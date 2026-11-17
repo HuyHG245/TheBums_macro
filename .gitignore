@@ -1,0 +1,9 @@
+.venv/
+.buildenv/
+build/
+dist/
+__pycache__/
+*.pyc
+*.spec
+TheBums.exe
+crash.log
