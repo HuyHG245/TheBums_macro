@@ -1,20 +1,20 @@
 @echo off
 setlocal
 cd /d "%~dp0"
-title The Bums - build
-echo ==== The Bums - build ====
+title The Bums Macro - build
+echo ==== The Bums Macro - build ====
 echo.
 
-rem Set to --uac-admin only if the macro must control windows that run as administrator.
-rem Leave it empty for fewer antivirus warnings.
-set "ADMIN_FLAG="
+rem Requires Administrator elevation to interact with an elevated Roblox window.
+rem Windows will show a UAC consent prompt on every new launch; this is NOT an elevation bypass.
+set "ADMIN_FLAG=--uac-admin"
 
 rem Default: ONE file, TheBums.exe. Run "build.bat onedir" to get a folder instead:
 rem it starts faster and antivirus programs complain less about it.
 set "MODE=--onefile"
 if /i "%~1"=="onedir" set "MODE=--onedir"
 
-for %%F in (main.py requirements.txt change.md version_info.txt image\thebums.ico) do (
+for %%F in (main.py requirements.txt version_info.txt image\thebums.ico) do (
     if not exist "%%F" (
         echo Missing file: %%F
         goto :fail
@@ -53,6 +53,12 @@ if errorlevel 1 (
     goto :fail
 )
 
+rem Embed a source revision when this is a real Git checkout; otherwise mark unknown.
+echo unpublished-local-build>"build_revision.txt"
+where git >nul 2>nul
+if not errorlevel 1 (
+    for /f "delims=" %%H in ('git rev-parse --verify HEAD 2^>nul') do echo %%H>"build_revision.txt"
+)
 echo.
 echo Building - this takes a few minutes...
 "%PY%" -m PyInstaller --noconfirm --clean %MODE% --windowed --noupx %ADMIN_FLAG% ^
@@ -60,7 +66,7 @@ echo Building - this takes a few minutes...
     --icon "image\thebums.ico" ^
     --version-file "version_info.txt" ^
     --add-data "image;image" ^
-    --add-data "change.md;." ^
+    --add-data "build_revision.txt;." ^
     --add-data "guides;guides" ^
     main.py
 if errorlevel 1 goto :fail

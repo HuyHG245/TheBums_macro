@@ -3,11 +3,11 @@ VSVersionInfo(
   kids=[
     StringFileInfo([StringTable('040904B0', [
       StringStruct('CompanyName', 'The Bums'),
-      StringStruct('FileDescription', 'The Bums'),
+      StringStruct('FileDescription', 'The Bums Macro'),
       StringStruct('FileVersion', '1.1.0.0'),
       StringStruct('InternalName', 'TheBums'),
       StringStruct('OriginalFilename', 'TheBums.exe'),
-      StringStruct('ProductName', 'The Bums'),
+      StringStruct('ProductName', 'The Bums Macro'),
       StringStruct('ProductVersion', '1.1.0.0')])]),
     VarFileInfo([VarStruct('Translation', [1033, 1200])])
   ]

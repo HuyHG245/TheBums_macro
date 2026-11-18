@@ -1,0 +1,133 @@
+# Custom Macro Guide — The Bums Macro
+
+The Custom Macro Editor creates a `.tbmacro` file under **Documents / thebums Macro / Custom-Macros**.
+Open **Settings > Configs > + (New macro)**. Enter a name, choose **Mission** or **Raid**, write
+one command per line, press **Check**, then **Save**. Select it from the Abilities menu to run it.
+Use **Record** to capture a real sequence; **Pick click spot** inserts coordinates; **Images**
+lets you provide image templates. The **Syntax** button shows an inline command reference.
+
+> **Tip:** Start with a 3–6 line script, test it once, then add image checks or repeats.
+
+## Quick start
+
+1. Open **Settings > Configs > + (New macro)**.
+2. Give the macro a name and choose **Mission** or **Raid**.
+3. Write one command per line.
+4. Press **Check** to validate the script.
+5. Press **Save**, then select it from the Abilities menu.
+6. Use **Guide**, **Syntax**, and **Images** whenever you need references.
+
+## Time, parameters and the difference between a key press and a dash
+
+- Times are **seconds**: `wait 1.5` = wait 1.5 s, `hold ability1 0.4` = hold for 0.4 s.
+- `wait 0.5-1.2` randomly waits between 0.5 and 1.2 seconds.
+- `press ability2` taps the configured Ability 2 key **one time**.
+- `doubletap d` taps D twice, creating **one** right dash in Roblox.
+- `dash right 2 1.0` means **two right dashes**: D-D, wait **1.0 s**, D-D.
+- The cooldown argument applies **between dashes** and never between the two taps of one dash.
+- The gap between taps within a dash follows **Edit Configs > Movement > Double-tap gap**.
+- `strafe right 2 1.0` differs from `dash right 2 1.0`: here 2 is a **duration**
+  (2 seconds of repeated right dashes), not a count. Prefer `dash` for a fixed count.
+- Values in brackets such as `[COUNT]` are optional and must be entered **without brackets**.
+
+## Ability commands (configurable Keybinds)
+
+| Command | Result |
+| --- | --- |
+| `press ability1` | Press Skill 1 once |
+| `press ability2` | Press Skill 2 once |
+| `press ability3` | Press Skill 3 once |
+| `press ability4` | Press Skill 4 once |
+| `press ability5` | Press Skill 5 once / Shift if that slot shifts |
+| `hold ability1 0.3` | Hold Skill 1 for 0.3 seconds |
+| `spam ability4 3 0.1` | Repeatedly tap Skill 4 for 3 seconds; 0.1-second gap |
+| `down ability5` / `up ability5` | Hold down, then release Skill 5 explicitly |
+
+`ability1` uses the **Escape grab** key in Settings > Keybinds (the same in-game
+Skill 1 key). Abilities 2–5 use their own keybinds. `grab` remains an alias for
+the same key as `ability1`; it is not necessary to bind the same key twice.
+
+## Directional dashes
+
+| Command | Meaning |
+| --- | --- |
+| `dash` | Forward dash once: Space-Space (or the configured forward dash key) |
+| `dash forward 2 1.0` | Forward dash twice with 1.0 s cooldown between them |
+| `dash left` | Left dash once: A-A |
+| `dash right 2 1.0` | Right dash twice: D-D, wait 1 s, D-D |
+| `dash back` | Back dash once: S-S |
+| `backdash` | Alias for one back dash |
+| `backdash 2 1.2` | Two back dashes with 1.2 s cooldown |
+| `strafe left` | Left dash once (legacy strafe command) |
+| `strafe right` | Right dash once |
+| `strafe back` | Back dash once |
+| `strafe left 4 1.0` | Repeat left dash for up to 4 seconds, with a 1 s gap |
+
+## Other commands
+
+| Command | Meaning |
+| --- | --- |
+| `press KEY` | Tap any valid configured key or raw keyboard key |
+| `doubletap KEY` | Tap that key twice |
+| `hold KEY SECONDS` | Hold a key down for a duration |
+| `wait SECONDS` | Pause for SECONDS |
+| `spam KEY SECONDS [GAP]` | Repeated taps for a duration |
+| `click` / `click X Y` | Click at the cursor or the selected screen coordinate |
+| `click X Y right` | Right-click at a screen coordinate |
+| `move X Y` | Move the mouse pointer to a screen coordinate |
+| `moverel DX DY` | Move the mouse relative to its current position (camera movement) |
+| `imgclick IMAGE.png 5` | Wait up to 5 s to find IMAGE.png and click its center |
+| `if find IMAGE.png` | Run the following block when the image is visible |
+| `if not find IMAGE.png` | Run when the image is absent |
+| `else` / `end` | Alternative / finish conditional or repeat block |
+| `repeat 3` / `end` | Repeat a block three times |
+| `repeat` / `end` | Repeat until stopped or the mission ends |
+| `status TEXT` | Show a status message in the macro window |
+| `log TEXT` | Add an Activity log message |
+| `retry()` | Hand off to the existing automatic Retry handler |
+| `trackloot()` | Detect loot on the result screen |
+| `openchest()` | Use the existing raid chest-opening sequence |
+| `addwin()` / `addlose()` | Count a win/loss manually |
+| `addmission()` / `addraid()` | Increment a mission/raid counter manually |
+
+## Example — simple opening (sample for learning commands)
+
+```text
+name: Example opening
+author: you
+type: mission
+
+dash right 2 1.0
+press ability1
+moverel 0 600
+backdash
+press ability2
+wait 0.4
+press ability4
+press ability3
+wait 0.7
+press ability5
+retry()
+```
+
+**Important:** This sample is for learning the Custom Macro language. Built-in Attack Titan
+Raid Universal has its own image-based combat state machine; Custom Macro scripts do not
+inherit those Heatwave/Shift detection states automatically. Do not use this example to
+replace the built-in Raid routine without adding game-state checks.
+
+## Notes
+
+- Macro commands are case-insensitive, and indentation is optional.
+- `#` or `//` begins a comment. Keep one command per line.
+- Use **Check** before **Save**; syntax errors are marked in red.
+- To share a custom macro, send its `.tbmacro` file and all pictures used by `if find` / `imgclick`.
+- Keep Roblox in focus for keyboard and mouse input, and test with **Record** or a short
+  custom script first. Press **Stop** to release held keys.
+
+
+## Safety notes
+
+- The macro only sends **keyboard and mouse input**.
+- It does **not** inject into Roblox or read game memory.
+- Keep Roblox focused while testing a new custom macro.
+- Use short waits first, then tune timings gradually.

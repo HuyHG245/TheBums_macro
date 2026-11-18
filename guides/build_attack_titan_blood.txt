@@ -1,0 +1,87 @@
+# Attack Titan Raid Blood Awakening - Guide
+
+> Required Titan: **Colossal Titan**
+
+
+## Skill Layouts
+**Before Shift — only two required slots**
+
+Skill 2: **Acoustic Shells**
+
+![Acoustic Shells - Skill 2](images/attack_blood_skill2.png)
+
+Skill 5: **Titan Shifting**
+
+![Titan Shifting - Skill 5](images/attack_blood_skill5.png)
+
+**After Shift — same Colossal Titan build as Attack Titan Raid Fritz**
+
+![After Shift - Colossal Titan](images/layout_attack_after.png)
+
+## Required Titan: Colossal Titan
+**Colossal Titan is mandatory** for this Raid macro. Equip Colossal Titan before starting so Skill 5 shifts to the required form and the post-Shift Heatwave/Skills 5, 3, and 1 routine is available.
+
+## Required Build
+Use a build with **Acoustic Shells in Skill Slot 2** and **Titan Shifting in Skill Slot 5**
+before transforming. The other three pre-Shift skill slots are not used by this route.
+After Shift, use the **same Colossal Titan skill layout** as the Fritz Raid guide.
+This opening does not require Fritz's Flashbang, camera or directional positioning combo.
+
+## Auto Skip Cutscenes
+In **Settings > Configs > Attack Titan Raid Blood Awakening > Edit configs**,
+**Auto skip cutscenes** can be turned ON or OFF. When enabled, the macro finds `skip.png`
+and presses E at the start of the Raid or during phase transitions.
+
+## Raid Automation
+The macro starts when `acoustic_shells.png` is detected on the Skill 2 HUD slot.
+
+1. Immediately press **Skill 2 — Acoustic Shells**.
+2. **Forward Dash × 1:** double-tap **Space, Space** (or the Dash key configured in Keybinds).
+3. Repeatedly press **Skill 5 — Titan Shifting** until `heatwave.png` confirms
+   that Colossal Titan has shifted successfully. **No automatic timeout**.
+4. If Phase 1 cutscene appears, optionally skip it with E.
+5. During Colossal combat, Skill 4 **Heatwave** uses the same two-cycle icon detection
+   as Fritz; **Skills 5, 3 and 1** run on independent timers until the CHESTS screen.
+6. Raider's Chest is ON by default; Emperor's Trove is OFF by default.
+   Use the Chest 1/Chest 2 **Pick spot** controls in Settings > Configs.
+7. After the real Retry button is detected, the existing results, loot and Retry system
+   handles the end of the Raid. Missing Heatwave by itself never means the Raid failed.
+
+## Shared After-Shift Setup
+The Colossal Titan abilities, Heatwave behavior, Phase 1 cutscene handling, chest
+collection and Retry flow are the **same implementation used by Attack Titan Raid Fritz**.
+Configure independent post-Shift Skill 1, 3 and 5 intervals in this mode's Edit configs.
+
+## Perks and Artifacts
+The guide shares the Fritz mode's post-Shift recommendations:
+
+**Perks**
+- Stormwrath
+- Avatar of Ymir
+- 15th Commander
+- Immortal
+- Adaptation
+- Font of Inspiration
+
+**Artifacts**
+- `Colossal Scars`: `Shifter Dmg%`
+- `Scorched Cloak`: `Shifter Dmg%`
+
+## Memories
+- Blood Awakening
+- Divine Decree
+- Sparks of Black
+- Shatterpoint
+- Elementalist/Tactician
+
+## Loot and Retry
+The macro detects **Primordial Evil** with `loot_attack_vessel.png` and
+**Attack Serum** with `loot_attack_serum.png` at the result screen.
+The Retry watchdog continues monitoring while Skill 5 is being spammed.
+The program does not enter Recovery just because Shift was not confirmed.
+
+## Edit Configs and Saving
+Select this macro under **Settings > Configs > Abilities**, then click **Edit configs**.
+The editor opens this mode's own cutscene/chest/Shift/Colossal settings and only its
+applicable shared inputs. Your changes are stored separately in `config.json` and
+restored when you reopen the app. Other macros' settings are not overwritten.

@@ -1,14 +1,16 @@
-# The Bums - Attack on Titan: Revolution macro (personal build).
+import atexit
 import base64
 import ctypes
 import json
 import os
+import hashlib
 import queue
 import random
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import tkinter as tk
@@ -18,7 +20,8 @@ import urllib.parse
 import urllib.request
 import uuid
 import webbrowser
-from tkinter import filedialog, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
+from tkinter import font as tkfont
 
 import cv2
 import mss
@@ -93,6 +96,15 @@ class _MacKeyboard:
         name = self._name(key)
         if name:
             self._down.discard(self._base(name))
+            event = types.SimpleNamespace(name=name, is_keypad=False)
+            with self._lock:
+                entries = list(self._entries.values())
+            for kind, _spec, handler in entries:
+                if kind == "anyup":
+                    try:
+                        handler(event)
+                    except Exception:  # noqa: BLE001
+                        pass
 
     def _add(self, kind, spec, handler):
         self._ensure()
@@ -110,6 +122,9 @@ class _MacKeyboard:
 
     def on_press(self, handler):
         return self._add("any", None, handler)
+
+    def on_release(self, handler):
+        return self._add("anyup", None, handler)
 
     def remove_hotkey(self, hid):
         self.unhook(hid)
@@ -133,11 +148,37 @@ else:
     import pyautogui as pydirectinput       # same keyDown / keyUp / moveTo / moveRel / click calls
     keyboard = _MacKeyboard()
 
+if IS_WIN:
+    _orig_moveTo = pydirectinput.moveTo
+
+    def _moveTo(x=None, y=None, *args, **kwargs):
+        """pydirectinput only knows the PRIMARY monitor. A spot that is outside of it (a second
+        monitor) is reached with SetCursorPos; spots on the primary monitor behave exactly as before."""
+        try:
+            u = ctypes.windll.user32
+            pw, ph = u.GetSystemMetrics(0), u.GetSystemMetrics(1)
+            if x is not None and y is not None and not (0 <= x < pw and 0 <= y < ph):
+                u.SetCursorPos(int(x), int(y))
+                return
+        except Exception:  # noqa: BLE001
+            pass
+        return _orig_moveTo(x, y, *args, **kwargs)
+    pydirectinput.moveTo = _moveTo
+
 # ----------------------------- SETTINGS ---------------------------------
-# --- Window logo (keep next to this script; falls back to the text "The Bums" if missing) ---
-APP_NAME = "The Bums"
+APP_NAME = "The Bums Macro"
+VERSION = "TheBumsMacro_v1.1"        # internal development version (not displayed in footer)
+
+# --- Update checker (footer > Updates) ---
+UPDATE_REPO = "HuyHG245/TheBums_macro"   # <-- your GitHub "owner/repo" (public). Releases are read from it
+UPDATE_CHECK_ON_START = False       # look for a newer release a moment after the window opens
+UPDATE_TIMEOUT = 15                # seconds before a GitHub request is given up
+
+# --- Window logo (keep next to this script; falls back to the text "thebums" if missing) ---
 LOGO_FILE = "thebums_logo_app.png"
-ICON_FILE = "thebums.ico"   # window / taskbar icon; skipped if missing
+ICON_FILE = "thebums.ico"   # window / taskbar icon (the lambda); skipped if missing
+FILE_ICON_FILE = "thebums.ico"   # icon of the .tbmacro files in Explorer (only the lambda: white, black outline,
+                                   # transparent). Lives in the image folder next to thebums.ico; skipped if missing
 
 # --- Retry button detection ---
 TEMPLATE_FILE = "retry_text.png"     # just the word RETRY (keep next to this script)
@@ -181,7 +222,8 @@ LOOT_FILES = {                       # kind -> template file (the icon only, no 
     "defence": "loot_defence.png",   # blue fragment
     "offence": "loot_offence.png",   # red fragment
     "support": "loot_support.png",   # green fragment
-    "vessel": "loot_vessel.png",     # Female Raid only (missions look for the scroll instead)
+    "vessel": "loot_vessel.png",     # Female Raid / custom raid vessel
+    "attack_vessel": "primordial_devil.png",  # Primordial Devil - Attack Titan Raid only
     "attack_serum": "loot_attack_serum.png",       # green
     "armor_serum": "loot_armor_serum.png",         # orange
     "female_serum": "loot_female_serum.png",       # blue
@@ -193,19 +235,29 @@ SERUM_KINDS = ("attack_serum", "armor_serum", "female_serum", "beast_serum", "co
 
 
 def active_loot_kinds():
-    """The loot kinds looked for with the config that is picked now: raids have vessels instead of
-    scrolls (fragments and serums are looked for in both)."""
-    raid = settings["family"] == "Female Raid"
-    return [k for k in LOOT_FILES if k != ("scroll" if raid else "vessel")]
+    """Match only the Vessel artwork appropriate to the selected raid.
+
+    Attack Titan uses Primordial Devil, Female Raid/custom raids use
+    their original Vessel template; missions do not scan either Vessel.
+    All other loot kinds (including Attack Serum) retain existing behavior.
+    """
+    is_attack = settings["family"] in ATTACK_FAMILIES
+    is_raid = raid_counting()
+    return [k for k in LOOT_FILES
+            if (k != "attack_vessel" or is_attack)
+            and (k != "vessel" or (is_raid and not is_attack))]
 LOOT_THRESHOLD = 0.75     # lower it if loot is missed, raise it if you get false hits
 LOOT_SCAN_TIME = 1.0      # seconds spent looking (items can fade in) before clicking retry
 LOOT_SCAN_STEP = 0.25     # seconds between looks during that time
 LOOT_FIX_SCALES = [0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95, 1.0, 1.05, 1.1, 1.15,
                    1.2, 1.3, 1.4, 1.5, 1.65, 1.8, 2.0]   # "Fix loot tracking": icon sizes tried
 LOOT_FIX_RELAX = 0.05     # "Fix loot tracking": loot threshold is this much lower (resized icons are blurrier)
+LOOT_SAFE_THRESHOLD = 0.82  # stricter than the old 0.75; reduce HUD and similar-icon false hits
+LOOT_SAFE_SINGLE_THRESHOLD = 0.88  # fast mode has only one captured frame, so require more confidence
+SAVE_LOOT_DEBUG = True     # save last_end_scan.png for troubleshooting on each end-screen detection
 LOW_LOOT_SCAN_TIME = 3.0  # low quality only: the loot is looked for ONLY during this many seconds
                           # right after the retry click (nothing is looked for before the click)
-SAVE_LOOT_DEBUG = False    # saves last_end_scan.png with boxes around the result + loot found
+# SAVE_LOOT_DEBUG is enabled above for testing; last_end_scan.png is saved locally.
 
 # --- Grabbed detection (the red YOUR STREAK IS IN DANGER text) ---
 GRAB_ENABLED = True
@@ -247,10 +299,10 @@ LOOK_DOWN_STEP = 0.01       # seconds between two small downward mouse movements
 LOOK_DOWN_PIXELS = 15       # pixels moved down per step (relative movement, works in a locked mouse)
 
 # --- Saved stats (kept between runs; the Reset button in the window erases them) ---
-STATS_FILE = "aotr_stats.json"   # saved in Documents\The Bums
+STATS_FILE = "aotr_stats.json"   # saved in Documents\thebums Macro
 CONFIG_FILE = "config.json"      # same folder: ONLY the timings changed in Edit configs (the overrides)
 STATS_FOLDER = "The Bums"      # folder created inside your Documents folder
-OVERRIDE_FOLDER = "asset_override"   # inside Documents\The Bums: the user's own pictures win over image/
+OVERRIDE_FOLDER = "asset_override"   # inside Documents\thebums Macro: the user's own pictures win over image/
 IMAGE_FOLDER = "image"           # all images (templates, logo, icon) are loaded from this folder,
                                  # next to this script / .exe
 LOW_FOLDER = "low quality fix"   # inside the image folder: the low graphics looks of the retry button,
@@ -313,7 +365,7 @@ SHIFT_LOCK_FIX_HOLD = 0.06        # Movement > Fix shift lock at start: how long
 SHIFT_LOCK_FIX_SETTLE = 0.15      # ... and the pause after it, before anything else happens
 UNIVERSAL_DASH_HOLD = (0.065, 0.09)  # how long each Space press is held
 UNIVERSAL_DASH_PRESS_GAP = (0.05, 0.08)  # pause between two presses
-UNIVERSAL_ABILITY4_SPAM_TIME = 2.0      # Universal: spam ability 4 this long after looking down
+UNIVERSAL_ABILITY4_SPAM_TIME = 3.5      # Universal: spam ability 4 this long after looking down
 UNIVERSAL_ABILITY4_SPAM_INTERVAL = 0.1  # seconds between those ability 4 presses
 # Universal family: right after ability 3: ctrl, mouse dragged down (LOOK_DOWN_TIME), ctrl again (forces the player to look down),
 # then ability 4 spammed for UNIVERSAL_ABILITY4_SPAM_TIME, then the shifting sequence goes on as usual (no buying time, no icon check)
@@ -333,9 +385,16 @@ MOVE_SHIFTED_BADGES = {
     "Right": ("R", "#14b8a6", "#ffffff"),
     "Stand": ("S", "#7a8398", "#ffffff"),
 }
-FAMILIES = ("Shiki", "Universal", "Blood Awakening", "Female Raid")
+ATTACK_FRITZ_KEY = "Attack Titan Raid"
+ATTACK_BLOOD_KEY = "Attack Titan Raid Blood Awakening"
+ATTACK_FAMILIES = (ATTACK_FRITZ_KEY, ATTACK_BLOOD_KEY)
+FAMILIES = ("Shiki", "Universal", "Blood Awakening", "Female Raid", *ATTACK_FAMILIES)
 DEFAULT_FAMILY = "Shiki"
 FAMILY_LABELS = {f: f for f in FAMILIES}   # what the dropdown shows
+FAMILY_LABELS[ATTACK_FRITZ_KEY] = "Attack Titan Raid Fritz (Not Recommended)"
+FAMILY_LABELS[ATTACK_BLOOD_KEY] = "Attack Titan Raid Blood Awakening"
+FAMILY_LABELS["__custom_macro__"] = "Custom Macro Guide"
+ATTACK_DISPLAY_NAME = FAMILY_LABELS[ATTACK_FRITZ_KEY]
 FAMILY_TAGS = {}   # entry -> tag text in the dropdown ("WIP" yellow, "Beta" blue), e.g. {"Universal": "Beta"}
 # icon next to each entry: (letter, badge colour, letter colour)
 FAMILY_BADGES = {
@@ -343,6 +402,8 @@ FAMILY_BADGES = {
     "Universal":       ("U", "#facc15", "#1a1500"),   # yellow U
     "Blood Awakening": ("B", "#ef4444", "#ffffff"),   # red B
     "Female Raid":     ("F", "#ef4444", "#ffffff"),   # red F
+    "Attack Titan Raid": ("A", "#f59e0b", "#1a1500"),
+    "Attack Titan Raid Blood Awakening": ("B", "#a855f7", "#ffffff"),
 }
 
 # --- Family "Female Raid": pictures it needs (same two folders / asset_override rules as the others) ---
@@ -352,19 +413,25 @@ RAID_START_THRESHOLD = 0.80
 RAID_FINISH_FILE = "finish_button.png"   # the finish button
 RAID_HEATWAVE_FILE = "heatwave.png"      # seen after the Nth skip -> ability 1 is spammed
 RAID_HEATWAVE_THRESHOLD = 0.80
+ATTACK_START_FILE = "acoustic_shells.png"  # Attack Titan only: Skill 2 acoustic icon
+ATTACK_START_THRESHOLD = 0.78
+ATTACK_FINISH_FILE = "finish.png"
+ATTACK_FINISH_THRESHOLD = 0.80
 KEY_RAID_SKIP = "e"              # pressed over and over while the skip button is on screen
-RAID_SKIP_THRESHOLD = 0.80       # lower them if the buttons aren't being detected
+RAID_SKIP_THRESHOLD = 0.67       # (skip button lowered from 0.80 - it was detected late) lower them if the buttons aren't being detected
 RAID_FINISH_THRESHOLD = 0.80
-RAID_SKIP_SPAM_TIME = 0.5        # spam E this long every time the skip button is seen
+RAID_SKIP_FIRST_SPAM_TIME = 0.5  # the FIRST skip button: spam E this long (fixed)
+RAID_SKIP_SPAM_TIME = 2.0        # every skip button after the first: spam E this long (runs in the background, alongside other actions)
 RAID_SKIP_SPAM_INTERVAL = 0.1    # seconds between those E presses
 RAID_SKIP_NUMBER = 3             # after this skip button (the first one = no. 1) the macro waits for heatwave.png
 RAID_HEATWAVE_TIME = 6.0         # after the Nth skip the macro waits for heatwave.png, then spams ability 1 this long
 RAID_HEATWAVE_INTERVAL = 0.1
-RAID_A3_TIME = 3.0               # opening: after ability 1, spam ability 3 this long
+RAID_A3_TIME = 2.0               # opening: after ability 1, spam ability 3 this long
 RAID_A3_INTERVAL = 0.1
-RAID_A5_TIME = 2.0               # then ability 5 this long
+RAID_A5_TIME = 3.0               # then ability 5 this long
 RAID_A5_INTERVAL = 0.1
 RAID_WAIT_TIME = 17.0            # then wait this long
+RAID_OPEN_A1_TIME = 1.5          # opening: ability 1 is spammed this long first (fixed)
 RAID_A1_TIME = 4.0               # then spam ability 1 this long
 RAID_A1_INTERVAL = 0.1
 RAID_RANDOM_GAP = 2.0            # then ability 4 -> 3 -> 2 (over and over), one every this many seconds, until the raid ends
@@ -375,7 +442,7 @@ RAID_FINISH_WAIT = 30.0          # ... then the macro waits (at most) this long 
 RAID_FINISH_CLICK_TIME = 2.0     # the finish button is clicked over and over this long
 RAID_FINISH_CLICK_INTERVAL = 0.1
 RAID_FAILSAFE_AFTER_SEQUENCE = 180.0   # raid failsafe (fixed, not the Failsafe timer): this long after the shifting + waiting sequence ...
-RAID_FAILSAFE_MAX_TIME = 300.0         # ... or when the raid has lasted this long (5 min), whichever comes first
+RAID_FAILSAFE_MAX_TIME = 180.0         # ... or when the raid has lasted this long (3 min), whichever comes first
 RAID_FINISH_LOOK = 0.1          # seconds between two looks for the finish button while a chest opens (not editable)
 RAID_LOOP_DELAY = 0.02           # seconds between two checks while waiting during a raid (not editable)
 RAID_LOOK_INTERVAL = 0.05        # seconds between two looks for the skip / finish button (not editable)
@@ -504,6 +571,10 @@ CONFIG_FIELDS = {
            "this long, then the ability 5 shift starts. 0 = off."),
         _f("strafe_gap", "Gap between strafes", "range", STRAFE_DELAY, 0, 5, "Start of the shift",
            "Random pause between two strafes while strafing left."),
+        _f("verify_shift", "Confirm Colossal Shift", "bool", True, 0, 1, "Shift reliability",
+           "Check heatwave.png to confirm the Colossal Titan form after Skill 5."),
+        _f("shift_retry_wait", "Extra Shift verification wait", "sec", 14.0, 0, 45, "Shift reliability",
+           "If Shift is not confirmed at the expected time, keep pressing Skill 5 during this extra window."),
     ] + _shift_fields(),
     "Female Raid": [
         _f("chest1", "Chest 1", "spot", None, 0, 20000, "Chests",
@@ -560,10 +631,79 @@ CONFIG_FIELDS = {
            "After the opening ability 4, 3, 2 are pressed one after the other (then again from 4), "
            "one this often, until the raid ends."),
     ],
+    "Attack Titan Raid": [
+        _f("auto_skip_cutscene", "Auto skip cutscenes", "bool", True, 0, 1, "Cutscenes",
+           "When enabled, detect skip.png and press E during intro and phase transitions."),
+        _f("skip_press_interval", "Repeat Skip every", "sec", 0.9, 0.4, 5, "Cutscenes",
+           "Retry E only while the skip button remains on screen. No inputs if disabled."),
+        _f("chest1", "Raider's Chest", "spot", None, 0, 20000, "Chests",
+           "Left chest position. Use Pick spot in Settings > Configs."),
+        _f("chest2", "Emperor's Trove", "spot", None, 0, 20000, "Chests",
+           "Optional right chest position. Uses an Emperor's Key when enabled."),
+        _f("open_chest2", "Open Emperor's Trove", "bool", False, 0, 1, "Chests",
+           "OFF by default to save Emperor's Keys."),
+        _f("chest_click_time", "Chest click time", "sec", 0.8, 0.1, 10, "Chests",
+           "Click the selected chest for this long."),
+        _f("chest_click_interval", "Chest click interval", "sec", 0.12, 0.02, 3, "Chests",
+           "Time between clicks."),
+        _f("finish_wait", "Wait for chest animation", "sec", 45.0, 1, 120, "Chests",
+           "Maximum wait for finish.png to reappear after opening a chest."),
+        _f("finish_click_time", "Finish click time", "sec", 0.8, 0.1, 10, "Chests",
+           "Click the FINISH button for this long."),
+        _f("finish_click_interval", "Finish click interval", "sec", 0.12, 0.02, 3, "Chests",
+           "Time between FINISH clicks."),
+        _fast_mode_field(True),
+        _f("right_dash_cooldown", "Gap between first Right Dashes", "sec", 1.3, 0.1, 15, "Before Shift",
+           "Pause between the two opening D-D right dashes only."),
+        _f("camera_down_time", "Camera down time", "sec", LOOK_DOWN_TIME, 0.1, 20, "Before Shift",
+           "CTRL -> relative mouse down -> CTRL, same camera motion as Universal."),
+        _f("camera_down_pixels", "Camera down pixels / step", "pix", LOOK_DOWN_PIXELS, 1, 200, "Before Shift",
+           "Mouse Y movement per step during the Fritz camera-down action."),
+        _f("skill3_animation", "Skill 3 animation", "sec", 3.0, 0.2, 10, "Before Shift",
+           "Wait after the Fritz Skill 3 animation before dashing left."),
+        _f("after_left_dash", "Pause after first Left Dash", "sec", 0.3, 0, 5, "Before Shift",
+           "Wait after Left Dash and before Acoustic Shells (Skill 2)."),
+        _f("after_right_dash", "Pause after later Right Dash", "sec", 0.3, 0, 5, "Before Shift",
+           "Wait after Right Dash and before the next Left Dash. Dash cooldown still applies."),
+        _f("after_last_left_dash", "Pause after last Left Dash", "sec", 0.3, 0, 5, "Before Shift",
+           "Wait after the final Left Dash before the additional 1-second pause."),
+        _f("before_skill4", "Additional wait before Skill 4", "sec", 1.0, 0, 5, "Before Shift",
+           "Additional 1s after the final Left Dash + 0.3s pause, then cast Skill 4."),
+        _f("after_skill4", "Skill 4 animation", "sec", 0.5, 0, 5, "Before Shift",
+           "Wait after Skill 4 before the second use of Skill 1."),
+        _f("after_skill2", "Wait after Skill 2", "sec", 0.0, 0, 3, "Before Shift",
+           "Optional wait after Fritz Skill 2 before Right Dash; default is zero."),
+        _f("shift_spam_interval", "Shift key press interval", "sec", SHIFT_SPAM_INTERVAL, 0.08, 2, "Colossal Titan",
+           "Time between Skill 5 attempts while the Colossal transformation is unconfirmed."),
+        _f("skill1_interval", "Colossal Skill 1 interval", "sec", 3.0, 0.2, 60, "Colossal Titan",
+           "Independent repeat timer; not image-detected."),
+        _f("skill3_interval", "Colossal Skill 3 interval", "sec", 6.0, 0.2, 60, "Colossal Titan",
+           "Independent repeat timer; not image-detected."),
+        _f("skill5_interval", "Colossal Skill 5 interval", "sec", 8.0, 0.2, 60, "Colossal Titan",
+           "Independent repeat timer; not image-detected."),
+        _f("heatwave_threshold", "Heatwave match threshold", "num", 0.80, 0.3, 1, "Colossal Titan",
+           "Icon matching score threshold."),
+        _f("heatwave_confirm", "Heatwave stable state", "sec", 0.35, 0.1, 2, "Colossal Titan",
+           "Icon must stay visible or hidden this long before a state transition."),
+    ],
 }
+# Blood Awakening + Colossal uses the same cutscene, chest, retry, Shift and
+# post-Shift settings, but does not expose Fritz's unrelated opening combo.
+_ATTACK_SHARED_FIELDS = {
+    "auto_skip_cutscene", "skip_press_interval", "chest1", "chest2",
+    "open_chest2", "chest_click_time", "chest_click_interval", "finish_wait",
+    "finish_click_time", "finish_click_interval", "fast_mode",
+    "shift_spam_interval", "skill1_interval", "skill3_interval",
+    "skill5_interval", "heatwave_threshold", "heatwave_confirm",
+}
+CONFIG_FIELDS[ATTACK_BLOOD_KEY] = [
+    spec for spec in CONFIG_FIELDS[ATTACK_FRITZ_KEY] if spec[0] in _ATTACK_SHARED_FIELDS
+]
 CONFIG_INDEX = {sec: {f[0]: f for f in fields} for sec, fields in CONFIG_FIELDS.items()}
 # fields that live in Settings > Configs instead of the Edit configs window (still saved in the same place)
-CONFIG_HIDDEN = {"Female Raid": ("chest1", "chest2")}
+CONFIG_HIDDEN = {"Female Raid": ("chest1", "chest2"),
+                 "Attack Titan Raid": ("chest1", "chest2"),
+                 ATTACK_BLOOD_KEY: ("chest1", "chest2")}
 CONFIG_BADGES = dict(FAMILY_BADGES, Movement=("M", "#a78bfa", "#1a1033"))   # purple M
 CONFIG_INFO = {
     "Movement": "Used by every config: the wait after ability 2, the dashing and the strafe.",
@@ -571,7 +711,57 @@ CONFIG_INFO = {
     "Universal": "Used while the Universal abilities are selected.",
     "Blood Awakening": "Used while the Blood Awakening abilities are selected.",
     "Female Raid": "Used while Female Raid is selected. (The chest locations are set in Settings > Configs.)",
+    "Attack Titan Raid": "Attack Titan Raid Fritz (Not Recommended). Colossal chest spots are set in Settings > Configs.",
+    ATTACK_BLOOD_KEY: "Acoustic Shells (Skill 2), forward Space-Space Dash, Shift (Skill 5), and Colossal combat.",
 }
+
+
+
+# v11: Edit Configs is scoped to the family selected in Settings.
+# Only shared settings which actually affect this family are offered.
+# These continue to be saved under "Movement" so older config.json data works.
+_SHARED_MISSION_KEYS = (
+    "look_up", "look_up_time", "look_up_pixels", "after_ability2",
+    "dash_time", "dash_hold", "dash_gap", "tap_gap",
+    "retry_click_time", "retry_click_interval", "fix_shift_lock",
+)
+CONFIG_SHARED_KEYS = {
+    "Shiki": _SHARED_MISSION_KEYS,
+    "Universal": _SHARED_MISSION_KEYS,
+    "Blood Awakening": _SHARED_MISSION_KEYS,
+    "Female Raid": ("retry_click_time", "retry_click_interval", "fix_shift_lock"),
+    "Attack Titan Raid": ("tap_gap", "retry_click_time", "retry_click_interval",
+                          "fix_shift_lock"),
+    ATTACK_BLOOD_KEY: ("tap_gap", "retry_click_time", "retry_click_interval",
+                       "fix_shift_lock"),
+}
+
+
+def edit_config_sections(family):
+    """One selected macro plus only the relevant shared-control section."""
+    if family not in FAMILIES:
+        raise ValueError("Choose a built-in macro before opening Edit Configs")
+    return (family, "Movement") if CONFIG_SHARED_KEYS.get(family) else (family,)
+
+
+def edit_config_menu_items(family):
+    return [
+        (section,
+         FAMILY_LABELS.get(section, section) if section != "Movement" else "Shared controls",
+         CONFIG_BADGES[section], None)
+        for section in edit_config_sections(family)
+    ]
+
+
+def edit_config_fields(family, section):
+    """Never expose Universal/Blood-only timings while editing Fritz or Female Raid."""
+    if section == family:
+        return [spec for spec in CONFIG_FIELDS[family]
+                if spec[0] not in CONFIG_HIDDEN.get(family, ())]
+    if section == "Movement":
+        allowed = set(CONFIG_SHARED_KEYS.get(family, ()))
+        return [spec for spec in CONFIG_FIELDS["Movement"] if spec[0] in allowed]
+    return []
 
 
 def clean_cfg_value(spec, raw):
@@ -626,12 +816,19 @@ def parse_spot_text(spec, texts):
 
 
 def tv(section, key):
-    """The live value of one editable timing: the user's saved value, else its default.
-    A key the config doesn't have (e.g. fast_mode / skip_ability2 on Female Raid) reads as off."""
-    spec = CONFIG_INDEX[section].get(key)
+    """Current timing for the active family; preserves legacy global Movement fallback."""
+    spec = CONFIG_INDEX.get(section, {}).get(key)
     if spec is None:
         return False
-    val = settings["timings"].get(section, {}).get(key)
+    val = None
+    if section == "Movement":
+        family = settings.get("family")
+        if family in FAMILIES:
+            overrides = settings["timings"].get(family, {}).get("_movement", {})
+            if isinstance(overrides, dict):
+                val = overrides.get(key)
+    if val is None:
+        val = settings["timings"].get(section, {}).get(key)
     if val is None:
         val = spec[3]
     if spec[2] in ("range", "spot"):
@@ -784,23 +981,6 @@ def app_dir():
     return os.path.dirname(os.path.abspath(__file__))
 
 
-CHANGELOG_FILE = "change.md"     # shown by footer > Changelog; add it to the build: --add-data "change.md;."
-
-
-def changelog_text():
-    """The text of change.md: bundled inside the .exe (PyInstaller --add-data), or next to the script."""
-    for base in (getattr(sys, "_MEIPASS", None), app_dir()):
-        if not base:
-            continue
-        path = os.path.join(base, CHANGELOG_FILE)
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                return f.read()
-        except OSError:
-            continue
-    return f"# Changelog\n\n{CHANGELOG_FILE} was not found next to the macro."
-
-
 def asset_path(filename):
     """Images are loaded from the "image" folder. One next to the .exe / script wins
     (so you can swap an image without recompiling); otherwise the copy bundled
@@ -811,9 +991,10 @@ def asset_path(filename):
     return os.path.join(getattr(sys, "_MEIPASS", app_dir()), IMAGE_FOLDER, filename)
 
 
-GUIDE_FOLDER = "guides"     # the Guide window reads build_<name>.md from here
+GUIDE_FOLDER = "guides"     # the Guide window reads build_<name>.txt from here (Markdown syntax is supported).
 GUIDE_NAMES = {"Shiki": "shiki", "Universal": "universal", "Blood Awakening": "blood",
-               "Female Raid": "female"}      # family -> the <name> part of the md file names
+               "Female Raid": "female", "Attack Titan Raid": "attack_titan",
+               ATTACK_BLOOD_KEY: "attack_titan_blood", "__custom_macro__": "custom_macro_commands"}      # family -> the <name> part of the guide text file names
 
 
 def guide_path(filename):
@@ -838,7 +1019,7 @@ def documents_dir():
 
 
 def data_dir():
-    """Documents\\The Bums - created if it doesn't exist yet. The json lives here."""
+    """Documents\\thebums Macro - created if it doesn't exist yet. The json lives here."""
     path = os.path.join(documents_dir(), STATS_FOLDER)
     try:
         os.makedirs(path, exist_ok=True)
@@ -847,7 +1028,7 @@ def data_dir():
     return path
 
 def override_dir():
-    """Documents\\The Bums\\asset_override - the user's own pictures (not created here)."""
+    """Documents\\thebums Macro\\asset_override - the user's own pictures (not created here)."""
     return os.path.join(data_dir(), OVERRIDE_FOLDER)
 
 
@@ -884,13 +1065,24 @@ def open_override_folder():
 STEP_NAMES = ["Ability 2", "Dashing", "Strafe", "Ability 3",
               "Buying time", "Ability 4", "Shift", "Shifted 4", "Ability 5"]
 
+ATTACK_STEP_NAMES = ["Right Dashes", "Fritz opening skills", "Fritz positioning", "Colossal Shift", "Opening chests", "Clicking retry"]
+ATTACK_BLOOD_STEP_NAMES = ["Acoustic Shells", "Forward Dash", "Colossal Shift", "Colossal combat", "Opening chests", "Clicking retry"]
+
 RAID_STEP_NAMES = ["Using buffs", "Shifting", "Killing Eren", "Killing Female titan",
                    "Opening chests", "Clicking retry"]
 
 
 def step_names():
     """The steps shown on the status card for the config that is picked now."""
-    return RAID_STEP_NAMES if settings["family"] == "Female Raid" else STEP_NAMES
+    if settings["family"] == ATTACK_FRITZ_KEY:
+        return ATTACK_STEP_NAMES
+    if settings["family"] == ATTACK_BLOOD_KEY:
+        return ATTACK_BLOOD_STEP_NAMES
+    if settings["family"] == "Female Raid":
+        return RAID_STEP_NAMES
+    if is_custom(settings["family"]):
+        return CUSTOM_STEP_NAMES
+    return STEP_NAMES
 
 
 # ------------------------------ settings --------------------------------
@@ -908,6 +1100,7 @@ GAME_BINDS = {
     "dash": ("Dash", KEY_DASH),
     "strafe": ("Strafe A", KEY_STRAFE),
     "strafe_d": ("Strafe D", KEY_STRAFE_D),
+    "back": ("Back Dash", KEY_BACK),
     "grab": ("Escape grab", KEY_GRAB),
 }
 BIND_LABELS = {k: v[0] for k, v in {**HOTKEY_BINDS, **GAME_BINDS}.items()}
@@ -920,6 +1113,9 @@ DEFAULT_WEBHOOK = {
     "graph_hours": 1,       # that interval, in hours
     "notify_mission": True, # post a stats embed after every finished mission
     "notify_error": True,   # message when the macro hits an error
+    "use_bot": False,       # True = send with a Discord bot (and obey its !commands) instead of the webhook
+    "bot_token": "",        # the bot's token
+    "channel_id": "",       # the channel the bot posts in and listens to
 }
 
 DEFAULT_FAILSAFE = {
@@ -927,7 +1123,56 @@ DEFAULT_FAILSAFE = {
     "seconds": 0,
     "click_x": None,    # where the failsafe clicks (screen pixels). None = X centre, 80% down the Y axis;
     "click_y": None,    # a picked coordinate overrides the middle
+    "look_down": False, # before clicking: ctrl, mouse moved down, ctrl (off by default)
+    "look_time": LOOK_DOWN_TIME,      # Configure window: seconds the mouse is moved down
+    "look_pixels": LOOK_DOWN_PIXELS,  # ... pixels per step
+    "look_step": LOOK_DOWN_STEP,      # ... seconds between two steps
 }
+RECONNECT_IMAGE_FILE = "disconnect.png"      # the Disconnect Image (saved in asset_override)
+ROBLOX_GAME_ID = 13379208636                 # Reconnect rejoins this game (roblox://placeId=...)
+RECONNECT_THRESHOLD = 0.75                   # how well the Disconnect Image must match
+RECONNECT_CHECK_INTERVAL = 1.0               # look for it this often (seconds)
+RECONNECT_CLOSE_WAIT = 3.0                   # after closing Roblox, before launching it again
+RECONNECT_LOAD_WAIT = 25.0                   # after launching: hands off while the game loads
+RECONNECT_COOLDOWN = 60.0                    # after a rejoin the image is ignored this long
+RECONNECT_CLICK_DELAY = 2.5                  # then: seconds before EACH of the other coordinates is clicked (default;
+                                             # tweakable in Recovery > Reconnect > Configure > Click delay)
+RECONNECT_CLICK_DELAY_RANGE = (0.0, 60.0)    # what the Click delay boxes accept (seconds)
+RECONNECT_PLAY_DELAY = 0.5                   # the wait between Create and Play (default; tweakable like the click delay)
+RECONNECT_PLAY_KEYS = ("m_play", "r_play")   # the Play spots of the Missions / Raids tab (they use that wait)
+DEFAULT_RECONNECT = {"enabled": False, "spots": {}, "click_delay": RECONNECT_CLICK_DELAY,
+                     "play_delay": RECONNECT_PLAY_DELAY}   # Recovery > Reconnect > Configure: off until it is set up
+RECONNECT_FIRST_DELAY = 2.0                  # the first click happens this long after the Select picture is seen
+RECONNECT_RESCUE_LIMIT = 120.0               # a failsafe rescue still running after this long forces a rejoin
+# The two pictures under the coordinates (saved in asset_override, like the Disconnect Image). They are the
+# same for both tabs: the first click (Pick a slot) waits until "Select" is on screen, and
+# Click play (lobby) waits until "Play" is on screen.
+RECONNECT_SELECT_FILE = "reconnect_select.png"
+RECONNECT_PLAY_FILE = "reconnect_play.png"
+RECONNECT_IMAGE_FILES = {"select": RECONNECT_SELECT_FILE, "play": RECONNECT_PLAY_FILE}
+RECONNECT_IMAGE_NAMES = {"disconnect": "Disconnect", "select": "Select", "play": "Play"}
+# every picture of the Images section of the window, in that order (the Disconnect Image is the one the
+# macro watches for; Select / Play gate two of the clicks)
+RECONNECT_ALL_IMAGES = {"disconnect": RECONNECT_IMAGE_FILE, **RECONNECT_IMAGE_FILES}
+RECONNECT_STEP_GATES = {"pick_slot": "select", "click_play_lobby": "play"}   # spot key -> picture it waits for
+RECONNECT_IMAGE_TIMEOUT = 120.0              # a picture that has not shown after this long: rejoin again
+RECONNECT_MAX_ATTEMPTS = 3                   # ... at most this many rejoins in a row
+# the coordinates picked in the Reconnect window (Recovery > Reconnect > Configure), 2 sub tabs.
+# Both tabs start with the same 4 shared coordinates (one set of values, shown in both), then:
+#   Missions - Click missions, then Pick outskirts > Create > Play   (mission macros)
+#   Raids    - Click Raids, then Pick female raid > Create > Play    (Female Raid / raid macros)
+# (key, name). The whole tab of the macro in use has to be filled in or Reconnect stays off.
+RECONNECT_SHARED_SPOTS = (("pick_slot", "Pick a slot"), ("click_play", "Click play"),
+                          ("choose_lobby", "Choose lobby"), ("click_play_lobby", "Click play (lobby)"))
+RECONNECT_MISSION_SPOTS = (("click_missions", "Click missions"), ("m_pick_outskirts", "Pick outskirts"),
+                           ("m_create", "Create"), ("m_play", "Play"))
+RECONNECT_RAID_SPOTS = (("click_raids", "Click Raids"), ("r_pick_female_raid", "Pick female raid"),
+                        ("r_create", "Create"), ("r_play", "Play"))
+RECONNECT_TABS = ("Missions", "Raids")
+RECONNECT_TAB_SPOTS = {"Missions": RECONNECT_SHARED_SPOTS + RECONNECT_MISSION_SPOTS,
+                       "Raids": RECONNECT_SHARED_SPOTS + RECONNECT_RAID_SPOTS}
+RECONNECT_SPOTS = RECONNECT_SHARED_SPOTS + RECONNECT_MISSION_SPOTS + RECONNECT_RAID_SPOTS   # every saved key
+FAILSAFE_LOOK_LIMITS = {"look_time": (0.1, 20.0), "look_pixels": (1, 200), "look_step": (0.005, 1.0)}
 
 # the live settings (saved in STATS_FILE under "settings")
 settings = {
@@ -938,28 +1183,32 @@ settings = {
     "move_shifted": DEFAULT_MOVE_SHIFTED,   # direction held at step 9: Left (A) / Right (D) / Stand
     "timings": {},          # Edit configs: {section: {key: value}} - only what the user changed
     "failsafe": dict(DEFAULT_FAILSAFE),     # stuck-mission rescue: time before it triggers + click spot
+    "reconnect": {"enabled": False, "spots": {}, "click_delay": RECONNECT_CLICK_DELAY,
+                  "play_delay": RECONNECT_PLAY_DELAY},   # Recovery tab: the reconnect feature (off by default)
     "retry_scale": None,    # template size that last found the retry button on a non-1080p screen
                             # (None = not found yet). Tried first; updated when another size matches
     "config_section": CONFIG_SECTIONS[0],   # Edit configs: the part that was open last (kept between runs)
+    "opacity": 100,         # The Bums: saved window transparency setting
     "always_on_top": False, # footer switch "Always on top" (kept between runs)
-    "opacity": 100,         # footer slider: window opacity in percent (30-100, kept between runs)
     "compact_ui": False,    # Settings > UI > "Compact mode": while the macro runs, hide the main
                             # window and show the small stats bar instead (off = keep the window)
     "mini_pos": DEFAULT_MINI_POS,   # Settings > UI: Left / Middle / Right edge of Roblox
-    "fix_loot": False,      # Settings > Configs > Asset override > "Fix loot tracking" (Beta): look for
+    "animations": False,    # Settings > UI > "GUI animations": slide / fade effects (off = the plain look)
+    "fix_loot": False,      # Settings > Configs > Fix image detection > "Fix loot tracking" (Beta): look for
                             # the loot icons at many sizes, for UIs where the drops are resized
+    "auto_monitor": True,     # The Bums: prefer the Roblox window monitor when found
+    "adaptive_resolution": False,  # opt-in Beta: crop the Roblox client and remap clicks; OFF is legacy
+    "monitor": 1,           # Settings > Keybinds > Monitor: 1 = first monitor, 2 = second, ...
     "window": None,         # {"x", "y", "w", "h"} of the main window (None = never moved/resized)
 }
 
 
-MIN_OPACITY = 30   # the footer slider never goes lower (the window would be unreadable)
-
+MIN_OPACITY = 30
 
 def clamp_opacity(value):
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return 100
     return int(min(100, max(MIN_OPACITY, round(value))))
-
 
 def apply_opacity(win):
     """Window opacity from the footer slider (Windows fades the whole window, text included).
@@ -975,12 +1224,11 @@ def apply_opacity(win):
     except tk.TclError:
         pass
 
-
 def apply_settings():
     """Copy the saved keybinds into the key variables the macro uses."""
     global START_KEY, PAUSE_KEY, QUIT_KEY
     global KEY_ABILITY_1ST, KEY_ABILITY_2ND, KEY_ABILITY_3RD, KEY_ABILITY_LAST
-    global KEY_DASH, KEY_STRAFE, KEY_STRAFE_D, KEY_GRAB, BUY_TIME_MOVES
+    global KEY_DASH, KEY_STRAFE, KEY_STRAFE_D, KEY_GRAB, BUY_TIME_MOVES, MONITOR_INDEX
     kb = settings["keybinds"]
     START_KEY, PAUSE_KEY, QUIT_KEY = kb["start"], kb["pause"], kb["stop"]
     KEY_ABILITY_1ST, KEY_ABILITY_2ND = kb["ability2"], kb["ability3"]
@@ -988,6 +1236,7 @@ def apply_settings():
     KEY_DASH, KEY_STRAFE, KEY_GRAB = kb["dash"], kb["strafe"], kb["grab"]
     KEY_STRAFE_D = kb["strafe_d"]
     BUY_TIME_MOVES = [KEY_STRAFE]
+    MONITOR_INDEX = max(1, int(settings["monitor"]))
 
 
 def load_settings(saved):
@@ -1010,7 +1259,7 @@ def load_settings(saved):
             settings["webhook"][key] = value if isinstance(value, type(default)) else default
         hours = settings["webhook"]["graph_hours"]
         settings["webhook"]["graph_hours"] = min(MAX_GRAPH_HOURS, max(1, hours))
-    if saved.get("family") in FAMILIES:
+    if family_valid(saved.get("family")):
         settings["family"] = saved["family"]
     if saved.get("theme") in THEMES:
         settings["theme"] = saved["theme"]
@@ -1030,6 +1279,32 @@ def load_settings(saved):
         cx, cy = _int(fs.get("click_x")), _int(fs.get("click_y"))
         if cx is not None and cy is not None and cx >= 0 and cy >= 0:
             settings["failsafe"]["click_x"], settings["failsafe"]["click_y"] = cx, cy
+        if isinstance(fs.get("look_down"), bool):
+            settings["failsafe"]["look_down"] = fs["look_down"]
+        for key, (lo, hi) in FAILSAFE_LOOK_LIMITS.items():
+            v = fs.get(key)
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                settings["failsafe"][key] = (int(min(hi, max(lo, v))) if key == "look_pixels"
+                                             else float(min(hi, max(lo, v))))
+    rc = saved.get("reconnect")
+    if isinstance(rc, dict):
+        spots = rc.get("spots")
+        if isinstance(spots, dict):
+            for key, _name in RECONNECT_SPOTS:
+                v = spots.get(key)
+                if (isinstance(v, (list, tuple)) and len(v) == 2
+                        and all(isinstance(n, int) and not isinstance(n, bool) and n >= 0 for n in v)):
+                    settings["reconnect"]["spots"][key] = [v[0], v[1]]
+        cd = rc.get("click_delay")
+        if isinstance(cd, (int, float)) and not isinstance(cd, bool):
+            lo, hi = RECONNECT_CLICK_DELAY_RANGE
+            settings["reconnect"]["click_delay"] = float(min(hi, max(lo, cd)))
+        pd = rc.get("play_delay")
+        if isinstance(pd, (int, float)) and not isinstance(pd, bool):
+            lo, hi = RECONNECT_CLICK_DELAY_RANGE
+            settings["reconnect"]["play_delay"] = float(min(hi, max(lo, pd)))
+        if rc.get("enabled") is True and not reconnect_missing():
+            settings["reconnect"]["enabled"] = True    # only stays on while everything it needs is set
     if saved.get("config_section") in CONFIG_SECTIONS:
         settings["config_section"] = saved["config_section"]
     if isinstance(saved.get("always_on_top"), bool):
@@ -1042,6 +1317,15 @@ def load_settings(saved):
         settings["compact_ui"] = not saved["legacy_ui"]
     if isinstance(saved.get("fix_loot"), bool):
         settings["fix_loot"] = saved["fix_loot"]
+    if isinstance(saved.get("animations"), bool):
+        settings["animations"] = saved["animations"]
+    if isinstance(saved.get("auto_monitor"), bool):
+        settings["auto_monitor"] = saved["auto_monitor"]
+    if isinstance(saved.get("adaptive_resolution"), bool):
+        settings["adaptive_resolution"] = saved["adaptive_resolution"]
+    mon = saved.get("monitor")
+    if isinstance(mon, int) and not isinstance(mon, bool) and 1 <= mon <= 16:
+        settings["monitor"] = mon
     rs = saved.get("retry_scale")
     if isinstance(rs, (int, float)) and not isinstance(rs, bool) and 0.3 <= rs <= 3.0:
         settings["retry_scale"] = float(rs)
@@ -1053,8 +1337,11 @@ def load_settings(saved):
 
 
 def apply_timings(tm):
-    """Merge saved Edit configs overrides {section: {key: value}} into settings["timings"].
-    Unknown sections / keys and bad or out-of-range values are ignored."""
+    """Load per-macro edits, including validated family-specific Movement overrides.
+
+    Legacy global Movement values remain readable and serve as defaults until
+    the user changes that setting in a particular macro.
+    """
     if not isinstance(tm, dict):
         return
     for section, fields in CONFIG_FIELDS.items():
@@ -1065,6 +1352,18 @@ def apply_timings(tm):
             val = clean_cfg_value(spec, sv.get(spec[0]))
             if val is not None:
                 settings["timings"].setdefault(section, {})[spec[0]] = val
+    for family in FAMILIES:
+        saved = tm.get(family)
+        if not isinstance(saved, dict) or not isinstance(saved.get("_movement"), dict):
+            continue
+        allowed = set(CONFIG_SHARED_KEYS.get(family, ()))
+        for spec in CONFIG_FIELDS["Movement"]:
+            key = spec[0]
+            if key not in allowed:
+                continue
+            val = clean_cfg_value(spec, saved["_movement"].get(key))
+            if val is not None:
+                settings["timings"].setdefault(family, {}).setdefault("_movement", {})[key] = val
 
 
 def mission_timeout():
@@ -1073,7 +1372,92 @@ def mission_timeout():
     return float(max(MIN_FAILSAFE_SECONDS, fs["minutes"] * 60 + fs["seconds"]))
 
 
+def list_monitors():
+    """The real monitors as mss sees them (left / top / width / height), first monitor first."""
+    try:
+        with mss.mss() as sct:
+            return [dict(m) for m in sct.monitors[1:]]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def pick_monitor(monitors):
+    """`monitors` = an mss .monitors list (entry 0 = all screens together). The monitor chosen in
+    Settings > Keybinds > Monitor, or the first one when that monitor isn't connected any more."""
+    idx = MONITOR_INDEX if 1 <= MONITOR_INDEX < len(monitors) else 1
+    return monitors[idx] if idx < len(monitors) else monitors[0]
+
+
+def macro_monitor_rect(owner=None):
+    """(left, top, width, height) of the chosen monitor, in screen pixels."""
+    try:
+        with mss.mss() as sct:
+            m = pick_monitor(sct.monitors)
+            return m["left"], m["top"], m["width"], m["height"]
+    except Exception:  # noqa: BLE001
+        if owner is not None:
+            return 0, 0, owner.winfo_screenwidth(), owner.winfo_screenheight()
+        return 0, 0, 1920, 1080
+
+
 FAILSAFE_DEFAULT_Y = 0.80    # default failsafe click: middle of the X axis, this fraction down the Y axis
+
+
+def reconnect_macro_tab():
+    """Which of the two macro tabs the selected macro needs: Raids for a raid macro, else Missions."""
+    return "Raids" if family_is_raid(settings["family"]) else "Missions"
+
+
+def reconnect_missing():
+    """What Reconnect still needs before it can be turned on (a list of names, empty = ready).
+    Every required setting of the Reconnect window is checked here: the Disconnect Image, the Select
+    and Play pictures and all 8 coordinates of the tab (Missions or Raids) of the macro that is selected - the 4 shared ones
+    plus that tab's own 4."""
+    missing = []
+    if not override_path(RECONNECT_IMAGE_FILE):
+        missing.append("Disconnect Image")
+    for kind, filename in RECONNECT_IMAGE_FILES.items():
+        if not override_path(filename):
+            missing.append(RECONNECT_IMAGE_NAMES[kind] + " Image")
+    spots = settings["reconnect"]["spots"]
+    tab = reconnect_macro_tab()
+    shared = {k for k, _n in RECONNECT_SHARED_SPOTS}
+    for key, name in RECONNECT_TAB_SPOTS[tab]:
+        if spots.get(key) is None:
+            missing.append(name if key in shared else f"{tab} > {name}")
+    return missing
+
+
+def reconnect_click_delay():
+    """Seconds between the Reconnect clicks (Click delay in the Reconnect window)."""
+    try:
+        return float(settings["reconnect"].get("click_delay", RECONNECT_CLICK_DELAY))
+    except (TypeError, ValueError):
+        return float(RECONNECT_CLICK_DELAY)
+
+
+def reconnect_play_delay():
+    """Seconds between Create and Play (Play delay in the Reconnect window)."""
+    try:
+        return float(settings["reconnect"].get("play_delay", RECONNECT_PLAY_DELAY))
+    except (TypeError, ValueError):
+        return float(RECONNECT_PLAY_DELAY)
+
+
+def reconnect_steps():
+    """The clicks after a rejoin, in order: [(label, (x, y), picture, spot key), ...] - the 4 shared
+    coordinates, then the tab's own: Click missions / Click Raids, then 3 more. `picture` is
+    "select" / "play" when the click waits for that picture to show, else None."""
+    spots = settings["reconnect"]["spots"]
+    tab = reconnect_macro_tab()
+    shared = {k for k, _n in RECONNECT_SHARED_SPOTS}
+    steps = []
+    for key, name in RECONNECT_TAB_SPOTS[tab]:
+        xy = spots.get(key)
+        if xy:
+            steps.append((name if key in shared else f"{tab} > {name}", (xy[0], xy[1]),
+                          RECONNECT_STEP_GATES.get(key), key))
+    return steps
 
 
 def failsafe_default_point():
@@ -1161,10 +1545,1121 @@ def to_game_key(name, keypad=False):
     return n
 
 
+# --------------------------- custom macros (.tbmacro) -------------------------
+# Settings > Configs > "+" : your own macro, written as a pseudo-script or recorded. Every macro is
+# ONE plain text file in Documents\thebums Macro\Custom-Macros, so sharing it = sending the file
+# (drop a received .tbmacro into that folder and it shows up in the dropdown).
+CUSTOM_FOLDER = "Custom-Macros"
+MACRO_EXT = ".tbmacro"
+CUSTOM_PREFIX = "custom:"          # settings["family"] of a custom macro = "custom:<file name>"
+CUSTOM_STEP_NAMES = ["Running macro", "Waiting for retry"]
+CUSTOM_BADGE_COLORS = (("#14b8a6", "#04201d"), ("#a855f7", "#ffffff"), ("#f97316", "#1c0a00"),
+                       ("#ec4899", "#ffffff"), ("#22c55e", "#052e12"), ("#0ea5e9", "#021824"))
+MACRO_HEADER_RE = re.compile(r"^(name|author|description|version|type)\s*:\s*(.*)$", re.I)
+# "type: ..." tells the macro what a run of this script IS, so the counters stay honest:
+#   mission  - every run is one mission: counted in Missions, Completed / Failed, Discord embeds
+#   raid     - every run is one raid: counted in Raids / Vessels / the raid's Completed / Failed (like
+#              the Female Raid config), and the start is the skip button / raid_start.png
+MACRO_TYPES = {
+    "mission": "counts every run as a mission (default)",
+    "raid": "counts every run as a raid (Raids, Vessels, raid Completed / Failed)",
+}
+# "utility" was the old name of "raid" (it and its aliases still work in older macros)
+MACRO_TYPE_ALIASES = {"missions": "mission", "raids": "raid", "utility": "raid", "none": "raid",
+                      "other": "raid", "loop": "raid", "afk": "raid", "farm": "raid"}
+# functions a macro can call (with or without the brackets):  retry()  trackloot()  openchest() ...
+MACRO_FUNCS = ("retry", "trackloot", "openchest", "addwin", "addlose", "addmission", "addraid")
+MACRO_CALL_RE = re.compile(r"^([A-Za-z_]+)\s*\(\s*\)$")
+DEFAULT_MACRO_TYPE = "mission"             # a macro without a type: line behaves like it always did
+MACRO_MAX_SECONDS = 3600.0
+MACRO_MAX_DEPTH = 6                 # repeat / if inside repeat / if inside ...
+MACRO_IMG_EXTS = (".png", ".jpg", ".jpeg", ".bmp")   # pictures a macro can look for (find / imgclick)
+MACRO_INDENT = "    "                # one level of indentation (optional in a script, ignored when running)
+CUSTOM_IMG_THRESHOLD = 0.85         # how well a macro picture has to match to count as seen
+_custom_held = set()                # keys a macro has pressed with "down" and not released yet
+
+
+def custom_dir():
+    """Documents\\thebums Macro\\Custom-Macros - created if it doesn't exist yet."""
+    path = os.path.join(data_dir(), CUSTOM_FOLDER)
+    try:
+        os.makedirs(path, exist_ok=True)
+    except OSError:
+        pass
+    return path
+
+
+FILE_PROGID = "thebums.Macro"      # the Windows file type .tbmacro is attached to
+
+
+def register_thebums_file_type():
+    """Windows: give every .tbmacro file its own icon in Explorer (the lambda, FILE_ICON_FILE).
+    Written under HKEY_CURRENT_USER, so no admin rights are needed, and only when something is
+    different, so a normal start touches nothing. The icon is copied into Documents\\thebums Macro first:
+    a one-file .exe unpacks itself into a temp folder that is deleted again, and the registry has to
+    point at a file that stays. Double-clicking a .tbmacro is not changed (no open command is set).
+    Never raises - a missing icon or a locked registry just means the files keep the plain icon."""
+    if not IS_WIN:
+        return
+    try:
+        import filecmp
+        import winreg
+        src = asset_path(FILE_ICON_FILE)
+        if not os.path.isfile(src):
+            return
+        icon = os.path.join(data_dir(), FILE_ICON_FILE)
+        try:
+            if not os.path.isfile(icon) or not filecmp.cmp(src, icon, shallow=False):
+                shutil.copyfile(src, icon)
+        except OSError:
+            icon = src                          # can't copy it: point at the bundled one
+        changed = False
+
+        def put(path, name, value):
+            nonlocal changed
+            with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, path, 0,
+                                    winreg.KEY_READ | winreg.KEY_WRITE) as key:
+                try:
+                    if winreg.QueryValueEx(key, name)[0] == value:
+                        return
+                except OSError:
+                    pass
+                winreg.SetValueEx(key, name, 0, winreg.REG_SZ, value)
+                changed = True
+
+        classes = "Software\\Classes\\"
+        put(classes + MACRO_EXT, "", FILE_PROGID)
+        put(classes + MACRO_EXT, "Content Type", "text/plain")      # a .tbmacro is plain text
+        put(classes + MACRO_EXT, "PerceivedType", "text")
+        put(classes + FILE_PROGID, "", "thebums macro")                # the "Type" column in Explorer
+        put(classes + FILE_PROGID + "\\DefaultIcon", "", icon + ",0")
+        if changed:                             # tell Explorer, so the icon shows without a restart
+            ctypes.windll.shell32.SHChangeNotify(0x08000000, 0x0000, None, None)   # SHCNE_ASSOCCHANGED
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def is_custom(key):
+    return isinstance(key, str) and key.startswith(CUSTOM_PREFIX)
+
+
+def custom_filename(key):
+    return key[len(CUSTOM_PREFIX):] if is_custom(key) else str(key)
+
+
+def custom_path(key):
+    """Full path of a macro; basename() so a hand-edited setting can never leave the folder."""
+    return os.path.join(custom_dir(), os.path.basename(custom_filename(key)))
+
+
+def family_valid(key):
+    """A built-in config, or a custom macro whose file is still there."""
+    if key in FAMILIES:
+        return True
+    return is_custom(key) and os.path.isfile(custom_path(key))
+
+
+def safe_macro_filename(name):
+    base = re.sub(r"[^\w\- ]+", "", name, flags=re.UNICODE).strip().replace(" ", "_")[:60]
+    return (base or "macro") + MACRO_EXT
+
+
+def custom_badge(name):
+    letter = next((ch for ch in name if ch.isalnum()), "?").upper()
+    bg, fg = CUSTOM_BADGE_COLORS[sum(name.encode("utf-8")) % len(CUSTOM_BADGE_COLORS)]
+    return (letter, bg, fg)
+
+
+def list_custom_macros():
+    """[(key, display name, file name)] of every .tbmacro in the Custom-Macros folder."""
+    found = []
+    try:
+        files = sorted(os.listdir(custom_dir()), key=str.lower)
+    except OSError:
+        return found
+    for fname in files:
+        if not fname.lower().endswith(MACRO_EXT):
+            continue
+        name = os.path.splitext(fname)[0]
+        try:
+            with open(os.path.join(custom_dir(), fname), "r", encoding="utf-8-sig") as fh:
+                for i, line in enumerate(fh):
+                    m = MACRO_HEADER_RE.match(line.strip())
+                    if m and m.group(1).lower() == "name" and m.group(2).strip():
+                        name = m.group(2).strip()
+                        break
+                    if i > 40:
+                        break
+        except (OSError, UnicodeDecodeError):
+            continue
+        found.append((CUSTOM_PREFIX + fname, name, fname))
+    return found
+
+
+def normalize_macro_type(word):
+    """'Mission' / 'raid' ... -> 'mission' | 'raid'. None when it is not a known type."""
+    w = (word or "").strip().lower()
+    w = MACRO_TYPE_ALIASES.get(w, w)
+    return w if w in MACRO_TYPES else None
+
+
+_macro_type_cache = {}      # file name -> (mtime, type)
+
+
+def custom_macro_type(key):
+    """The type: of a custom macro ('mission' when the line is missing or unknown)."""
+    path = custom_path(key)
+    try:
+        stamp = os.path.getmtime(path)
+    except OSError:
+        return DEFAULT_MACRO_TYPE
+    hit = _macro_type_cache.get(path)
+    if hit and hit[0] == stamp:
+        return hit[1]
+    kind = DEFAULT_MACRO_TYPE
+    try:
+        with open(path, "r", encoding="utf-8-sig") as fh:
+            for i, line in enumerate(fh):
+                m = MACRO_HEADER_RE.match(_strip_macro_comment(line))
+                if m and m.group(1).lower() == "type":
+                    kind = normalize_macro_type(m.group(2)) or DEFAULT_MACRO_TYPE
+                    break
+                if i > 40:
+                    break
+    except (OSError, UnicodeDecodeError):
+        pass
+    _macro_type_cache[path] = (stamp, kind)
+    return kind
+
+
+def family_is_raid(fam):
+    """Female Raid, or a custom macro of type: raid - they count raids / vessels, not missions."""
+    return fam == "Female Raid" or fam in ATTACK_FAMILIES or (is_custom(fam) and custom_macro_type(fam) == "raid")
+
+
+def raid_counting():
+    """family_is_raid() of the config that is picked now."""
+    return family_is_raid(settings["family"])
+
+
+_macro_chest_cache = {}      # path -> (mtime, uses openchest)
+
+
+def custom_uses_chest(key):
+    """Does that custom macro call openchest()? (Then Settings > Configs shows the chest spots.)"""
+    path = custom_path(key)
+    try:
+        stamp = os.path.getmtime(path)
+    except OSError:
+        return False
+    hit = _macro_chest_cache.get(path)
+    if hit and hit[0] == stamp:
+        return hit[1]
+    uses = False
+    try:
+        with open(path, "r", encoding="utf-8-sig") as fh:
+            uses = any(re.match(r"openchest\b", _strip_macro_comment(line), re.I) for line in fh)
+    except (OSError, UnicodeDecodeError):
+        pass
+    _macro_chest_cache[path] = (stamp, uses)
+    return uses
+
+
+def family_items():
+    """Everything the config dropdown lists: the built-in configs, then the custom macros."""
+    items = [(f, FAMILY_LABELS[f], FAMILY_BADGES[f], FAMILY_TAGS.get(f)) for f in FAMILIES]
+    for key, name, _fname in list_custom_macros():
+        items.append((key, name, custom_badge(name), "Raid" if custom_macro_type(key) == "raid" else None))
+    return items
+
+
+# ----- the pseudo-script: parsing -----
+class MacroSyntaxError(Exception):
+    pass
+
+
+def resolve_macro_key(word):
+    """A key word of a script -> what pydirectinput presses (None = unknown key).
+    ability1..ability5 / dash / strafe / strafe_d / back / grab are YOUR keybinds from Settings, so a
+    shared macro uses the keys of whoever runs it."""
+    n = word.strip().lower()
+    # Ability 1 and Escape grab are the same in-game slot in this macro.
+    # Keep one configurable keybind to avoid a duplicate-key conflict in Settings.
+    if n == "ability1":
+        return settings["keybinds"].get("grab")
+    if n in GAME_BINDS:
+        return settings["keybinds"].get(n)
+    key = to_game_key(n)
+    if key is None and "_" in n:
+        key = to_game_key(n.replace("_", " "))
+    return key
+
+
+def normalize_image_name(word):
+    """What a script wrote after find / imgclick -> the file name in asset_override ('retry' and
+    'retry.png' both give 'retry.png'). None when it can't be a picture there (folders, odd names)."""
+    w = (word or "").strip()
+    if (not w or w.startswith(".") or "/" in w or "\\" in w
+            or not re.fullmatch(r"[\w\-.]+", w, re.UNICODE)):
+        return None
+    if not w.lower().endswith(MACRO_IMG_EXTS):
+        w += ".png"
+    return w
+
+
+def safe_image_name(name):
+    """A name typed in a dialog -> a file name a script can use (no spaces / folders)."""
+    base = os.path.basename((name or "").replace("\\", "/"))
+    stem, ext = os.path.splitext(base)
+    stem = re.sub(r"[^\w\-]+", "_", stem, flags=re.UNICODE).strip("_")[:50]
+    if not stem:
+        return None
+    ext = ext.lower()
+    return stem + (ext if ext in MACRO_IMG_EXTS else ".png")
+
+
+def image_exists(name):
+    """Is there a picture of that name - the user's own (asset_override) or a built-in one?"""
+    return bool(override_path(name) or os.path.isfile(asset_path(name)))
+
+
+def _parse_condition(words):
+    """The words after 'if' -> a condition tree:
+    ('find', picture) | ('not', cond) | ('and', a, b) | ('or', a, b)   (and binds tighter than or)"""
+    usage = "if find IMAGE.png   (also: not find ..., and, or)"
+    pos = [0]
+
+    def peek():
+        return words[pos[0]].lower() if pos[0] < len(words) else None
+
+    def take():
+        pos[0] += 1
+        return words[pos[0] - 1]
+
+    def atom():
+        w = peek()
+        if w is None:
+            raise MacroSyntaxError(f"the condition is not finished - use: {usage}")
+        if w == "not":
+            take()
+            return ("not", atom())
+        if w == "find":
+            take()
+            if peek() is None:
+                raise MacroSyntaxError("'find' needs a picture, like: find retry.png")
+            raw = take()
+            img = normalize_image_name(raw)
+            if img is None:
+                raise MacroSyntaxError(f"'{raw}' is not a picture file name (use a name like "
+                                       "retry.png - no spaces, no folders)")
+            return ("find", img)
+        raise MacroSyntaxError(f"unknown condition '{words[pos[0]]}' - use: {usage}")
+
+    def conj():
+        node = atom()
+        while peek() == "and":
+            take()
+            node = ("and", node, atom())
+        return node
+
+    def disj():
+        node = conj()
+        while peek() == "or":
+            take()
+            node = ("or", node, conj())
+        return node
+
+    node = disj()
+    if pos[0] < len(words):
+        raise MacroSyntaxError(f"unexpected '{words[pos[0]]}' in the condition - use: {usage}")
+    return node
+
+
+def macro_node_images(nodes):
+    """Every picture name a parsed script looks for (find / imgclick), sorted."""
+    out = set()
+
+    def conds(c):
+        if c is None:
+            return
+        if c[0] == "find":
+            out.add(c[1])
+        elif c[0] == "not":
+            conds(c[1])
+        else:
+            conds(c[1])
+            conds(c[2])
+
+    def walk(ns):
+        for n in ns:
+            if n[0] == "imgclick":
+                out.add(n[1])
+            elif n[0] == "if":
+                conds(n[1])
+                walk(n[2])
+                walk(n[3])
+            elif n[0] == "repeat":
+                walk(n[2])
+    walk(nodes)
+    return sorted(out, key=str.lower)
+
+
+def macro_image_usage():
+    """{picture name: [names of the macros that use it]} over every .tbmacro in Custom-Macros. Anyone
+    who gets a macro sees its pictures listed in Fix image detection > Macros (their own copy of
+    each picture goes in asset_override, with the same name)."""
+    used = {}
+    for key, name, _fname in list_custom_macros():
+        try:
+            with open(custom_path(key), "r", encoding="utf-8-sig") as fh:
+                text = fh.read()
+        except (OSError, UnicodeDecodeError):
+            continue
+        for raw in text.splitlines():
+            words = _strip_macro_comment(raw).split()
+            if not words:
+                continue
+            found = []
+            if words[0].lower() == "imgclick" and len(words) > 1:
+                found.append(words[1])
+            found += [words[i + 1] for i, w in enumerate(words[:-1]) if w.lower() == "find"]
+            for w in found:
+                img = normalize_image_name(w)
+                if img and name not in used.setdefault(img, []):
+                    used[img].append(name)
+    return used
+
+
+def macro_picture_list():
+    """[(file name, [macros that use it])] for the Macros tab of Fix image detection: every picture
+    a macro looks for, plus every picture the user dropped into asset_override that isn't one of
+    the macro's own (those are on the UI / Loot tabs)."""
+    builtin = {f for _label, f in ASSET_LIST}
+    used = macro_image_usage()
+    names = set(used)
+    try:
+        for f in os.listdir(override_dir()):
+            if f.lower().endswith(MACRO_IMG_EXTS) and os.path.isfile(os.path.join(override_dir(), f)):
+                names.add(f)
+    except OSError:
+        pass
+    names -= builtin
+    return [(n, used.get(n, [])) for n in sorted(names, key=str.lower)]
+
+
+def _macro_num(word, what, lo=0.0, hi=MACRO_MAX_SECONDS):
+    try:
+        v = float(word)
+    except ValueError:
+        raise MacroSyntaxError(f"'{word}' is not a number ({what})")
+    if not (lo <= v <= hi):
+        raise MacroSyntaxError(f"{what} must be between {lo:g} and {hi:g}")
+    return v
+
+
+def _macro_int(word, what, lo=-20000, hi=20000):
+    try:
+        v = int(word)
+    except ValueError:
+        raise MacroSyntaxError(f"'{word}' is not a whole number ({what})")
+    if not (lo <= v <= hi):
+        raise MacroSyntaxError(f"{what} must be between {lo} and {hi}")
+    return v
+
+
+def _macro_key(word):
+    key = resolve_macro_key(word)
+    if not key:
+        raise MacroSyntaxError(f"unknown key '{word}'")
+    return key
+
+
+STRAFE_WORDS = {"left": "strafe", "l": "strafe", "right": "strafe_d", "r": "strafe_d",
+                "back": "back", "backward": "back", "b": "back"}
+DASH_DIRECTION_BINDS = {"forward": "dash", "straight": "dash", "front": "dash", "f": "dash",
+                        "left": "strafe", "l": "strafe", "right": "strafe_d", "r": "strafe_d",
+                        "back": "back", "backward": "back", "b": "back"}
+
+
+def _strafe_key(word):
+    """'left' / 'right' -> your Strafe A / Strafe D keybind. Anything else is read as a key (a, d ...)."""
+    bind = STRAFE_WORDS.get(word.strip().lower())
+    return resolve_macro_key(bind) if bind else resolve_macro_key(word)
+
+
+def _macro_args(cmd, args, lo, hi, usage):
+    if not (lo <= len(args) <= hi):
+        raise MacroSyntaxError(f"'{cmd}' needs: {usage}")
+
+
+def _strip_macro_comment(s):
+    s = s.strip()
+    if s.startswith("#") or s.startswith("//"):
+        return ""
+    return re.split(r"\s+(?:#|//)", s, maxsplit=1)[0].strip()
+
+
+def _parse_macro_command(cmd, args, line):
+    """One line -> a node tuple (op, ...)."""
+    if cmd in ("press", "tap"):
+        _macro_args(cmd, args, 1, 1, "press KEY")
+        return ("press", _macro_key(args[0]))
+    if cmd in ("doubletap", "dtap"):
+        _macro_args(cmd, args, 1, 1, "doubletap KEY")
+        return ("doubletap", _macro_key(args[0]))
+    if cmd == "down":
+        _macro_args(cmd, args, 1, 1, "down KEY")
+        return ("down", _macro_key(args[0]))
+    if cmd == "up":
+        _macro_args(cmd, args, 1, 1, "up KEY")
+        return ("up", _macro_key(args[0]))
+    if cmd == "hold":
+        _macro_args(cmd, args, 2, 2, "hold KEY SECONDS")
+        return ("hold", _macro_key(args[0]), _macro_num(args[1], "seconds"))
+    if cmd in ("wait", "sleep"):
+        _macro_args(cmd, args, 1, 1, "wait SECONDS   (or a random one: wait 0.5-1.2)")
+        word = args[0]
+        if "-" in word[1:]:
+            a, b = word.split("-", 1)
+            lo, hi = _macro_num(a, "seconds"), _macro_num(b, "seconds")
+            if hi < lo:
+                raise MacroSyntaxError("in 'wait A-B' the second number must not be smaller")
+            return ("wait", lo, hi)
+        v = _macro_num(word, "seconds")
+        return ("wait", v, v)
+    if cmd == "strafe":
+        usage = "strafe left|right|back|KEY [SECONDS] [GAP]   (no SECONDS = one dash)"
+        _macro_args(cmd, args, 1, 3, usage)
+        key = _strafe_key(args[0])
+        if not key:
+            raise MacroSyntaxError(f"'{args[0]}' is not a dash direction - use left, right, back or a key like a / d / s")
+        secs = _macro_num(args[1], "seconds") if len(args) >= 2 else 0.0
+        gap = _macro_num(args[2], "gap", 0.0, 60) if len(args) == 3 else None
+        return ("strafe", key, secs, gap, args[0].lower())
+    if cmd in ("dash", "backdash", "dashback"):
+        # dash [DIRECTION] [COUNT] [COOLDOWN] — a single dash means two taps of the direction key.
+        # e.g. dash right 2 1.0 = D-D, wait 1 second, D-D. No Space key is sent.
+        remaining = list(args)
+        direction = "back" if cmd in ("backdash", "dashback") else "forward"
+        if cmd == "dash" and remaining and remaining[0].lower() in DASH_DIRECTION_BINDS:
+            direction = remaining.pop(0).lower()
+        _macro_args(cmd, remaining, 0, 2, "dash [forward|left|right|back] [COUNT] [COOLDOWN]")
+        count = _macro_int(remaining[0], "dash count", 1, 50) if remaining else 1
+        cooldown = _macro_num(remaining[1], "dash cooldown", 0.0, 60.0) if len(remaining) > 1 else 1.0
+        bind = DASH_DIRECTION_BINDS[direction]
+        key = _macro_key(bind)
+        return ("directional_dash", key, count, cooldown, direction)
+    if cmd == "spam":
+        _macro_args(cmd, args, 2, 3, "spam KEY SECONDS [GAP]")
+        gap = _macro_num(args[2], "gap", 0.02, 60) if len(args) == 3 else 0.1
+        return ("spam", _macro_key(args[0]), _macro_num(args[1], "seconds"), gap, args[0].lower())
+    if cmd == "click":
+        button = "left"
+        rest = list(args)
+        if rest and rest[-1].lower() in ("left", "right"):
+            button = rest.pop().lower()
+        if len(rest) not in (0, 2):
+            raise MacroSyntaxError("'click' needs: click   or   click X Y   (+ left / right)")
+        if rest:
+            return ("click", _macro_int(rest[0], "X", 0), _macro_int(rest[1], "Y", 0), button)
+        return ("click", None, None, button)
+    if cmd == "move":
+        _macro_args(cmd, args, 2, 2, "move X Y")
+        return ("move", _macro_int(args[0], "X", 0), _macro_int(args[1], "Y", 0))
+    if cmd == "moverel":
+        _macro_args(cmd, args, 2, 2, "moverel DX DY")
+        return ("moverel", _macro_int(args[0], "DX"), _macro_int(args[1], "DY"))
+    if cmd == "imgclick":
+        usage = "imgclick IMAGE.png [SECONDS] [right]   (SECONDS = keep looking for it that long)"
+        rest = list(args)
+        button = "left"
+        if rest and rest[-1].lower() in ("left", "right"):
+            button = rest.pop().lower()
+        if not 1 <= len(rest) <= 2:
+            raise MacroSyntaxError(f"'imgclick' needs: {usage}")
+        img = normalize_image_name(rest[0])
+        if img is None:
+            raise MacroSyntaxError(f"'{rest[0]}' is not a picture file name (use a name like "
+                                   "retry.png - no spaces, no folders)")
+        secs = _macro_num(rest[1], "seconds") if len(rest) == 2 else 0.0
+        return ("imgclick", img, secs, button)
+    if cmd in MACRO_FUNCS:
+        _macro_args(cmd, args, 0, 0, f"{cmd}()")
+        return (cmd,)
+    if cmd == "find":
+        raise MacroSyntaxError("'find' only works inside a condition, like:  if find retry.png")
+    if cmd in ("log", "status"):
+        text = line.split(None, 1)[1] if len(args) else ""
+        return (cmd, text)
+    raise MacroSyntaxError(f"unknown command '{cmd}'")
+
+
+def parse_macro(text):
+    """Pseudo-script text -> (meta dict, program, errors).
+    program = list of nodes. A repeat node is ("repeat", count or None, [nodes], line); an if node is
+    ("if", condition, [nodes when true], [nodes when false], line).
+    errors = [(line number, message)] - empty when the script is fine.
+    Indentation is optional: only the words on a line matter, never the spaces before them."""
+    meta, errors = {}, []
+    root = []
+    stack = [(root, 0, "root", None)]   # (list the next node goes into, line that opened it, kind, node)
+    for no, raw in enumerate(text.splitlines(), 1):
+        line = _strip_macro_comment(raw)
+        if not line:
+            continue
+        m = MACRO_HEADER_RE.match(line)
+        if m:
+            field, value = m.group(1).lower(), m.group(2).strip()
+            if field == "type":
+                kind = normalize_macro_type(value)
+                if kind is None:
+                    errors.append((no, f"unknown type '{value}' - use: " + ", ".join(MACRO_TYPES)))
+                else:
+                    value = kind
+            meta[field] = value
+            continue
+        parts = line.split()
+        call = MACRO_CALL_RE.match(line)            # retry()  /  addwin ( )
+        if call:
+            cmd, args = call.group(1).lower(), []
+        else:
+            cmd, args = parts[0].lower(), parts[1:]
+        try:
+            if cmd == "repeat":
+                _macro_args(cmd, args, 0, 1, "repeat [TIMES]  ...  end")
+                times = _macro_int(args[0], "times", 1, 100000) if args else None
+                if len(stack) > MACRO_MAX_DEPTH:
+                    raise MacroSyntaxError(f"blocks are nested more than {MACRO_MAX_DEPTH} deep")
+                node = ("repeat", times, [], no)
+                stack[-1][0].append(node)
+                stack.append((node[2], no, "repeat", node))
+            elif cmd == "if":
+                err = None
+                try:
+                    cond = _parse_condition(args)
+                except MacroSyntaxError as e:
+                    cond, err = None, e         # still opens a block, so its 'end' isn't a second error
+                if len(stack) > MACRO_MAX_DEPTH and err is None:
+                    err = MacroSyntaxError(f"blocks are nested more than {MACRO_MAX_DEPTH} deep")
+                node = ("if", cond, [], [], no)
+                stack[-1][0].append(node)
+                stack.append((node[2], no, "if", node))
+                if err is not None:
+                    raise err
+            elif cmd == "else":
+                _macro_args(cmd, args, 0, 0, "else   (on its own line)")
+                if stack[-1][2] == "else":
+                    raise MacroSyntaxError("this 'if' already has an 'else'")
+                if stack[-1][2] != "if":
+                    raise MacroSyntaxError("'else' without an 'if' above it")
+                _body, opened, _kind, node = stack[-1]
+                stack[-1] = (node[3], opened, "else", node)
+            elif cmd == "end":
+                _macro_args(cmd, args, 0, 0, "end   (on its own line)")
+                if len(stack) == 1:
+                    raise MacroSyntaxError("'end' without an 'if' or 'repeat' above it")
+                stack.pop()
+            else:
+                stack[-1][0].append(_parse_macro_command(cmd, args, line) + (no,))
+        except MacroSyntaxError as e:
+            errors.append((no, str(e)))
+    for _body, opened, kind, _node in stack[1:]:
+        errors.append((opened, f"'{'if' if kind == 'else' else kind}' is never closed with 'end'"))
+    return meta, root, sorted(errors)
+
+
+def count_macro_nodes(nodes):
+    total = 0
+    for n in nodes:
+        total += 1
+        if n[0] == "repeat":
+            total += count_macro_nodes(n[2])
+        elif n[0] == "if":
+            total += count_macro_nodes(n[2]) + count_macro_nodes(n[3])
+    return total
+
+
+# ----- the pseudo-script: running (inside the macro thread, so stop / pause / retry just work) -----
+def _macro_mouse_rel(dx, dy):
+    if IS_WIN:
+        ctypes.windll.user32.mouse_event(0x0001, int(dx), int(dy), 0, 0)   # MOUSEEVENTF_MOVE
+    else:
+        pydirectinput.moveRel(int(dx), int(dy), _pause=False)
+
+
+def _macro_click(x, y, button):
+    if x is not None:
+        pydirectinput.moveTo(x, y)
+        wait(0.08, scan=False)
+        pydirectinput.moveRel(1, 0)         # a real mouse move, same as the retry click
+        wait(0.05, scan=False)
+    pydirectinput.click(button=button)
+
+
+_macro_img_cache = {}      # picture name -> (stamp, template or None)
+_macro_img_warned = set()  # pictures already reported as missing (one log line each)
+
+
+def _macro_image(name):
+    """The picture a script looks for: the user's own copy in asset_override wins, else a built-in
+    one of that name in the image folder. Their picture is scaled to 1080p size like every other
+    (see load_template). Returns None - and says so once in the log - when there is none."""
+    mine = override_path(name)
+    try:
+        stamp = ("mine", os.path.getmtime(mine)) if mine else ("built", os.path.isfile(asset_path(name)))
+    except OSError:
+        stamp = ("mine", 0)
+    stamp += (round(_scale, 3),)
+    hit = _macro_img_cache.get(name)
+    if hit and hit[0] == stamp:
+        return hit[1]
+    try:
+        tpl = load_template(name)
+    except FileNotFoundError:
+        tpl = None
+    _macro_img_cache[name] = (stamp, tpl)
+    if tpl is None and name not in _macro_img_warned:
+        _macro_img_warned.add(name)
+        log(f"Macro picture '{name}' not found - add it in Settings > Fix image detection > Macros "
+            "(until then 'find' says not seen)")
+    return tpl
+
+
+def _macro_find(name, screen):
+    """Match (cx, cy, score, w, h) of the picture on that screenshot, or None."""
+    tpl = _macro_image(name)
+    if tpl is None:
+        return None
+    return find_template(screen, tpl, CUSTOM_IMG_THRESHOLD)
+
+
+def _macro_eval(cond, shot):
+    """True / False for a condition tree. `shot` = [screenshot or None]: taken the first time a
+    'find' needs it, so 'a and b' / 'a or b' look at one and the same picture of the screen."""
+    kind = cond[0]
+    if kind == "find":
+        if shot[0] is None:
+            shot[0] = grab_screen()
+        return _macro_find(cond[1], shot[0]) is not None
+    if kind == "not":
+        return not _macro_eval(cond[1], shot)
+    if kind == "and":
+        return _macro_eval(cond[1], shot) and _macro_eval(cond[2], shot)
+    return _macro_eval(cond[1], shot) or _macro_eval(cond[2], shot)
+
+
+def _macro_imgclick(name, seconds, button):
+    """Find the picture on screen and click its middle. With seconds > 0 keep looking that long
+    (stop / pause / the retry button keep working meanwhile); not found = skipped, the macro goes on."""
+    end = time.time() + seconds
+    while True:
+        tick()
+        hit = _macro_find(name, grab_screen())
+        if hit:
+            cx, cy, _score, tw, th = hit
+            jit = max(1, int(min(tw, th) * _scale)) // 6
+            x, y = frame_to_screen(cx, cy)
+            x += random.randint(-jit, jit)
+            y += random.randint(-jit, jit)
+            detail(f"Clicking {name}")
+            _macro_click(x, y, button)
+            return True
+        left = end - time.time()
+        if left <= 0:
+            if seconds > 0:
+                log(f"imgclick: {name} not seen after {seconds:g}s - skipped")
+            else:
+                detail(f"{name} not on screen - skipped")
+            return False
+        detail(f"Looking for {name}... {left:.0f}s")
+        wait(min(0.15, left))
+
+
+def _macro_strafe(key, seconds, gap, label):
+    """One strafe = the key double-tapped (like a-a). With SECONDS: strafe again and again that long,
+    with the same random pause between strafes as the built-in configs (or your own GAP)."""
+    double_tap(key)
+    if seconds <= 0:
+        return
+    end = time.time() + seconds
+    while True:
+        left = end - time.time()
+        if left <= 0:
+            return
+        detail(f"Strafing {label}... {left:.0f}s left")
+        pause = gap if gap is not None else random.uniform(*tv("Shiki", "strafe_gap"))
+        wait(min(pause, left))
+        if end - time.time() <= 0:
+            return
+        double_tap(key)
+
+
+def macro_retry():
+    """retry(): do what every config does at the end of a mission - wait for the retry button. When
+    it shows up the normal retry handling takes over (result + loot, click, hands off, next
+    mission), so the lines below a retry() never run."""
+    set_step(1)
+    show("Waiting for retry", "retry() - waiting for the retry button")
+    log("Macro: retry() - waiting for the retry button")
+    while True:
+        wait(0.1)
+
+
+def macro_trackloot():
+    """trackloot(): look for the loot pictures on screen now and add what is seen to the loot
+    counters. The retry handling then doesn't count the same loot a second time."""
+    if not any(_loot_templates.values()):
+        log("trackloot(): no loot pictures loaded - nothing to look for (Settings > Fix image detection)")
+        return
+    show("Tracking loot", "Looking for the loot pictures")
+    found = {}
+    for quality, scan_time in (("normal", None), ("low", LOW_LOOT_SCAN_TIME)):
+        if not _loot_templates.get(quality):
+            continue
+        got, _result = scan_end_screen(quality, want_loot=True, want_result=False,
+                                       scan_time=scan_time)
+        found.update(got)
+        if found:
+            break
+    record_loot(found)
+    if found:
+        state["macro_loot"] = {**(state.get("macro_loot") or {}), **found}
+
+
+def macro_openchest():
+    """openchest(): the raid's chest part. Waits for the finish button, then opens chest 1 (and chest
+    2 when it is on) and clicks finish - the spots and click times are the Female Raid ones
+    (Settings > Configs > Chest locations / Edit configs)."""
+    if not _raid_templates.get("finish"):
+        log("openchest(): finish_button.png not found - add it in Settings > Configs > "
+            "Fix image detection")
+        return
+    log("openchest(): waiting for the finish button")
+    hit = None
+    while hit is None:
+        show("Opening chests", "Waiting for the finish button...")
+        hit = raid_wait_finish_button(30)
+    raid_finish(hit, phase=False)
+
+
+def macro_add_result(kind):
+    """addwin() / addlose(): one more Completed / Failed (the raid's for a raid macro). The
+    retry handling then doesn't read the result a second time."""
+    state["macro_result"] = kind
+    counters()[1][kind] += 1
+    log(f"Result: {kind.capitalize()} (added by the macro)")
+    push_stats()
+
+
+def macro_add_count(raid):
+    """addmission() / addraid(): one more in the Missions / Raids counter."""
+    (raid_stats if raid else stats)["missions"] += 1
+    log(f"{'Raid' if raid else 'Mission'} added by the macro")
+    push_stats()
+
+
+def run_macro_nodes(nodes):
+    for node in nodes:
+        op = node[0]
+        if op == "press":
+            tap(node[1])
+        elif op == "doubletap":
+            double_tap(node[1])
+        elif op == "down":
+            pydirectinput.keyDown(node[1])
+            _custom_held.add(node[1])
+        elif op == "up":
+            pydirectinput.keyUp(node[1])
+            _custom_held.discard(node[1])
+        elif op == "hold":
+            pydirectinput.keyDown(node[1])
+            try:
+                wait(node[2])
+            finally:
+                pydirectinput.keyUp(node[1])
+        elif op == "wait":
+            secs = random.uniform(node[1], node[2]) if node[2] > node[1] else node[1]
+            detail(f"Waiting {secs:.1f}s")
+            wait(secs)
+        elif op == "spam":
+            spam_key_for(node[1], node[2], node[3], node[4])
+        elif op == "strafe":
+            _macro_strafe(node[1], node[2], node[3], node[4])
+        elif op == "directional_dash":
+            key, count, cooldown, direction = node[1:5]
+            for i in range(count):
+                tick()
+                detail(f"{direction.capitalize()} Dash {i+1}/{count}")
+                double_tap(key)                # each Dash = exactly two taps of its direction
+                if i + 1 < count:
+                    wait(cooldown)              # cooldown BETWEEN dashes, not between the two taps
+        elif op == "click":
+            _macro_click(node[1], node[2], node[3])
+        elif op == "imgclick":
+            _macro_imgclick(node[1], node[2], node[3])
+        elif op == "if":
+            tick()                              # stop / pause / retry work even in a tight loop of ifs
+            run_macro_nodes(node[2] if _macro_eval(node[1], [None]) else node[3])
+        elif op == "retry":
+            macro_retry()
+        elif op == "trackloot":
+            macro_trackloot()
+        elif op == "openchest":
+            macro_openchest()
+        elif op == "addwin":
+            macro_add_result("completed")
+        elif op == "addlose":
+            macro_add_result("failed")
+        elif op == "addmission":
+            macro_add_count(False)
+        elif op == "addraid":
+            macro_add_count(True)
+        elif op == "move":
+            pydirectinput.moveTo(node[1], node[2])
+        elif op == "moverel":
+            _macro_mouse_rel(node[1], node[2])
+        elif op == "log":
+            log(node[1])
+        elif op == "status":
+            show(node[1])
+        elif op == "repeat":
+            if node[1] is None:             # no number: until the mission ends (the retry button)
+                while True:
+                    run_macro_nodes(node[2])
+                    wait(0.02)              # never a hot loop, even with an empty body
+            else:
+                for _ in range(node[1]):
+                    run_macro_nodes(node[2])
+
+
+def custom_routine():
+    """The mission of a custom macro: run the script once, then wait for the retry button like every
+    other config. Never returns normally (ends with RetryFound / stop)."""
+    key = settings["family"]
+    try:
+        with open(custom_path(key), "r", encoding="utf-8-sig") as fh:
+            text = fh.read()
+    except (OSError, UnicodeDecodeError) as e:
+        raise RuntimeError(f"custom macro '{custom_filename(key)}' could not be read: {e}")
+    meta, program, errors = parse_macro(text)
+    title = meta.get("name") or os.path.splitext(custom_filename(key))[0]
+    if errors:
+        for no, msg in errors[:8]:
+            log(f"{title}: line {no}: {msg}")
+        raise RuntimeError(f"custom macro '{title}' has {len(errors)} error(s) - fix it in "
+                           "Settings > Configs (the Edit button next to the dropdown)")
+    _macro_img_cache.clear()
+    _macro_img_warned.clear()
+    set_step(0)
+    show(title, "Running your macro")
+    kind = normalize_macro_type(meta.get("type")) or DEFAULT_MACRO_TYPE
+    log(f"Custom macro '{title}': running  (type: {kind}"
+        + ("" if kind == "mission" else " - not counted as a mission") + ")")
+    try:
+        run_macro_nodes(program)
+        set_step(1)
+        show("Waiting for retry", f"'{title}' is finished")
+        log(f"Custom macro '{title}': finished - waiting for the retry button")
+        while True:
+            wait(0.1)
+    finally:
+        for k in list(_custom_held):        # a macro that pressed "down" and never "up"
+            try:
+                pydirectinput.keyUp(k)
+            except Exception:  # noqa: BLE001
+                pass
+        _custom_held.clear()
+
+
+# ----- recording -----
+def start_mouse_watch(on_click):
+    """Call on_click(x, y, 'left' | 'right') for every click anywhere on the screen.
+    Returns a function that stops watching, or None if clicks can't be watched on this system."""
+    if IS_WIN:
+        from ctypes import wintypes
+        stop = threading.Event()
+
+        def poll():
+            user32 = ctypes.windll.user32
+            pt = wintypes.POINT()
+            was = {0x01: False, 0x02: False}
+            while not stop.is_set():
+                for vk, name in ((0x01, "left"), (0x02, "right")):
+                    down = bool(user32.GetAsyncKeyState(vk) & 0x8000)
+                    if down and not was[vk]:
+                        user32.GetCursorPos(ctypes.byref(pt))
+                        try:
+                            on_click(pt.x, pt.y, name)
+                        except Exception:  # noqa: BLE001
+                            pass
+                    was[vk] = down
+                time.sleep(0.004)
+        threading.Thread(target=poll, daemon=True).start()
+        return stop.set
+    try:
+        from pynput import mouse as pm
+    except Exception:  # noqa: BLE001
+        return None
+
+    def on_c(x, y, button, pressed):
+        if pressed and button in (pm.Button.left, pm.Button.right):
+            on_click(int(x), int(y), "left" if button == pm.Button.left else "right")
+    lis = pm.Listener(on_click=on_c)
+    lis.daemon = True
+    lis.start()
+    return lis.stop
+
+
+class MacroRecorder:
+    """Records key presses and mouse clicks and turns them into pseudo-script lines.
+    Not recorded: mouse movement (camera turns) - add those with 'moverel'."""
+    MIN_WAIT = 0.02         # shorter gaps are not written
+    PRESS_MAX = 0.30        # a key held shorter than this becomes 'press', longer becomes 'hold'
+    PRESS_COST = 0.05       # what a 'press' takes while it runs (taken off the next 'wait')
+    CLICK_COST = 0.15
+
+    def __init__(self, use_binds=True):
+        self.use_binds = use_binds
+        self.events = []                # (seconds, "down" | "up" | "click", data)
+        self.t0 = None                  # None = not recording yet (countdown)
+        self.stop_requested = False
+        self.skipped = set()
+        self.ignore = None              # (x1, y1, x2, y2): clicks in here (the indicator) are not recorded
+        self.mouse_ok = False
+        self._down = set()
+        self._handles = []
+        self._mouse_stop = None
+
+    def start(self):
+        unregister_hotkeys()            # F8 / F6 / F7 must not run the macro while the player plays
+        self._handles = [keyboard.on_press(self._on_down), keyboard.on_release(self._on_up)]
+        self._mouse_stop = start_mouse_watch(self._on_click)
+        self.mouse_ok = self._mouse_stop is not None
+
+    def begin(self):
+        self.t0 = time.perf_counter()
+
+    def stop(self):
+        for h in self._handles:
+            try:
+                keyboard.unhook(h)
+            except (KeyError, ValueError):
+                pass
+        self._handles = []
+        if self._mouse_stop is not None:
+            try:
+                self._mouse_stop()
+            except Exception:  # noqa: BLE001
+                pass
+            self._mouse_stop = None
+        register_hotkeys()
+
+    def _now(self):
+        return time.perf_counter() - self.t0
+
+    def _on_down(self, e):
+        if self.t0 is None:
+            return
+        name = (e.name or "").lower()
+        if name == QUIT_KEY.lower():
+            self.stop_requested = True
+            return
+        if name in (START_KEY.lower(), PAUSE_KEY.lower()):
+            return
+        key = to_game_key(name, bool(getattr(e, "is_keypad", False)))
+        if key is None:
+            self.skipped.add(name)
+            return
+        if key in self._down:           # auto-repeat of a key that is held
+            return
+        self._down.add(key)
+        self.events.append((self._now(), "down", key))
+
+    def _on_up(self, e):
+        if self.t0 is None:
+            return
+        key = to_game_key((e.name or "").lower(), bool(getattr(e, "is_keypad", False)))
+        if key is None or key not in self._down:
+            return
+        self._down.discard(key)
+        self.events.append((self._now(), "up", key))
+
+    def _on_click(self, x, y, button):
+        if self.t0 is None:
+            return
+        r = self.ignore
+        if r and r[0] <= x <= r[2] and r[1] <= y <= r[3]:
+            return
+        self.events.append((self._now(), "click", (int(x), int(y), button)))
+
+    def _name(self, key):
+        """With 'use my keybind names' on, the key you bound to ability 2 is written as ability2."""
+        if self.use_binds:
+            if settings["keybinds"].get("grab") == key:
+                return "ability1"
+            for bind_id in GAME_BINDS:
+                if settings["keybinds"].get(bind_id) == key:
+                    return bind_id
+        return key
+
+    def to_lines(self):
+        evs = sorted(self.events, key=lambda e: e[0])
+        lines, held = [], set()
+        cursor, owed, i = 0.0, 0.0, 0
+        while i < len(evs):
+            t, kind, data = evs[i]
+            span = t - cursor
+            if span - owed >= self.MIN_WAIT:
+                lines.append(f"wait {span - owed:.2f}")
+                owed = 0.0
+            else:
+                owed = max(0.0, owed - span)
+            cursor = t
+            if kind == "click":
+                x, y, button = data
+                lines.append(f"click {x} {y}" + (" right" if button == "right" else ""))
+                owed += self.CLICK_COST
+            elif kind == "down":
+                nxt = evs[i + 1] if i + 1 < len(evs) else None
+                if nxt and nxt[1] == "up" and nxt[2] == data:
+                    dur = nxt[0] - t
+                    if dur < self.PRESS_MAX:
+                        lines.append(f"press {self._name(data)}")
+                        owed += self.PRESS_COST
+                    else:
+                        lines.append(f"hold {self._name(data)} {dur:.2f}")
+                    cursor = nxt[0]
+                    i += 1
+                else:
+                    lines.append(f"down {self._name(data)}")
+                    held.add(data)
+            else:
+                lines.append(f"up {self._name(data)}")
+                held.discard(data)
+            i += 1
+        for k in sorted(held):          # still held when recording stopped
+            lines.append(f"up {self._name(k)}")
+        return lines
+
+
 # --------------------------- Discord webhook ----------------------------
+DISCORD_API = "https://discord.com/api/v10"
+
+
+def bot_ready():
+    """True when bot mode is on and the token / channel ID look usable."""
+    wh = settings["webhook"]
+    return bool(wh["use_bot"] and len(wh["bot_token"].strip()) >= 30
+                and wh["channel_id"].strip().isdigit())
+
+
 def webhook_url():
-    """The webhook URL if it looks valid, otherwise '' (= Discord is off)."""
-    url = settings["webhook"]["url"].strip()
+    """Where messages are sent: the bot's channel (bot mode) or the webhook URL. '' = Discord is off.
+    (The name is kept: every "is Discord on?" check in the macro uses it.)"""
+    wh = settings["webhook"]
+    if wh["use_bot"]:
+        return f"{DISCORD_API}/channels/{wh['channel_id'].strip()}/messages" if bot_ready() else ""
+    url = wh["url"].strip()
     return url if url.startswith("https://") and "/api/webhooks/" in url else ""
 
 
@@ -1174,10 +2669,12 @@ def mention_id():
     return uid if wh["mention"] and uid.isdigit() else ""
 
 
-def post_webhook(text, png=None, ping=True, title=APP_NAME, embed=None):
+def post_webhook(text, png=None, ping=True, title="thebums", embed=None):
     """Send one message (optionally with a PNG picture). Blocks; returns (ok, message)."""
     url = webhook_url()
     if not url:
+        if settings["webhook"]["use_bot"]:
+            return False, "The bot token or the channel ID is missing / not valid"
         return False, "No valid webhook URL (it starts with https://discord.com/api/webhooks/)"
     uid = mention_id() if ping else ""
     payload = {"content": f"<@{uid}> {text}" if uid else text,
@@ -1204,11 +2701,18 @@ def post_webhook(text, png=None, ping=True, title=APP_NAME, embed=None):
         ])
         headers = {"Content-Type": f"multipart/form-data; boundary={boundary}"}
     headers["User-Agent"] = "thebums-macro/1.0"   # Discord rejects the default python user agent
+    if settings["webhook"]["use_bot"]:
+        headers["Authorization"] = "Bot " + settings["webhook"]["bot_token"].strip()
     try:
         req = urllib.request.Request(url, data=body, headers=headers, method="POST")
         with urllib.request.urlopen(req, timeout=WEBHOOK_TIMEOUT):
             return True, "Sent"
     except urllib.error.HTTPError as e:
+        if settings["webhook"]["use_bot"] and e.code in (401, 403, 404):
+            return False, {401: "Discord rejected the bot token (401)",
+                           403: "The bot can't write in that channel (403): give it View Channel, "
+                                "Send Messages and Attach Files",
+                           404: "Channel not found (404): check the channel ID"}[e.code]
         return False, f"Discord answered {e.code} {e.reason}"
     except (urllib.error.URLError, OSError, ValueError) as e:
         return False, f"Could not reach Discord: {e}"
@@ -1226,13 +2730,192 @@ def notify_async(text):
     threading.Thread(target=work, daemon=True).start()
 
 
+# ------------------------- Discord bot: !commands -------------------------
+# The bot reads the channel with plain HTTPS requests (no extra library): every BOT_POLL_SECONDS it
+# asks for the messages that are newer than the last one it has seen. Needs "Message Content Intent"
+# turned on for the bot in the Discord developer portal. Only the user IDs typed in Settings may use it.
+BOT_PREFIX = "!"
+BOT_POLL_SECONDS = 2.0
+BOT_COMMANDS_TEXT = "!start  !pause  !resume  !stop  !reconnect  !screenshot  !stats  !status  !help"
+_bot = {"stop": None, "sig": None}
+
+
+def bot_allowed_ids():
+    """The Discord user IDs that may give commands (the User ID box; several separated by commas)."""
+    raw = settings["webhook"]["user_id"]
+    return {p for p in re.split(r"[,\s]+", raw.strip()) if p.isdigit()}
+
+
+def _bot_api_get(path, token):
+    req = urllib.request.Request(DISCORD_API + path, method="GET", headers={
+        "Authorization": "Bot " + token, "User-Agent": "thebums-macro/1.0"})
+    with urllib.request.urlopen(req, timeout=WEBHOOK_TIMEOUT) as r:
+        return json.loads(r.read().decode("utf-8") or "[]")
+
+
+def _bot_say(text, png=None, title="thebums"):
+    ok, msg = post_webhook(text, png=png, ping=False, title=title)
+    if not ok:
+        log(f"Discord bot: {msg}")
+
+
+def _bot_status_text():
+    st, res, _loot = counters()
+    if not running():
+        phase = "Not running"
+    elif state["quit"]:
+        phase = "Stopping"
+    elif state["paused"]:
+        phase = "Paused"
+    else:
+        phase = str(state["phase_status"]).capitalize()
+    return (f"{phase}  -  missions: {st['missions']}, completed: {res['completed']}, "
+            f"failed: {res['failed']}")
+
+
+def _bot_run(cmd):
+    """Run one command (in its own thread, so a slow screenshot never blocks the listener)."""
+    try:
+        if cmd == "start":
+            if running() and not state["quit"]:
+                request_start()
+                _bot_say("The macro is already running. " + _bot_status_text())
+            else:
+                request_start()
+                _bot_say("Starting the macro...")
+        elif cmd == "pause":
+            if not running():
+                _bot_say("The macro isn't running.")
+            else:
+                toggle_pause()
+                _bot_say("Paused." if state["paused"] else "Resumed.")
+        elif cmd == "resume":
+            if running() and state["paused"]:
+                toggle_pause()
+                _bot_say("Resumed.")
+            else:
+                _bot_say("The macro isn't paused.")
+        elif cmd == "stop":
+            if running():
+                request_stop()
+                _bot_say("Stopping the macro...")
+            else:
+                _bot_say("The macro isn't running.")
+        elif cmd in ("screenshot", "ss", "screen"):
+            png = cv2.imencode(".png", grab_roblox())[1].tobytes()
+            _bot_say("", png=png, title="Screenshot")
+        elif cmd in ("stats", "graph"):
+            ok, msg = send_stats_graph("Stats", partial=True)
+            if not ok:
+                _bot_say(f"Could not send the stats: {msg}")
+        elif cmd == "status":
+            _bot_say(_bot_status_text())
+        elif cmd == "reconnect":
+            if not running():
+                _bot_say("The macro isn't running.")
+            elif _disconnect_template is None:
+                missing = reconnect_missing()
+                _bot_say("Reconnect is off. " + ("Still needed: " + ", ".join(missing) + "."
+                                                 if missing else "Turn it on in Recovery > Reconnect."))
+            elif state.get("reconnecting"):
+                _bot_say("Already reconnecting.")
+            else:
+                state["rc_request"] = True
+                _bot_say("Reconnecting: closing Roblox, rejoining and clicking through the lobby...")
+        elif cmd in ("help", "commands"):
+            _bot_say("Commands: " + BOT_COMMANDS_TEXT)
+    except Exception as e:  # noqa: BLE001
+        log(f"Discord bot: command '{cmd}' failed: {type(e).__name__}: {e}")
+
+
+def _bot_handle(msg, warned):
+    author = msg.get("author") or {}
+    if author.get("bot"):
+        return
+    text = (msg.get("content") or "").strip()
+    if not text:
+        if not warned.get("empty") and not msg.get("attachments") and not msg.get("embeds"):
+            warned["empty"] = True
+            log("Discord bot: the messages arrive empty - turn on 'Message Content Intent' "
+                "for the bot in the Discord developer portal")
+        return
+    if not text.startswith(BOT_PREFIX):
+        return
+    parts = text[len(BOT_PREFIX):].split()
+    if not parts:
+        return
+    cmd = parts[0].lower()
+    allowed = bot_allowed_ids()
+    if str(author.get("id")) not in allowed:
+        if not allowed and not warned.get("noid"):
+            warned["noid"] = True
+            _bot_say("Commands are off: type your Discord user ID in thebums > Settings > Discord first.")
+        return
+    threading.Thread(target=_bot_run, args=(cmd,), daemon=True).start()
+
+
+def _bot_loop(stop, token, channel):
+    last, warned, down = None, {}, False
+    while not stop.is_set():
+        wait_s = BOT_POLL_SECONDS
+        try:
+            if last is None:     # first look: remember the newest message, don't run old commands
+                first = _bot_api_get(f"/channels/{channel}/messages?limit=1", token)
+                last = max((int(m["id"]) for m in first), default=0)
+                log(f"Discord bot: listening for commands ({BOT_COMMANDS_TEXT})")
+            else:
+                msgs = _bot_api_get(f"/channels/{channel}/messages?after={last}&limit=20", token)
+                for m in sorted(msgs, key=lambda m: int(m["id"])):
+                    last = max(last, int(m["id"]))
+                    _bot_handle(m, warned)
+            down = False
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403, 404):
+                why = {401: "the token was rejected (401)",
+                       403: "the bot can't read that channel (403): give it View Channel + Read Message History",
+                       404: "channel not found (404)"}[e.code]
+                log(f"Discord bot: {why} - check Settings > Discord")
+                return
+            if e.code == 429:
+                try:
+                    wait_s = min(30.0, float(json.loads(e.read().decode("utf-8")).get("retry_after", 5)))
+                except Exception:  # noqa: BLE001
+                    wait_s = 5.0
+            elif not down:
+                down = True
+                log(f"Discord bot: Discord answered {e.code} {e.reason}")
+        except (urllib.error.URLError, OSError, ValueError, KeyError, TypeError) as e:
+            if not down:
+                down = True
+                log(f"Discord bot: could not reach Discord ({e})")
+        stop.wait(wait_s)
+
+
+def bot_restart():
+    """Start / stop / restart the command listener so it matches the Discord settings."""
+    wh = settings["webhook"]
+    sig = (bool(wh["use_bot"]), wh["bot_token"].strip(), wh["channel_id"].strip())
+    if sig == _bot["sig"]:
+        return
+    _bot["sig"] = sig
+    if _bot["stop"] is not None:
+        _bot["stop"].set()
+        _bot["stop"] = None
+    if bot_ready():
+        stop = threading.Event()
+        _bot["stop"] = stop
+        threading.Thread(target=_bot_loop, args=(stop, sig[1], sig[2]), daemon=True).start()
+
+
 def loot_parts(found):
     """['1 scroll', '2 fragments (body, defence)', '1 serum (attack)'] for the kinds in `found`."""
     parts = []
-    raid = settings["family"] == "Female Raid"
+    raid = raid_counting()
     if "scroll" in found and not raid:
         parts.append("1 scroll")
-    if "vessel" in found and raid:
+    if "attack_vessel" in found:
+        parts.append("1 Primordial Devil vessel")
+    elif "vessel" in found and raid:
         parts.append("1 vessel")
     frags = [k for k in FRAGMENT_KINDS if k in found]
     if frags:
@@ -1253,6 +2936,9 @@ LOOT_EMOJI = {"scroll": "<:scroll:1502824781207310346>", "body": "<:body:1566849
               "support": "<:support:1566849487173849188>",
               "fragments": "<:fragments:1566862673713438851>",
               "vessel": "<:ScarletBlossomVessel:1566848731134034172>",
+              # No existing public Discord emoji ID for the supplied Primordial Devil icon.
+              # Bot mode uploads the exact supplied local image; webhook mode shows its name.
+              "attack_vessel": "",
               "attack_serum": "<:AttackSerum:1566849853684715661>",
               "armor_serum": "<:ArmoredSerum:1566849901071962163>",
               "female_serum": "<:FemaleSerum:1566849755076759693>",
@@ -1261,9 +2947,98 @@ LOOT_EMOJI = {"scroll": "<:scroll:1502824781207310346>", "body": "<:body:1566849
               "serums": "<:SerumBag:1566875481523884305>"}
 
 
+# Bot mode: a bot can only show another server's emojis when it is in that server AND has "Use External
+# Emojis", which is why they showed as plain :name: text. So the bot gets its own copies instead
+# ("application emojis", owned by the bot, usable in every server it is in): the pictures are fetched from
+# Discord's CDN by the ids above and uploaded once; later runs find them by name and reuse them.
+_app_emoji = {"token": None, "map": {}, "retry": 0.0, "done": False}
+_app_emoji_lock = threading.Lock()
+EMOJI_PREFIX = "thebums_"
+
+
+def _discord_call(method, path, token, payload=None):
+    """One authenticated JSON call to the Discord API (waits out a 429 once or twice)."""
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    headers = {"Authorization": "Bot " + token, "User-Agent": "thebums-macro/1.0"}
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+    for _ in range(3):
+        try:
+            req = urllib.request.Request(DISCORD_API + path, data=data, headers=headers, method=method)
+            with urllib.request.urlopen(req, timeout=WEBHOOK_TIMEOUT) as r:
+                return json.loads(r.read().decode("utf-8") or "{}")
+        except urllib.error.HTTPError as e:
+            if e.code != 429:
+                raise
+            try:
+                delay = float(json.loads(e.read().decode("utf-8")).get("retry_after", 1))
+            except (ValueError, OSError):
+                delay = 1.0
+            time.sleep(min(10.0, max(0.2, delay)))
+    raise OSError("Discord rate limit")
+
+
+def bot_emoji_map():
+    """{loot key: '<:thebums_key:id>'} for the bot's own emojis (created on first use). Keys that could
+    not be made are missing; a failed try is repeated after 5 minutes."""
+    token = settings["webhook"]["bot_token"].strip()
+    with _app_emoji_lock:
+        c = _app_emoji
+        if c["token"] != token:
+            c.update(token=token, map={}, retry=0.0, done=False)
+        if c["done"] or time.time() < c["retry"] or not token:
+            return dict(c["map"])
+        c["retry"] = time.time() + 300
+        try:
+            app_id = _discord_call("GET", "/applications/@me", token)["id"]
+            have = _discord_call("GET", f"/applications/{app_id}/emojis", token).get("items", [])
+            ids = {e["name"]: e["id"] for e in have}
+        except Exception as exc:  # noqa: BLE001
+            log(f"Discord bot emojis: could not read the bot's emojis ({type(exc).__name__}: {exc})")
+            return dict(c["map"])
+        for key, markup in LOOT_EMOJI.items():
+            # Aggregate icons provided by The Bums replace the originals only for these two totals.
+            # Other item emojis retain their existing source images.
+            custom = key in ("fragments", "serums", "attack_vessel")
+            name = (EMOJI_PREFIX + ("gold_fragments_v6" if key == "fragments"
+                                    else "red_serums_v6" if key == "serums"
+                                    else "primordial_evil_v10")) if custom else EMOJI_PREFIX + key
+            try:
+                if name not in ids:
+                    if custom:
+                        image_file = ("primordial_devil.png" if key == "attack_vessel"
+                                      else "emoji_" + key + ".png")
+                        with open(asset_path(image_file), "rb") as pic:
+                            img = pic.read()
+                    else:
+                        src = re.match(r"<a?:\w+:(\d+)>", markup).group(1)
+                        req = urllib.request.Request(
+                            f"https://cdn.discordapp.com/emojis/{src}.png?size=128",
+                            headers={"User-Agent": "thebums-macro/1.0"})
+                        with urllib.request.urlopen(req, timeout=WEBHOOK_TIMEOUT) as r:
+                            img = r.read()
+                    made = _discord_call("POST", f"/applications/{app_id}/emojis", token, {
+                        "name": name, "image": "data:image/png;base64," + base64.b64encode(img).decode()})
+                    ids[name] = made["id"]
+                c["map"][key] = f"<:{name}:{ids[name]}>"
+            except Exception as exc:  # noqa: BLE001
+                log(f"Discord bot emojis: {key} not made ({type(exc).__name__}: {exc})")
+        c["done"] = len(c["map"]) == len(LOOT_EMOJI)
+        return dict(c["map"])
+
+
+def loot_emoji(key):
+    """The emoji text for a loot kind: the original custom emoji for a webhook, the bot's own copy in bot
+    mode ('' when that copy is not available, so no broken :name: text shows up)."""
+    if settings["webhook"]["use_bot"]:
+        return bot_emoji_map().get(key, "")
+    return LOOT_EMOJI.get(key, "")
+
+
 def loot_name(kind):
-    """'attack_serum' -> 'Attack serum', 'body' -> 'Body'."""
-    return kind.replace("_", " ").capitalize()
+    """Human-readable item names for status messages and Discord reports."""
+    return {"attack_vessel": "Primordial Devil", "attack_serum": "Attack Serum"}.get(
+        kind, kind.replace("_", " ").capitalize())
 
 
 def mission_embed(result, found, mission_seconds=None):
@@ -1273,14 +3048,15 @@ def mission_embed(result, found, mission_seconds=None):
     Female Raid -> vessels, female serum, each fragment."""
     kind = result[0] if result else None
     stats, _results, loot = counters()
-    raid = settings["family"] == "Female Raid"
+    raid = raid_counting()
     word = "Raid" if raid else "Mission"
-    main_item = "vessel" if raid else "scroll"
-    serum_kinds = ("female_serum",) if raid else SERUM_KINDS
+    attack_raid = settings["family"] in ATTACK_FAMILIES
+    main_item = "attack_vessel" if attack_raid else ("vessel" if raid else "scroll")
+    serum_kinds = (("attack_serum",) if attack_raid else ("female_serum",)) if raid else SERUM_KINDS
     snap = snapshot()
     done = snap["completed"] + snap["failed"]
     rate = f"{100 * snap['completed'] // done}%" if done else "-"
-    got = [f"{LOOT_EMOJI.get(k, '')} {loot_name(k)}".strip()
+    got = [f"{loot_emoji(k)} {loot_name(k)}".strip()
            for k in (((main_item,) + serum_kinds + FRAGMENT_KINDS) if raid
                      else ((main_item,) + FRAGMENT_KINDS + serum_kinds)) if k in found]
     run = fmt_time(time.time() - report["t0"]) if report["t0"] else "--:--"
@@ -1291,19 +3067,21 @@ def mission_embed(result, found, mission_seconds=None):
         return {"name": name, "value": value or "​", "inline": True}
 
     def emo(k, name=None):   # a loot count with its emoji, like the app's coloured dots
-        return field(name or k.upper(), f"{LOOT_EMOJI.get(k, '')} **{loot.get(k, 0)}**".strip())
-    if raid:   # vessels, female serum, then the 4 fragments
-        loot_fields = [emo("vessel", ui_word("scrolls").upper()), emo("female_serum", "FEMALE SERUM"),
+        return field(name or k.upper(), f"{loot_emoji(k)} **{loot.get(k, 0)}**".strip())
+    if raid:   # Raid-specific Vessel and Serum, then the 4 fragments
+        loot_fields = [emo(main_item, "VESSELS"),
+                       emo("attack_serum", "ATTACK SERUM") if attack_raid
+                       else emo("female_serum", "FEMALE SERUM"),
                        *(emo(k) for k in FRAGMENT_KINDS)]
     else:
-        loot_fields = [field("FRAGMENTS", f"{LOOT_EMOJI['fragments']} **{snap['fragments']}**"),
+        loot_fields = [field("FRAGMENTS", f"{loot_emoji('fragments')} **{snap['fragments']}**"),
                        emo("scroll", ui_word("scrolls").upper()),
-                       field("SERUMS", f"{LOOT_EMOJI['serums']} **{snap['serums']}**"),
+                       field("SERUMS", f"{loot_emoji('serums')} **{snap['serums']}**"),
                        # below the totals: each fragment, then each serum (9 = 3 full rows)
                        *(emo(k) for k in FRAGMENT_KINDS),
                        *(emo(k, k.split("_")[0].upper()) for k in SERUM_KINDS)]
     return {
-        "author": {"name": APP_NAME},
+        "author": {"name": "The Bums"},
         "title": f"{word} #{stats['missions']}  ·  {head}",
         # purple completed, red failed, grey otherwise
         "color": {"completed": 0xA855F7, "failed": 0xF87171}.get(kind, 0x7A8398),
@@ -1315,7 +3093,7 @@ def mission_embed(result, found, mission_seconds=None):
                    field(ui_word("mission_time").upper(), f"`{length}`"),
                    field("RUN TIME", f"`{run}`"),
                    *loot_fields],
-        "footer": {"text": APP_NAME},
+        "footer": {"text": "thebums  ·  by The Bums"},
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
 
@@ -1333,12 +3111,42 @@ def roblox_area():
     return {"left": rect[0], "top": rect[1], "width": w, "height": h}
 
 
+def adaptive_capture_area():
+    """The Roblox client rectangle if Beta is active, or None for legacy monitor capture.
+
+    Keep the Windows-only branch separate: non-Windows and a missing/minimized
+    Roblox window continue using the exact original monitor-based path.
+    """
+    if not (_adaptive_run_enabled and IS_WIN):
+        return None
+    try:
+        area = roblox_area()
+        if area and area["width"] >= 200 and area["height"] >= 200:
+            return area
+    except Exception:  # the fallback must always be safe
+        pass
+    return None
+
+
+def frame_to_screen(cx, cy):
+    """Map a normalized template match back into absolute desktop coordinates."""
+    area = _capture_rect if _adaptive_run_enabled and _capture_rect else _monitor
+    if not area:
+        raise RuntimeError("Screen capture has not been initialized")
+    return (int(area["left"] + cx * _scale),
+            int(area["top"] + cy * _scale))
+
+
+def capture_mode_description():
+    return "Adaptive Roblox client" if _adaptive_run_enabled else "Legacy full monitor"
+
+
 def grab_roblox():
     """BGR screenshot of the inside of the Roblox window (no title bar, no taskbar); the whole
     monitor if Roblox isn't open or is minimized. At most 1080 tall (Discord upload limit).
     Uses its own mss instance, so it works from any thread and when the macro isn't running."""
     with mss.mss() as sct:
-        area = roblox_area() or sct.monitors[MONITOR_INDEX]
+        area = roblox_area() or pick_monitor(sct.monitors)
         shot = cv2.cvtColor(np.array(sct.grab(area)), cv2.COLOR_BGRA2BGR)
     if shot.shape[0] > 1080:
         f = 1080 / shot.shape[0]
@@ -1368,7 +3176,7 @@ def rescue_embed(eliminated, mission_no, mission_seconds=None):
     """Discord embed for the stuck-mission rescue: it started / it worked."""
     timeout = mission_timeout()
     limit = f"{int(timeout // 60)}m {int(timeout % 60):02d}s"
-    word = "Raid" if settings["family"] == "Female Raid" else "Mission"
+    word = "Raid" if raid_counting() else "Mission"
     low = word.lower()
     if eliminated:
         embed = {
@@ -1412,7 +3220,8 @@ report = {"run": 0, "base": None, "hourly": [], "t0": 0.0}
 def snapshot():
     _st, results, loot = counters()
     return {"completed": results["completed"], "failed": results["failed"],
-            "scrolls": loot.get("vessel" if settings["family"] == "Female Raid" else "scroll", 0),
+            "scrolls": (loot.get("vessel", 0) + loot.get("attack_vessel", 0))
+                       if raid_counting() else loot.get("scroll", 0),
             "fragments": sum(loot.get(k, 0) for k in FRAGMENT_KINDS),
             "serums": sum(loot.get(k, 0) for k in SERUM_KINDS)}
 
@@ -1440,7 +3249,7 @@ def render_graph(hourly, totals, run_seconds, hours=1):
             x -= tw
         cv2.putText(img, s, (int(x), int(y)), font, scale, color, thick, cv2.LINE_AA)
 
-    text(f"{APP_NAME}  |  stats report", 30, 48, 0.9, TEXT, 2)
+    text("thebums  |  stats report", 30, 48, 0.9, TEXT, 2)
     text(time.strftime("%Y-%m-%d %H:%M"), W - 30, 48, 0.55, SUB, 1, "r")
     cv2.rectangle(img, (660, 70), (940, 810), CARD, -1)
 
@@ -1574,30 +3383,46 @@ results = {"completed": 0, "failed": 0}
 raid_stats = {"missions": 0, "retries": 0}
 raid_loot = loot
 raid_results = {"completed": 0, "failed": 0}
+# New session starts at zero on each app launch; never overwrites saved historical loot.
+session_scrolls = 0
 worker = None
 
 
 def counters():
     """(stats, results, loot) of the config that is picked now: the raid's own counts while Female
     Raid is selected, the mission ones for every other config. The loot is the same for both."""
-    if settings["family"] == "Female Raid":
+    if raid_counting():
         return raid_stats, raid_results, raid_loot
     return stats, results, loot
 
 _sct = None
 _sct_lock = threading.Lock()   # guards _sct re-creation when the monitor turns off/on
 _monitor = None
-_scale = 1.0     # real screen height / BASE_HEIGHT (set when the macro starts)
+_scale = 1.0     # real capture height / BASE_HEIGHT (set when the macro starts)
+_adaptive_run_enabled = False  # frozen on Start so changing Settings cannot interrupt combat
+_capture_rect = None         # exact area used to create the latest normalized detection frame
 _retry_template = None
 _alt_retry_templates = []        # extra looks of the retry button: [(templates, dx)] - see load_alt_retry()
 _start_template = None
+_attack_start_template = None    # only loaded when Attack Titan Raid is selected
 _shiki_ability4_icon = None      # Shiki: ability 4 icon, seen = ability 4 is ready
 _raid_templates = {}             # Female Raid: {"skip": {...}, "finish": {...}} (see load_quality_templates)
 _loot_templates = {}
 _result_templates = {}
 _grab_template = None
+_disconnect_template = None       # Reconnect: the Disconnect Image (None = reconnect off)
+_reconnect_images = {}            # Reconnect: {"select": templates, "play": templates}
 _last_scan = 0.0
 _last_grab = 0.0
+# Passive Retry watchdog - never clicks or runs a macro on this thread.
+_retry_watch_lock = threading.Lock()
+_retry_watch_hit = None          # (match, quality, screen, timestamp_monotonic)
+_retry_watch_stop = None
+_retry_watch_thread = None
+RETRY_WATCH_POLL = 0.50
+RETRY_WATCH_TTL = 1.8
+RETRY_GUARD_EXTRA = 1.2       # extra time after each Retry click before inspecting another one
+RETRY_WATCH_CONFIRM = 2       # two consecutive matching frames to filter visual noise
 
 
 class RetryFound(Exception):
@@ -1606,6 +3431,15 @@ class RetryFound(Exception):
         self.match = match
         self.quality = quality    # which look matched: "normal" or "low" (low graphics)
         self.screen = screen      # fast mode only: the screenshot the button was found on
+
+
+class Disconnected(Exception):
+    """Rejoin the game (see reconnect_rejoin). `reason`: the Disconnect Image was seen, the failsafe
+    rescue ran longer than RECONNECT_RESCUE_LIMIT, or the bot command !reconnect was used."""
+
+    def __init__(self, reason="the Disconnect Image was seen"):
+        super().__init__(reason)
+        self.reason = reason
 
 
 def log(msg):
@@ -1629,7 +3463,7 @@ def stats_path():
 
 
 def migrate_old_stats():
-    """One time: if the json used to live next to the script, copy it into the Documents/The Bums folder."""
+    """One time: if the json used to live next to the script, copy it into the Documents/thebums Macro folder."""
     old = os.path.join(app_dir(), STATS_FILE)
     new = stats_path()
     if os.path.exists(old) and not os.path.exists(new) and os.path.abspath(old) != os.path.abspath(new):
@@ -1665,7 +3499,7 @@ def config_path():
 
 
 def save_timings():
-    """config.json (Documents/The Bums): ONLY the timings changed in Edit configs."""
+    """config.json (Documents/thebums Macro): ONLY the timings changed in Edit configs."""
     try:
         with _save_lock:
             tmp = config_path() + ".tmp"
@@ -1691,6 +3525,23 @@ def load_timings():
         return                  # unreadable: keep what there is, the next change rewrites it
     settings["timings"] = {}
     apply_timings(data)
+    attack = settings["timings"].get("Attack Titan Raid", {})
+    changed = False
+    if attack.get("right_dash_cooldown") == 2.5:
+        attack["right_dash_cooldown"] = 1.3
+        changed = True
+        log("Attack Titan Raid Fritz: migrated legacy 2.5s opening right-dash value to 1.3s")
+    # v8's default before_skill4=0.5s is now an additional 1.0s, after a
+    # separately configurable 0.5s pause. Preserve non-default personal values.
+    if attack.get("before_skill4") == 0.5 and "after_last_left_dash" not in attack:
+        attack["before_skill4"] = 1.0
+        changed = True
+        log("Attack Titan Raid Fritz: updated default before-Skill-4 pause to 1.0s")
+    if attack.get("after_skill2") == 0.1 and "after_right_dash" not in attack:
+        attack["after_skill2"] = 0.0
+        changed = True
+    if changed:
+        save_timings()
 
 
 def load_stats():
@@ -1728,12 +3579,15 @@ def load_stats():
 
 def push_stats(save=True):
     st, res, lt = counters()       # the window shows the counters of the picked config
-    ev.put(("stats", st["missions"], st["retries"], dict(lt), dict(res)))
+    loot_view = dict(lt)
+    loot_view["session_scroll"] = session_scrolls
+    ev.put(("stats", st["missions"], st["retries"], loot_view, dict(res)))
     if save:
         save_stats()
 
 
 def reset_stats():
+    global session_scrolls
     """Erase the counters of the picked config (missions, or raids for Female Raid) back to 0.
     The other one's counts (and every setting) stay; the loot is shared, so it is cleared for both."""
     st, res, lt = counters()
@@ -1741,9 +3595,10 @@ def reset_stats():
     res.update(completed=0, failed=0)
     for kind in lt:
         lt[kind] = 0
+    session_scrolls = 0
     report_rebase()
     push_stats()
-    log("Raid stats reset to 0" if settings["family"] == "Female Raid" else "Mission stats reset to 0")
+    log("Raid stats reset to 0" if raid_counting() else "Mission stats reset to 0")
 
 
 def set_status(key):
@@ -1795,7 +3650,7 @@ def start_macro(manual=False):
         return
     state.update(paused=False, quit=False, manual_start=manual,
                  phase_status="waiting", mission_t0=None, rescuing=False,
-                 debug_rescue=False)
+                 debug_rescue=False, retry_processing=False, retry_guard_until=0.0)
     worker = threading.Thread(target=macro_main, daemon=True)
     worker.start()
     start_reporter()
@@ -2005,7 +3860,7 @@ def _reinit_mss():
         new_sct = None
         try:
             new_sct = mss.mss()
-            mon = new_sct.monitors[MONITOR_INDEX]
+            mon = pick_monitor(new_sct.monitors)
             # Quick sanity-grab to confirm the monitor is really back.
             test = np.array(new_sct.grab(mon))
             if test.max() == 0:
@@ -2013,7 +3868,8 @@ def _reinit_mss():
                 return False
             _sct = new_sct
             _monitor = mon
-            _scale = FORCE_SCALE if FORCE_SCALE else _monitor["height"] / BASE_HEIGHT
+            area = adaptive_capture_area() or _monitor
+            _scale = FORCE_SCALE if FORCE_SCALE else area["height"] / BASE_HEIGHT
             return True
         except Exception:  # noqa: BLE001
             try:
@@ -2041,20 +3897,28 @@ def grab_screen():
     The function then waits in a loop, logging once, until the monitor comes back, and
     continues transparently so the macro never crashes or stops. Stop (F7) still works
     while it waits."""
-    global _monitor_was_off
+    global _monitor_was_off, _scale, _capture_rect
     while True:
         try:
-            shot = np.array(_sct.grab(_monitor))
-            img = _to_points(cv2.cvtColor(shot, cv2.COLOR_BGRA2BGR))
+            client = adaptive_capture_area()
+            area = client or _monitor
+            shot = np.array(_sct.grab(area))
+            img = cv2.cvtColor(shot, cv2.COLOR_BGRA2BGR)
+            if not client:
+                img = _to_points(img)  # unchanged Retina/monitor behavior in Legacy mode
+            scale = (FORCE_SCALE if FORCE_SCALE else area["height"] / BASE_HEIGHT)
             # An all-black frame means the monitor is off (or going to sleep).
             if img.max() == 0:
-                raise OSError("All-black frame - monitor appears to be off")
+                raise OSError("All-black frame - monitor appears to be of")
             if _monitor_was_off:
                 _monitor_was_off = False
                 log("Monitor is back - resuming screen detection")
-            if abs(_scale - 1.0) > 0.01:
-                interp = cv2.INTER_AREA if _scale > 1 else cv2.INTER_CUBIC
-                img = cv2.resize(img, None, fx=1 / _scale, fy=1 / _scale, interpolation=interp)
+            if abs(scale - 1.0) > 0.01:
+                interp = cv2.INTER_AREA if scale > 1 else cv2.INTER_CUBIC
+                img = cv2.resize(img, None, fx=1 / scale, fy=1 / scale, interpolation=interp)
+            # Publish the geometry only after a successful frame capture.
+            _scale = scale
+            _capture_rect = dict(area)
             return img
         except SystemExit:
             raise
@@ -2085,8 +3949,8 @@ def check_grabbed(screen):
     global _last_grab
     if _grab_template is None or time.time() - _last_grab < GRAB_REPEAT:
         return
-    if settings["family"] == "Shiki":
-        return   # Shiki: ability 1 is a perk, no need to press it
+    if settings["family"] in ("Shiki", "Female Raid", *ATTACK_FAMILIES):
+        return   # Raid skill 1 is handled by the combat scheduler, not grabbed-text recognition
     if find_template(red_mask(screen), _grab_template, GRAB_THRESHOLD):
         _last_grab = time.time()
         log(f"Grabbed! Pressing {KEY_GRAB.upper()}")
@@ -2121,6 +3985,15 @@ def load_alt_retry():
             dx = w / 2 - (x0 + x1) / 2
     if word:
         _alt_retry_templates.append((word, dx))
+    # User's raid capture: keep this additional fallback so Attack Titan Retry
+    # can be found without creating or renaming any image file.
+    try:
+        user_retry_button = load_quality_templates("retry_button.png")
+    except FileNotFoundError:
+        pass
+    else:
+        _alt_retry_templates.append((user_retry_button, 0))
+        log("retry_button.png loaded as an additional Retry fallback")
     log(f"{ALT_RETRY_FILE} loaded - used as an extra check for the retry button")
 
 
@@ -2190,6 +4063,113 @@ def find_retry(screen):
     return found[:2] if found else None
 
 
+def _retry_watch_capture(sct):
+    """Read one screen in this thread's own MSS context; never touch the macro's MSS handle."""
+    client = adaptive_capture_area()
+    area = client or _monitor
+    shot = np.asarray(sct.grab(area))
+    frame = cv2.cvtColor(shot, cv2.COLOR_BGRA2BGR)
+    if not client and IS_MAC and frame.shape[1] != _monitor["width"]:
+        frame = cv2.resize(frame, (_monitor["width"], _monitor["height"]), interpolation=cv2.INTER_AREA)
+    if frame.max() == 0:
+        return None
+    scale = FORCE_SCALE if FORCE_SCALE else area["height"] / BASE_HEIGHT
+    if abs(scale - 1.0) > .01:
+        interp = cv2.INTER_AREA if scale > 1 else cv2.INTER_CUBIC
+        frame = cv2.resize(frame, None, fx=1 / scale, fy=1 / scale, interpolation=interp)
+    return frame
+
+
+def _retry_watch_match(frame, count):
+    """Use original Retry templates, with a cheap cached-size probe and periodic scale sweep."""
+    if abs(_scale - 1.0) <= .01:
+        found = _match_retry(frame, None)
+    else:
+        saved = settings.get("retry_scale")
+        found = _match_retry(frame, [saved]) if saved else None
+        if not found and (not saved or count % 4 == 0):
+            found = _match_retry(frame, RETRY_SCALES)
+    if not found:
+        return None
+    (cx, cy, score, tw, th), quality, _scale_of_match = found
+    h, w = frame.shape[:2]
+    # Retry is in the game's central bottom results panel, not in macro logs / HUD labels.
+    if not (0.20*w < cx < 0.82*w and 0.48*h < cy < 0.96*h):
+        return None
+    return found
+
+
+def _retry_watch_worker(stop):
+    global _retry_watch_hit
+    seen, consecutive, n = None, 0, 0
+    try:
+        with mss.mss() as scout:
+            while not stop.wait(RETRY_WATCH_POLL):
+                if state["quit"]:
+                    break
+                if state["paused"] or _monitor is None:
+                    continue
+                try:
+                    frame = _retry_watch_capture(scout)
+                    n += 1
+                    found = _retry_watch_match(frame, n) if frame is not None else None
+                except Exception as e:  # screenshot interruptions should never stop the real macro
+                    if n % 20 == 0:
+                        log(f"Retry watchdog temporarily unable to read screen: {type(e).__name__}")
+                    seen, consecutive = None, 0
+                    continue
+                if found:
+                    match, quality, _sz = found
+                    if seen and quality == seen[1] and abs(seen[0][0] - match[0]) < 16 and abs(seen[0][1] - match[1]) < 16:
+                        consecutive += 1
+                    else:
+                        consecutive = 1
+                    seen = (match, quality)
+                    if consecutive >= RETRY_WATCH_CONFIRM:
+                        with _retry_watch_lock:
+                            _retry_watch_hit = (match, quality, frame, time.monotonic())
+                else:
+                    seen, consecutive = None, 0
+                    with _retry_watch_lock:
+                        _retry_watch_hit = None
+    except Exception as e:
+        log(f"Retry watchdog unavailable; the normal Retry scanner remains active: {e}")
+
+
+def start_retry_watchdog():
+    """Start once after screen templates and monitor are ready; observer has NO input privileges."""
+    global _retry_watch_stop, _retry_watch_thread, _retry_watch_hit
+    stop_retry_watchdog()
+    with _retry_watch_lock:
+        _retry_watch_hit = None
+    _retry_watch_stop = threading.Event()
+    _retry_watch_thread = threading.Thread(target=_retry_watch_worker, args=(_retry_watch_stop,), daemon=True,
+                                           name="RetryWatchdog")
+    _retry_watch_thread.start()
+    log("Passive Retry watchdog ON: observing all macro modes without sending inputs")
+
+
+def stop_retry_watchdog():
+    global _retry_watch_stop, _retry_watch_thread, _retry_watch_hit
+    if _retry_watch_stop is not None:
+        _retry_watch_stop.set()
+    _retry_watch_stop = None
+    _retry_watch_thread = None
+    with _retry_watch_lock:
+        _retry_watch_hit = None
+
+
+def cached_retry_hit():
+    """Nonblocking flag read - safe to use in every tick, including during keyboard input."""
+    if state.get("retry_processing") or state.get("reconnecting") or time.monotonic() < state.get("retry_guard_until", 0.0):
+        return None
+    with _retry_watch_lock:
+        cached = _retry_watch_hit
+    if cached and time.monotonic() - cached[3] <= RETRY_WATCH_TTL:
+        return cached
+    return None
+
+
 def scan_for_retry():
     """Look for the end of the mission once (and for a grab). Raises RetryFound if it is there.
     The end of the mission is the retry button."""
@@ -2218,12 +4198,13 @@ def _mouse_move_down(pixels):
         pydirectinput.moveRel(0, int(pixels), _pause=False)
 
 
-def look_down(check, seconds=None, pixels=None, settle=0.15):
+def look_down(check, seconds=None, pixels=None, settle=0.15, step=None):
     """Press ctrl, move the mouse down for `seconds` (default LOOK_DOWN_TIME), press ctrl again.
     `settle` = pause after the second ctrl (0 = return the moment the look down has ended).
     `check` is called all the time (stop / pause handling, may raise SystemExit)."""
     seconds = LOOK_DOWN_TIME if seconds is None else seconds
     pixels = LOOK_DOWN_PIXELS if pixels is None else pixels
+    step = LOOK_DOWN_STEP if step is None else step
     def press_ctrl():
         pydirectinput.keyDown(LOOK_DOWN_KEY)
         try:
@@ -2243,7 +4224,7 @@ def look_down(check, seconds=None, pixels=None, settle=0.15):
     while time.time() < end:
         check()
         _mouse_move_down(pixels)
-        time.sleep(LOOK_DOWN_STEP)
+        time.sleep(step)
     press_ctrl()
     end = time.time() + settle               # let the cursor unlock before clicking
     while time.time() < end:
@@ -2318,6 +4299,7 @@ def rescue_clicks(debug=False, reason=None):
     Settings) every RESCUE_CLICK_DELAY seconds until the retry button can be seen. The retry button being found raises RetryFound, so the normal
     end-of-mission handling takes over."""
     state["rescuing"] = True
+    state["rescue_t0"] = None if debug else time.time()   # tick(): a rescue past RECONNECT_RESCUE_LIMIT rejoins
     if not debug:
         state["rescued"] = True
     for held in (KEY_STRAFE_D, KEY_STRAFE):
@@ -2329,14 +4311,16 @@ def rescue_clicks(debug=False, reason=None):
         notify_rescue_async(False, counters()[0]["missions"])  # Discord: stuck, trying to eliminate
     cx, cy = failsafe_click_point(*failsafe_default_point())
     where = "the picked spot" if (cx, cy) != failsafe_default_point() else "bottom-centre (50% X, 80% Y)"
+    look = bool(settings["failsafe"]["look_down"])      # Settings > Configs > Failsafe > Look down
+    ground = "looking at the ground, " if look else ""
     if reason:      # raid failsafe
-        log(f"Raid failsafe ({reason}) - ejecting, looking at the ground, "
+        log(f"Raid failsafe ({reason}) - ejecting, {ground}"
             f"then clicking {where} ({cx}, {cy}) until retry shows up")
-        show("Stuck raid", f"Ejecting, looking at the ground, then clicking {where}")
+        show("Stuck raid", f"Ejecting, {ground}then clicking {where}")
     else:
-        log(f"Mission is taking longer than {mission_timeout():g}s - ejecting, looking at the ground, "
+        log(f"Mission is taking longer than {mission_timeout():g}s - ejecting, {ground}"
             f"then clicking {where} ({cx}, {cy}) until retry shows up")
-        show("Stuck mission", f"Ejecting, looking at the ground, then clicking {where}")
+        show("Stuck mission", f"Ejecting, {ground}then clicking {where}")
 
     def click_phase():
         """Click every RESCUE_CLICK_DELAY seconds until retry shows up."""
@@ -2344,6 +4328,13 @@ def rescue_clicks(debug=False, reason=None):
             tick(scan_retry=False)                      # stop / pause
             loop_start = time.time()
             scan_for_retry()                            # raises RetryFound when it is visible
+            if reason and "finish" in _raid_templates:  # raid failsafe: stop at the finish button too
+                fin = raid_find("finish", grab_screen())
+                if fin:
+                    log("Raid failsafe: finish button seen - failsafe stopped")
+                    state["rescuing"] = False
+                    raid_finish(fin)
+                    raise RaidFinished
             click_middle(cx, cy)
             end = loop_start + RESCUE_CLICK_DELAY      # click-to-click gap = exactly the delay
             while time.time() < end:
@@ -2365,34 +4356,268 @@ def rescue_clicks(debug=False, reason=None):
             remaining = wait_end - time.time()
             if remaining <= 0:
                 break
-            show("Stuck mission", f"Waiting {remaining:.0f}s before looking down")
+            show("Stuck mission", f"Waiting {remaining:.0f}s before "
+                                  f"{'looking down' if look else 'clicking'}")
             wait(min(0.5, remaining))
-        look_down(lambda: tick(scan_retry=False))
+        if look:        # ctrl, mouse down, ctrl - off by default (on some setups the camera goes UP)
+            fsl = settings["failsafe"]      # Failsafe > Configure: time / pixels / step delay
+            look_down(lambda: tick(scan_retry=False), seconds=fsl["look_time"],
+                      pixels=fsl["look_pixels"], step=fsl["look_step"])
         click_phase()
     finally:
         state["rescuing"] = False
+        state["rescue_t0"] = None
+
+
+_fs_test = {"cancel": threading.Event(), "thread": None, "msgs": queue.Queue()}
+
+
+def failsafe_test_running():
+    th = _fs_test["thread"]
+    return th is not None and th.is_alive()
+
+
+def failsafe_test_stop():
+    _fs_test["cancel"].set()
+
+
+def failsafe_test_start(countdown=3.0, clicks=5):
+    """Failsafe > Test: only the look down (if it is on) and the clicking part of the rescue, once
+    - no ability 2, no waiting, no retry detection. Messages go to _fs_test["msgs"] as
+    (text, kind) with kind None / "good" / "error" / "done"."""
+    cancel = _fs_test["cancel"]
+    cancel.clear()
+    msgs = _fs_test["msgs"]
+
+    def check():
+        if cancel.is_set() or state["quit"]:
+            raise SystemExit
+
+    def nap(seconds):
+        end = time.time() + seconds
+        while time.time() < end:
+            check()
+            time.sleep(0.02)
+
+    def run():
+        try:
+            fs = dict(settings["failsafe"])
+            left = countdown
+            while left > 0:
+                msgs.put((f"Test: click into Roblox - starting in {left:.0f}s", None))
+                nap(min(1.0, left))
+                left -= 1.0
+            with mss.mss() as sct:
+                m = pick_monitor(sct.monitors)
+            dx, dy = m["left"] + m["width"] // 2, m["top"] + int(m["height"] * FAILSAFE_DEFAULT_Y)
+            cx, cy = (fs["click_x"], fs["click_y"]) if (
+                fs["click_x"] is not None and fs["click_y"] is not None) else (dx, dy)
+            if fs["look_down"]:
+                msgs.put((f"Test: looking down ({fs['look_time']:g}s, {fs['look_pixels']}px "
+                          f"every {fs['look_step']:g}s)", None))
+                look_down(check, seconds=fs["look_time"], pixels=fs["look_pixels"],
+                          step=fs["look_step"])
+            else:
+                msgs.put(("Test: look down is off - clicking only", None))
+            for i in range(1, clicks + 1):
+                check()
+                msgs.put((f"Test: click {i}/{clicks} at {cx}, {cy}", None))
+                click_middle(cx, cy)
+                nap(RESCUE_CLICK_DELAY)
+            msgs.put(("Test finished", "good"))
+        except SystemExit:
+            msgs.put(("Test stopped", None))
+        except Exception as exc:  # noqa: BLE001
+            msgs.put((f"Test failed: {exc}", "error"))
+        finally:
+            try:
+                pydirectinput.keyUp(LOOK_DOWN_KEY)      # never leave ctrl held
+            except Exception:  # noqa: BLE001
+                pass
+            msgs.put(("", "done"))
+
+    th = threading.Thread(target=run, daemon=True)
+    _fs_test["thread"] = th
+    th.start()
+
+
+def reconnect_seen(kind):
+    """True when the Select / Play picture of Reconnect is on the screen right now."""
+    tpl = _reconnect_images.get(kind)
+    return bool(tpl) and bool(find_quality_template(grab_screen(), tpl, RECONNECT_THRESHOLD))
+
+
+def reconnect_wait_for(gate, i, total, name):
+    """Wait until the Select / Play picture is on screen. False when it has not shown within
+    RECONNECT_IMAGE_TIMEOUT."""
+    label = RECONNECT_IMAGE_NAMES[gate]
+    give_up = time.time() + RECONNECT_IMAGE_TIMEOUT
+    while not reconnect_seen(gate):
+        left = give_up - time.time()
+        if left <= 0:
+            log(f'Reconnect: the "{label}" picture did not show within '
+                f"{RECONNECT_IMAGE_TIMEOUT:g}s - {name} was not clicked")
+            return False
+        show("Reconnecting", f'Step {i}/{total}: waiting for "{label}" to show ({left:.0f}s)')
+        wait(0.5, scan=False)
+    log(f'Reconnect: "{label}" seen')
+    return True
+
+
+def reconnect_countdown(i, total, name, seconds):
+    end = time.time() + seconds
+    while True:
+        remaining = end - time.time()
+        if remaining <= 0:
+            break
+        show("Reconnecting", f"Step {i}/{total}: {name} in {remaining:.0f}s")
+        wait(min(0.5, remaining), scan=False)
+
+
+def reconnect_clicks():
+    """After the rejoin: click the picked coordinates one by one (the 4 shared ones, then the 4 of
+    the Missions / Raids tab). The first click (Pick a slot) waits until the Select picture is on
+    screen and happens RECONNECT_FIRST_DELAY seconds later - no other wait before it. Every other
+    click waits the Click delay (reconnect_click_delay(), 2.5s by default; the Play click after Create waits the Play delay, 0.5s by default), and Click play (lobby) then also waits until the Play
+    picture is on screen. Returns False when a picture did not show within RECONNECT_IMAGE_TIMEOUT
+    (nothing more is clicked then), True when every click was made."""
+    steps = reconnect_steps()
+    total = len(steps)
+    for i, (name, (x, y), gate, key) in enumerate(steps, 1):
+        if gate == "select":
+            if not reconnect_wait_for(gate, i, total, name):
+                return False
+            if not state.get("rc_notified"):      # Discord: the game is back (Select seen) - once per rejoin
+                state["rc_notified"] = True
+                notify_async("Reconnected successfully - the game has loaded, clicking through the lobby now.")
+            reconnect_countdown(i, total, name, RECONNECT_FIRST_DELAY)
+        else:
+            reconnect_countdown(i, total, name, reconnect_play_delay() if key in RECONNECT_PLAY_KEYS
+                                else reconnect_click_delay())
+            if gate and not reconnect_wait_for(gate, i, total, name):
+                return False
+        show("Reconnecting", f"Step {i}/{total}: clicking {name}")
+        log(f"Reconnect step {i}/{total}: clicking {name} ({x}, {y})")
+        click_middle(x, y)
+    return True
+
+
+def reconnect_launch(reason):
+    """One rejoin: close Roblox, launch the game again (roblox://placeId=...), stay hands off while
+    it loads - for at most RECONNECT_LOAD_WAIT seconds: the wait ends as soon as the Select picture
+    is on screen."""
+    state["rescuing"] = False
+    state["rescue_t0"] = None
+    state["mission_t0"] = None
+    _raid["active"] = False
+    _skip_spam["until"] = 0.0
+    release_all_keys()
+    set_status("waiting")
+    show("Reconnecting", "Closing Roblox")
+    log(f"Reconnect: {reason} - closing Roblox and rejoining the game")
+    if IS_WIN:
+        for exe in ("RobloxPlayerBeta.exe", "Windows10Universal.exe"):
+            try:
+                subprocess.run(["taskkill", "/F", "/IM", exe], capture_output=True,
+                               timeout=10, creationflags=0x08000000)
+            except Exception:  # noqa: BLE001
+                pass
+    wait(RECONNECT_CLOSE_WAIT, scan=False)
+    link = f"roblox://placeId={ROBLOX_GAME_ID}"
+    show("Reconnecting", f"Launching game {ROBLOX_GAME_ID}")
+    log(f"Launching {link}")
+    try:
+        if IS_WIN:
+            os.startfile(link)
+        else:
+            webbrowser.open(link)
+    except Exception as exc:  # noqa: BLE001
+        log(f"Could not launch Roblox: {type(exc).__name__}: {exc}")
+    end = time.time() + RECONNECT_LOAD_WAIT
+    while True:
+        remaining = end - time.time()
+        if remaining <= 0:
+            break
+        if reconnect_seen("select"):          # the lobby is up: no need to wait out the rest
+            log('Reconnect: "Select" seen - skipping the rest of the load wait')
+            break
+        show("Reconnecting", f"Waiting for the game to load... {remaining:.0f}s")
+        wait(min(0.5, remaining), scan=False)
+
+
+def reconnect_rejoin(reason="the Disconnect Image was seen"):
+    """Force a rejoin: reconnect_launch(), then click the picked coordinates step by step
+    (reconnect_clicks). If the Select / Play picture never shows, the whole rejoin is tried again
+    (up to RECONNECT_MAX_ATTEMPTS). The macro goes back to waiting for the next mission afterwards."""
+    state["reconnecting"] = True
+    state["rc_notified"] = False
+    # Discord: tell the user (with a mention when "Mention me" is on) that the rejoin started
+    if str(reason).startswith("the Disconnect Image"):
+        notify_async("Disconnected from the game - closing Roblox and rejoining...")
+    else:
+        notify_async(f"Rejoining the game ({reason}) - closing Roblox and rejoining...")
+    try:
+        for attempt in range(1, RECONNECT_MAX_ATTEMPTS + 1):
+            reconnect_launch(reason)
+            log(f"Game loaded - waiting for the Select picture, then clicking "
+                f"{len(reconnect_steps())} spots ({reconnect_click_delay():g}s apart)")
+            if reconnect_clicks():
+                log("Rejoin done - waiting for the next mission")
+                return
+            reason = "a Reconnect picture did not show"
+            if attempt < RECONNECT_MAX_ATTEMPTS:
+                log(f"Rejoining again (attempt {attempt + 1}/{RECONNECT_MAX_ATTEMPTS})")
+        log(f"Reconnect gave up after {RECONNECT_MAX_ATTEMPTS} attempts - waiting for the next mission")
+        notify_async(f"Reconnect FAILED after {RECONNECT_MAX_ATTEMPTS} attempts - please check the game.")
+    finally:
+        state["reconnecting"] = False
+        state["rc_next"] = time.time() + RECONNECT_COOLDOWN
 
 
 def tick(scan_retry=True):
-    """Called constantly: handles stop, pause, retry-button detection and the stuck-mission rescue."""
+    """Handles stop/pause/rescue and consumes the passive Retry observer without input delay."""
     if state["quit"]:
         raise SystemExit
     while state["paused"]:
         if state["quit"]:
             raise SystemExit
         time.sleep(0.1)
+    # Detection is independent of scan_retry. A passive observer can stop a stalled routine
+    # even inside a precise-timing wait; only the foreground macro thread handles Retry.
+    watchdog = cached_retry_hit()
+    if watchdog:
+        match, quality, screen, _timestamp = watchdog
+        raise RetryFound(match, quality, screen if tv(settings["family"], "fast_mode") else None)
+    if _disconnect_template is not None and not state.get("reconnecting"):
+        # Reconnect is on: three ways to rejoin - the bot command, a failsafe rescue that has not
+        # ended after RECONNECT_RESCUE_LIMIT (2 min), or the Disconnect Image
+        if state.pop("rc_request", False):
+            raise Disconnected("the bot command !reconnect was used")
+        t0 = state.get("rescue_t0")
+        if state["rescuing"] and t0 and time.time() - t0 > RECONNECT_RESCUE_LIMIT:
+            raise Disconnected(f"the failsafe has been rescuing for {RECONNECT_RESCUE_LIMIT / 60:g} minutes")
+        if time.time() >= state.get("rc_next", 0.0):
+            state["rc_next"] = time.time() + RECONNECT_CHECK_INTERVAL
+            if find_quality_template(grab_screen(), _disconnect_template, RECONNECT_THRESHOLD):
+                raise Disconnected
     if scan_retry:
         t0 = state["mission_t0"]
         if state["debug_rescue"] and not state["rescuing"]:     # DEBUG: F3+K
             state["debug_rescue"] = False
             rescue_clicks(debug=True)
         elif (not state["rescuing"] and t0 is not None
-                and settings["family"] != "Female Raid"      # the raid has its own failsafe (raid_failsafe_*)
+                and settings["family"] != "Female Raid" and settings["family"] not in ATTACK_FAMILIES    # raid routines manage retry
                 and time.time() - t0 > mission_timeout()):
             rescue_clicks()
+        if _raid["active"] and not _raid["in_raid_wait"] and not state["rescuing"]:
+            raid_skip_poll()        # the skip button is watched during every other raid action too
+        if (settings["family"] in ATTACK_FAMILIES
+                and not state.get("retry_processing")):
+            attack_titan_auto_skip()
         interval = FAST_SCAN_INTERVAL if tv(settings["family"], "fast_mode") else SCAN_INTERVAL
-        if time.time() - _last_scan >= interval:
-            scan_for_retry()
+        if time.time() - _last_scan >= interval and not state.get("retry_processing") \
+                and time.monotonic() >= state.get("retry_guard_until", 0.0):
+            scan_for_retry()     # original scanner stays as a fallback and handles Grab detection
 
 
 def wait(seconds, scan=True):
@@ -2473,37 +4698,58 @@ def gold_mask(bgr):
 _loot_fix_log = {"size": None}
 
 
-def scan_end_screen(quality="normal", want_loot=True, want_result=True, scan_time=None, frame=None):
+def scan_end_screen(quality="normal", want_loot=True, want_result=True,
+                    scan_time=None, frame=None, retry_anchor=None):
+    """Scan the result screen without matching loot icons anywhere on the desktop.
+
+    Loot is searched only in the central game result area, not the app's own
+    counters/HUD on screen edges. Multi-frame scans require two consistent hits;
+    fast mode's one saved frame requires a higher confidence score. Result text
+    matching remains unchanged. retry_anchor is the detected Retry button x.
     """
-    Look at the end screen for a moment. Only the loot icons of the same graphics quality as
-    the retry button are looked for ("low" icons for a low graphics screen), so the two looks
-    never get mixed up.
-    Returns (loot, result):
-      loot   = {kind: (cx, cy, score, w, h)} for every loot icon seen
-      result = ("completed" | "failed", (cx, cy, score, w, h)) or None
-    want_loot / want_result turn one of the two scans off.
-    frame: fast mode - read this one screenshot (taken when the retry button was found) instead of
-    looking at the live screen for scan_time seconds.
-    """
-    loot_found = {}
+    loot_hits = {}   # kind -> [(center_x, center_y, score, w, h)]
     loot_sizes = {}
     result_best = {}
-    fix = bool(settings.get("fix_loot"))      # "Fix loot tracking" (Beta): loot icons at any size
-    loot_thr = relax(LOOT_THRESHOLD) - (LOOT_FIX_RELAX if fix else 0.0)
+    fix = bool(settings.get("fix_loot"))
+    threshold = max(LOOT_SAFE_THRESHOLD, relax(LOOT_THRESHOLD) -
+                    (LOOT_FIX_RELAX if fix else 0.0))
+    if frame is not None:
+        threshold = max(threshold, LOOT_SAFE_SINGLE_THRESHOLD)
     wanted = active_loot_kinds()
     loot_tpls = ({k: t for k, t in _loot_templates.get(quality, {}).items() if k in wanted}
                  if want_loot else {})
     end = time.time() + (LOOT_SCAN_TIME if scan_time is None else scan_time)
+    frames = 0
+    first_debug_frame = None
     while True:
         screen = frame if frame is not None else grab_screen()
+        frames += 1
+        if first_debug_frame is None and SAVE_LOOT_DEBUG:
+            first_debug_frame = screen.copy()
+        height, width = screen.shape[:2]
+        # The Retry button and its loot/result panel are near the screen center.
+        # Restrict horizontal search to avoid counting the The Bums window or HUD.
+        center = retry_anchor if retry_anchor is not None else width / 2
+        pad = width * 0.23
+        x0 = max(0, int(center - pad))
+        x1 = min(width, int(center + pad))
+        y0, y1 = int(height * 0.16), int(height * 0.90)
+        crop = screen[y0:y1, x0:x1]
         for kind, tpl in loot_tpls.items():
             if fix:
-                best, size = best_match_any_size(screen, tpl, LOOT_FIX_SCALES)
+                best, size = best_match_any_size(crop, tpl, LOOT_FIX_SCALES)
             else:
-                best, size = best_match(screen, tpl), 1.0
-            if best and best[2] >= loot_thr:
-                if kind not in loot_found or best[2] > loot_found[kind][2]:
-                    loot_found[kind] = best
+                best, size = best_match(crop, tpl), 1.0
+            if best and best[2] >= threshold:
+                cx, cy, score, tw, th = best
+                hit = (cx + x0, cy + y0, score, tw, th)
+                prev = loot_hits.setdefault(kind, [])
+                # Same icon has to stay at roughly the same position as the
+                # result animation settles. Do not combine unrelated positions.
+                if not prev or any(abs(hit[0] - h[0]) <= max(hit[3], h[3])
+                                   and abs(hit[1] - h[1]) <= max(hit[4], h[4])
+                                   for h in prev):
+                    prev.append(hit)
                     loot_sizes[kind] = size
         if _result_templates and want_result:
             mask = gold_mask(screen)
@@ -2519,34 +4765,72 @@ def scan_end_screen(quality="normal", want_loot=True, want_result=True, scan_tim
             break
         wait(LOOT_SCAN_STEP, scan=False)
 
+    loot_found = {}
+    required_hits = 1 if frame is not None else 2
+    for kind, hits in loot_hits.items():
+        if len(hits) >= required_hits:
+            loot_found[kind] = max(hits, key=lambda x: x[2])
+        else:
+            log(f"Loot candidate rejected: {kind} matched only {len(hits)} frame(s)")
+
+    # Multiple templates may resemble the exact SAME on-screen reward icon.
+    # Keep the highest-scoring class for each location, rather than counting
+    # Body+Offence or other similar icons from a single graphic.
+    for a in list(loot_found):
+        if a not in loot_found:
+            continue
+        ah = loot_found[a]
+        for b in list(loot_found):
+            if a == b or b not in loot_found:
+                continue
+            bh = loot_found[b]
+            if (abs(ah[0]-bh[0]) < max(ah[3],bh[3]) * 0.65
+                    and abs(ah[1]-bh[1]) < max(ah[4],bh[4]) * 0.65):
+                loser = b if ah[2] >= bh[2] else a
+                winner = a if loser == b else b
+                log(f"Loot overlap: selected {winner} instead of {loser} at same position")
+                loot_found.pop(loser, None)
+                if loser == a:
+                    break
+
     if fix and loot_found:
         size = loot_sizes[max(loot_found, key=lambda k: loot_found[k][2])]
-        if _loot_fix_log["size"] != size:         # log the size only when it changes
+        if _loot_fix_log["size"] != size:
             _loot_fix_log["size"] = size
-            log(f"Fix loot tracking: loot icons matched at size x{size:.2f}")
+            log(f"Fix loot tracking: confirmed icons at size x{size:.2f}")
+    for kind, hit in loot_found.items():
+        log(f"Loot confirmed: {kind} (score {hit[2]:.2f}, "
+            f"hits {len(loot_hits[kind])}/{frames})")
 
     result = None
     for kind, m in result_best.items():
         if m[2] >= relax(RESULT_THRESHOLD) and (result is None or m[2] > result[1][2]):
             result = (kind, m)
 
-    if SAVE_LOOT_DEBUG and (loot_found or result):
-        img = frame.copy() if frame is not None else grab_screen()
-        marks = {k: (v, (0, 255, 0)) for k, v in loot_found.items()}
+    if SAVE_LOOT_DEBUG and first_debug_frame is not None:
+        img = first_debug_frame
+        # Retain the actual image dimensions to support user-generated overrides.
+        h, w = img.shape[:2]
+        p = retry_anchor if retry_anchor is not None else w/2
+        cv2.rectangle(img, (max(0,int(p-w*.23)), int(h*.16)),
+                      (min(w-1,int(p+w*.23)), int(h*.90)), (150,150,150), 2)
+        for label, (cx, cy, score, tw, th) in loot_found.items():
+            cv2.rectangle(img, (cx-tw//2,cy-th//2), (cx+tw//2,cy+th//2), (0,255,0), 2)
+            cv2.putText(img, f"{label} {score:.2f}", (cx-tw//2,cy-th//2-6),
+                        cv2.FONT_HERSHEY_SIMPLEX, .5, (0,255,0), 1)
         if result:
-            marks["result " + result[0]] = (result[1], (0, 200, 255))
-        for label, ((cx, cy, score, tw, th), color) in marks.items():
-            cv2.rectangle(img, (cx - tw // 2, cy - th // 2), (cx + tw // 2, cy + th // 2),
-                          color, 2)
-            cv2.putText(img, f"{label} {score:.2f}", (cx - tw // 2, cy - th // 2 - 6),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-        out = os.path.join(app_dir(), "last_end_scan.png")
-        cv2.imwrite(out, img)
+            cx,cy,score,tw,th = result[1]
+            cv2.rectangle(img,(cx-tw//2,cy-th//2),(cx+tw//2,cy+th//2),(0,200,255),2)
+        cv2.imwrite(os.path.join(app_dir(), "last_end_scan.png"), img)
     return loot_found, result
 
 
-def record_result(result):
-    """Count the mission as completed or failed (if the text was seen)."""
+def record_result(result, counted=False):
+    """Count the mission as completed or failed (if the text was seen). counted=True: the macro
+    already added it itself (addwin / addlose)."""
+    if counted:
+        push_stats()
+        return
     if result is None:
         log("Result: not detected")
     else:
@@ -2557,10 +4841,14 @@ def record_result(result):
 
 
 def record_loot(found):
-    """Add one to each kind that was seen, log it, update the window."""
+    """Add detected drops once per completed result and update the current session Scroll count."""
+    global session_scrolls
     lt = counters()[2]
     for kind in found:
         lt[kind] += 1
+        if kind == "scroll":
+            session_scrolls += 1
+            log(f"Scrolls this session: {session_scrolls}")
     if not found:
         log("Loot: nothing found")
     else:
@@ -2569,27 +4857,63 @@ def record_loot(found):
 
 
 # ------------------- mission start / end handling -----------------------
-def wait_for_mission_start(scan_retry=True):
-    """Block until the ability-2 icon appears (or F8 is pressed).
+def recover_retry_while_waiting(found):
+    """One click recovery after an unsuccessful Retry click. Do not count the result twice."""
+    global _retry_watch_hit
+    # A cached match can become stale while the result screen is animating.
+    fresh = find_retry(grab_screen())
+    if not fresh:
+        return
+    (cx, cy, score, tw, th), quality = fresh
+    # The live match must agree with the watchdog's confirmed results-panel location.
+    if abs(cx - found.match[0]) > 32 or abs(cy - found.match[1]) > 32:
+        return
+    x, y = frame_to_screen(cx, cy)
+    log(f"Retry still visible after previous click (score {score:.2f}); retrying click without counting the mission again")
+    show("Retry recovery", "Retry still visible - clicking again")
+    state["retry_processing"] = True
+    try:
+        with _retry_watch_lock:
+            _retry_watch_hit = None
+        click_at(x, y, int(tw * _scale), int(th * _scale))
+        state["retry_guard_until"] = time.monotonic() + AFTER_CLICK_DELAY + RETRY_GUARD_EXTRA
+        hands_off_wait(AFTER_CLICK_DELAY)
+        wait_for_icon_gone()
+    finally:
+        state["retry_processing"] = False
 
-    scan_retry=False means hands-off: no retry-button scanning and no clicks.
-    It is used right after clicking retry, so we never click twice.
+
+def wait_for_mission_start(scan_retry=True, after_retry=False):
+    """Wait for the correct family-specific start marker, monitoring Retry throughout.
+
+    after_retry=True recovers a still-visible Retry button without counting mission / loot twice.
     """
     set_status("waiting")
     set_step(-1)
-    raid = settings["family"] == "Female Raid"
-    show("Waiting for the raid" if raid else "Waiting for the mission",
-         "Looking for the skip button / raid_start.png" if raid else "Looking for the ability 2 icon")
-    log("Waiting for the raid to start (skip button / raid_start.png)" if raid else "Waiting for the mission to start")
+    raid = raid_counting()
+    attack_mode = settings["family"] in ATTACK_FAMILIES
+    start_note = "Looking for acoustic_shells.png (Skill 2)" if attack_mode else ("Looking for the skip button / raid_start.png" if raid else "Looking for the ability 2 icon")
+    show("Waiting for the raid" if raid else "Waiting for the mission", start_note)
+    log("Waiting for the raid: " + start_note if raid else "Waiting for the mission to start")
     while True:
-        tick(scan_retry=scan_retry)
+        try:
+            tick(scan_retry=scan_retry)
+        except RetryFound as found:
+            if not after_retry:
+                raise
+            recover_retry_while_waiting(found)
+            continue
         if state["manual_start"]:
             state["manual_start"] = False
             return
         fast = tv(settings["family"], "fast_mode")
+        # Suppress stale HUD icons during the transition from result screen to the next raid.
+        if after_retry and time.monotonic() < state.get("retry_guard_until", 0.0):
+            time.sleep(0.1)
+            continue
         if start_marker_visible():
             if raid:
-                log("Raid started (skip button or raid_start.png seen)")
+                log(f"{FAMILY_LABELS[settings['family']]}: acoustic_shells.png detected" if attack_mode else "Raid started (skip button or raid_start.png seen)")
                 return
             log("Mission started (icon detected)")
             if not fast:
@@ -2605,13 +4929,13 @@ def hands_off_wait(seconds):
         remaining = end - time.time()
         if remaining <= 0:
             break
-        show("Hands off", f"Waiting after the retry click... {remaining:.0f}s")
+        show("Hands of", f"Waiting after the retry click... {remaining:.0f}s")
         wait(min(0.5, remaining), scan=False)
 
 
 def wait_for_icon_gone():
     """After retry, wait for the old mission HUD to disappear (loading)."""
-    show("Hands off", "Waiting for the next mission to load")
+    show("Hands of", "Waiting for the next mission to load")
     deadline = time.time() + ICON_GONE_TIMEOUT
     while time.time() < deadline:
         tick(scan_retry=False)
@@ -2691,13 +5015,41 @@ def shift_sequence(fam=None):
     shifted4_interval = tv(fam, "shifted4_interval")
     shifted4_to5 = tv(fam, "shifted4_to5")
     ability5_interval = tv(fam, "ability5_interval")
+    # Colossal HUD image is available from the existing raid asset loader for every mode.
+    verify_blood = (fam == "Blood Awakening" and bool(tv(fam, "verify_shift"))
+                    and bool(_raid_templates.get("heatwave")))
+    if fam == "Blood Awakening" and tv(fam, "verify_shift") and not verify_blood:
+        log("Blood Awakening: heatwave.png is missing; using legacy timed Shift sequence")
+    blood_confirm_hits = 0
+    blood_shift_confirmed = False
+
+    def check_blood_shift():
+        nonlocal blood_confirm_hits, blood_shift_confirmed
+        if not verify_blood or blood_shift_confirmed:
+            return blood_shift_confirmed
+        found = raid_find("heatwave", grab_screen()) is not None
+        blood_confirm_hits = (blood_confirm_hits + 1) if found else 0
+        if blood_confirm_hits >= 2:
+            blood_shift_confirmed = True
+            log("Blood Awakening: Shift CONFIRMED - Colossal Heatwave icon detected twice")
+        return blood_shift_confirmed
+
     set_step(6)
     show("Shift", "Spamming ability 5 so the shift is used")
     log(f"Ability 5 spam for {shift_spam_time:g}s (shift)")
     spam_end = time.time() + shift_spam_time
+    shift_presses = 0
     while time.time() < spam_end:
+        if check_blood_shift():
+            break
         tap(KEY_ABILITY_LAST)
+        shift_presses += 1
         wait(shift_spam_interval)
+        if check_blood_shift():
+            break
+    if fam == "Blood Awakening":
+        log(f"Blood Awakening: {shift_presses} Shift key presses sent; "
+            f"verification {'active' if verify_blood else 'not available'}")
     log(f"Waiting {shifted4_at:g}s for the shift (then shifted ability 4)")
     shift_end = time.time() + shifted4_at
     extra_end = time.time() + shift_spam_extra   # still pressing 5 quietly during the first seconds of the wait
@@ -2706,11 +5058,30 @@ def shift_sequence(fam=None):
         if remaining <= 0:
             break
         show("Shift", f"Waiting for the shift... {remaining:.0f}s")
-        if time.time() < extra_end:
+        # If Colossal icon is already visible, do NOT keep pressing 5: the
+        # transformed skill can be triggered by the same key after Shift.
+        confirmed = check_blood_shift()
+        if time.time() < extra_end and not confirmed:
             tap(KEY_ABILITY_LAST)
+            shift_presses += 1
             wait(min(shift_spam_interval, remaining))
         else:
-            wait(min(0.5, remaining))
+            wait(min(0.35 if verify_blood and not confirmed else 0.5, remaining))
+    if verify_blood and not check_blood_shift():
+        extra = float(tv(fam, "shift_retry_wait"))
+        deadline = time.time() + max(0.0, extra)
+        if extra:
+            log(f"Blood Awakening: Shift NOT confirmed after expected delay; retrying 5 for {extra:g}s")
+            show("Shift recovery", "Waiting for Colossal Heatwave icon")
+        while time.time() < deadline and not check_blood_shift():
+            tap(KEY_ABILITY_LAST)
+            shift_presses += 1
+            wait(min(max(shift_spam_interval, 0.3), max(0, deadline-time.time())))
+        if not check_blood_shift():
+            log("WARNING: Blood Awakening Shift UNCONFIRMED after recovery; "
+                "using legacy continuation. Check Roblox focus, Shift meter, and heatwave.png.")
+        else:
+            log(f"Blood Awakening: Shift recovery succeeded after {shift_presses} Skill 5 presses")
 
     set_step(7)
     log(f"Shifted ability 4 spam for {shifted4_time:g}s")
@@ -2760,7 +5131,8 @@ def raid_find(kind, screen):
     if not tpl:
         return None
     thr = {"skip": RAID_SKIP_THRESHOLD, "finish": RAID_FINISH_THRESHOLD,
-           "heatwave": RAID_HEATWAVE_THRESHOLD, "start": RAID_START_THRESHOLD}[kind]
+           "heatwave": (tv(settings["family"], "heatwave_threshold") if settings["family"] in ATTACK_FAMILIES else RAID_HEATWAVE_THRESHOLD),
+           "start": RAID_START_THRESHOLD, "attack_finish": ATTACK_FINISH_THRESHOLD}[kind]
     hit = find_quality_template(screen, tpl, thr)
     return hit[0] if hit else None
 
@@ -2769,10 +5141,45 @@ def raid_skip_visible():
     return raid_find("skip", grab_screen()) is not None
 
 
+def attack_titan_start_icon_visible(frame):
+    """Match Acoustic Shells inside the skill-bar HUD across UI-scale variations.
+
+    A cropped HUD scan is faster and safer than matching a 99x103 border over the entire screen.
+    """
+    templates = _attack_start_template or {}
+    if not templates:
+        return False
+    h, w = frame.shape[:2]
+    x0, x1, y0 = int(w * 0.20), int(w * 0.85), int(h * 0.57)
+    roi = frame[y0:, x0:x1]
+    best_score = -1.0
+    for tpl in templates.values():
+        match, _scale_used = best_match_any_size(
+            roi, tpl, [0.55, 0.65, 0.75, 0.85, 1.0, 1.10, 1.20], top=3)
+        if match:
+            best_score = max(best_score, match[2])
+            if match[2] >= relax(ATTACK_START_THRESHOLD):
+                return True
+    now = time.monotonic()
+    if now - state.get("attack_start_debug_at", 0.0) > 10.0:
+        state["attack_start_debug_at"] = now
+        log(f"Acoustic Shells HUD scan: best score {best_score:.2f} / required {relax(ATTACK_START_THRESHOLD):.2f}")
+    return False
+
+
 def start_marker_visible():
-    """The thing that tells a new mission / raid has started: the ability 2 icon, or for Female Raid
-    the skip button or raid_start.png (whichever shows up first marks the raid's start)."""
-    if settings["family"] == "Female Raid":
+    """Detect the selected macro's actual start icon, not another macro's icon."""
+    if settings["family"] in ATTACK_FAMILIES:
+        # Retry sometimes overlays the HUD. Never treat that as a new Raid.
+        frame = grab_screen()
+        retry = find_retry(frame)
+        if retry:
+            cx, cy = retry[0][:2]
+            h, w = frame.shape[:2]
+            if .20*w < cx < .82*w and .48*h < cy < .96*h:
+                return False
+        return attack_titan_start_icon_visible(frame)
+    if raid_counting():
         screen = grab_screen()
         return raid_find("skip", screen) is not None or raid_find("start", screen) is not None
     return icon_visible()
@@ -2802,7 +5209,72 @@ class RaidFinished(Exception):
 
 _raid = {"skips": 0, "skip_visible": False, "last_look": 0.0, "heatwave": False,
          "next_a1": None, "start_seen": False, "step": -1, "title": "Raid", "detail": "",
-         "seq_done_t": None}     # when the shifting + waiting sequence ended (raid failsafe timer)
+         "seq_done_t": None,     # when the shifting + waiting sequence ended (raid failsafe timer)
+         "active": False, "in_raid_wait": False, "last_skip_look": 0.0}
+_skip_spam = {"until": 0.0, "thread": None}
+
+
+def _skip_spam_worker():
+    """Background E presses, so the skip spam overlaps whatever the macro is doing meanwhile."""
+    while time.time() < _skip_spam["until"] and not state["quit"]:
+        if state["paused"] or state["rescuing"]:
+            time.sleep(0.05)
+            continue
+        try:
+            pydirectinput.keyDown(KEY_RAID_SKIP)
+            time.sleep(random.uniform(0.03, 0.06))
+            pydirectinput.keyUp(KEY_RAID_SKIP)
+        except Exception:  # noqa: BLE001
+            pass
+        time.sleep(max(0.02, tv("Female Raid", "skip_spam_interval")))
+    _skip_spam["thread"] = None
+
+
+def raid_skip_e_spam(seconds):
+    """Spam E for `seconds` from now (a new sighting restarts / extends the time)."""
+    _skip_spam["until"] = time.time() + seconds
+    th = _skip_spam["thread"]
+    if th is None or not th.is_alive():
+        th = threading.Thread(target=_skip_spam_worker, daemon=True)
+        _skip_spam["thread"] = th
+        th.start()
+
+
+def raid_skip_handle(screen):
+    """The skip button check (used by raid_watch and, during other actions, by tick). Returns True
+    while the button is on screen. E is spammed in the background for the E spam time (3s); a skip
+    button counts once per time it shows up."""
+    if not raid_find("skip", screen):
+        _raid["skip_visible"] = False
+        return False
+    new = not _raid["skip_visible"]
+    _raid["skip_visible"] = True
+    if new:
+        _raid["skips"] += 1
+        _raid["start_seen"] = True          # the first skip starts the buffs
+        n = _raid["skips"]
+        e_time = RAID_SKIP_FIRST_SPAM_TIME if n == 1 else tv("Female Raid", "skip_spam_time")
+        raid_skip_e_spam(e_time)            # once per sighting (the first skip: 0.5s, the rest: 2s)
+        log(f"Skip button seen (no. {n}) - spamming {KEY_RAID_SKIP.upper()} for {e_time:g}s")
+        if n == 2:
+            raid_phase(2, "Killing Eren", "Skip no. 2")
+        if n == int(tv("Female Raid", "skip_number")):
+            show("Ability 3", f"Skip no. {n}: ability 3 once")
+            log(f"Skip no. {n}: ability 3 once")
+            tap(KEY_ABILITY_2ND)
+            _raid["heatwave"] = True
+            raid_phase(3, "Killing Female titan", f"Skip no. {n}: waiting for heatwave")
+            log(f"Skip no. {n}: waiting for heatwave.png (then ability 1)")
+    return True
+
+
+def raid_skip_poll():
+    """tick() calls this during every raid action, so the skip button is noticed in time."""
+    now = time.time()
+    if now - max(_raid["last_skip_look"], _raid["last_look"]) < RAID_LOOK_INTERVAL:
+        return
+    _raid["last_skip_look"] = now
+    raid_skip_handle(grab_screen())
 
 
 def raid_trigger_failsafe(reason):
@@ -2857,7 +5329,7 @@ def raid_wait_finish_button(timeout):
         wait(RAID_FINISH_LOOK, scan=True)
 
 
-def raid_finish(match):
+def raid_finish(match, phase=True):
     """The finish button is on screen: chest 1 (clicked over and over), wait until the finish button
     shows up again (= the chest is open), chest 2 (if on) the same, then the finish button is
     clicked over and over. The retry button that shows up afterwards is
@@ -2865,7 +5337,8 @@ def raid_finish(match):
     cx, cy, _score, tw, th = match
     t = lambda key: tv("Female Raid", key)    # noqa: E731
     log("Finish button seen")
-    raid_phase(4, "Opening chests", "Finish button seen")
+    if phase:                       # (openchest() in a custom macro has no raid steps)
+        raid_phase(4, "Opening chests", "Finish button seen")
     for n, key in ((1, "chest1"), (2, "chest2")):
         if n == 2 and not t("open_chest2"):
             continue
@@ -2885,7 +5358,7 @@ def raid_finish(match):
             log(f"WARNING: finish button not seen {t('finish_wait'):g}s after chest {n}")
     show("Opening chests", "Clicking the finish button")
     log(f"Clicking finish for {t('finish_click_time'):g}s")
-    raid_click_spam(_monitor["left"] + int(cx * _scale), _monitor["top"] + int(cy * _scale),
+    raid_click_spam(*frame_to_screen(cx, cy),
                     t("finish_click_time"), t("finish_click_interval"), "finish",
                     jitter=max(1, int(min(tw, th) * _scale) // 6))
 
@@ -2903,40 +5376,14 @@ def raid_watch(force=False):
         return
     _raid["last_look"] = now
     screen = grab_screen()
-    if not _raid["start_seen"] and "start" in _raid_templates and raid_find("start", screen):
-        _raid["start_seen"] = True
-        log("raid_start.png seen")
-    if raid_find("skip", screen):
-        new = not _raid["skip_visible"]
-        _raid["skip_visible"] = True
-        if new:
-            _raid["skips"] += 1
-            if "start" not in _raid_templates:      # no raid_start.png: the first skip starts the buffs
-                _raid["start_seen"] = True
-            log(f"Skip button seen (no. {_raid['skips']})")
-            if _raid["skips"] == 2:
-                raid_phase(2, "Killing Eren", "Skip no. 2")
-        n = _raid["skips"]
-        e_time = tv("Female Raid", "skip_spam_time")
-        show("Skip", f"Spamming {KEY_RAID_SKIP.upper()} for {e_time:g}s (skip no. {n})")
-        spam_key_for(KEY_RAID_SKIP, e_time, tv("Female Raid", "skip_spam_interval"),
-                     KEY_RAID_SKIP.upper())
-        if new and n == int(tv("Female Raid", "skip_number")):
-            show("Ability 3", f"Skip no. {n}: ability 3 once")
-            log(f"Skip no. {n}: ability 3 once")
-            tap(KEY_ABILITY_2ND)
-            _raid["heatwave"] = True
-            raid_phase(3, "Killing Female titan", f"Skip no. {n}: waiting for heatwave")
-            log(f"Skip no. {n}: waiting for heatwave.png (then ability 1)")
+    _raid["last_skip_look"] = now
+    if raid_skip_handle(screen):
         raid_back_to_phase()
-        return
-    _raid["skip_visible"] = False
     fin = raid_find("finish", screen)
     if fin:
         raid_finish(fin)
         raise RaidFinished
     if (_raid["heatwave"]                      # armed by the 3rd skip, stays armed
-            and (_raid["next_a1"] is None or time.time() >= _raid["next_a1"])
             and raid_find("heatwave", screen)):
         log("Heatwave seen")
         raid_ability1_burst()
@@ -2947,18 +5394,35 @@ def raid_watch(force=False):
 
 
 def raid_ability1_burst():
-    """Ability 4 once, then spam ability 1 (the heatwave). The 4 -> 3 -> 2 cycle waits meanwhile.
-    Seeing heatwave.png again later does it again, but not before the cooldown (Edit configs:
-    'Pause before it can repeat') has passed, so a heatwave that stays on screen isn't spammed forever."""
-    hw = tv("Female Raid", "heatwave_time")
+    """Ability 4 once, then spam ability 1 for as long as heatwave.png stays on screen. Nothing
+    else is done meanwhile (no skip handling, no ability cycle) - only stop / pause / the retry
+    button and the raid failsafe keep working. When the heatwave is gone the raid goes on."""
+    _skip_spam["until"] = 0.0                       # drop any E spam still running
+    interval = tv("Female Raid", "heatwave_interval")
     show("Ability 1", "Ability 4 once, then ability 1")
     log("Ability 4 once")
     tap(KEY_ABILITY_3RD)
-    show("Ability 1", f"Spamming ability 1 for {hw:g}s")
-    log(f"Ability 1 spam for {hw:g}s")
-    spam_key_for(KEY_GRAB, hw, tv("Female Raid", "heatwave_interval"), "ability 1")
-    rep_after = tv("Female Raid", "heatwave_repeat")
-    _raid["next_a1"] = time.time() + rep_after if rep_after > 0 else None
+    log("Spamming ability 1 while the heatwave is visible")
+    _raid["in_raid_wait"] = True                    # tick() must not look for the skip button now
+    t_start = time.time()
+    misses = 0
+    try:
+        while True:
+            show("Ability 1", f"Spamming ability 1 while the heatwave is visible "
+                              f"({time.time() - t_start:.0f}s)")
+            if raid_find("heatwave", grab_screen()):
+                misses = 0
+                tap(KEY_GRAB)
+            else:
+                misses += 1
+                if misses >= 2:                     # gone on two looks in a row
+                    break
+            wait(max(0.02, interval))
+            raid_failsafe_time_check()
+    finally:
+        _raid["in_raid_wait"] = False
+    log(f"Heatwave gone after {time.time() - t_start:.1f}s - ability 1 spam stopped")
+    _raid["next_a1"] = None
     raid_back_to_phase()
 
 
@@ -2966,7 +5430,11 @@ def raid_wait(seconds):
     """wait() that also keeps an eye on the skip / finish button."""
     end = time.time() + seconds
     while True:
-        tick()
+        _raid["in_raid_wait"] = True        # raid_watch() below looks for the skip button itself
+        try:
+            tick()
+        finally:
+            _raid["in_raid_wait"] = False
         raid_watch()
         raid_failsafe_time_check()
         remaining = end - time.time()
@@ -2993,8 +5461,8 @@ def raid_sequence():
     "escape grab" key in Settings > Keybinds - the same key in the game.) Every number is in Edit configs."""
     t = lambda key: tv("Female Raid", key)    # noqa: E731
     raid_phase(0, "Using buffs", "Ability 1")
-    log("Ability 1")
-    tap(KEY_GRAB)
+    log(f"Ability 1 spam for {RAID_OPEN_A1_TIME:g}s")
+    raid_spam(KEY_GRAB, RAID_OPEN_A1_TIME, t("a1_interval"), "ability 1")
     log(f"Ability 3 spam for {t('a3_time'):g}s")
     raid_spam(KEY_ABILITY_2ND, t("a3_time"), t("a3_interval"), "ability 3")
     log(f"Ability 5 spam for {t('a5_time'):g}s")
@@ -3031,38 +5499,396 @@ def raid_routine():
     usual)."""
     _raid.update(skips=0, skip_visible=False, last_look=0.0, heatwave=False, next_a1=None,
                  start_seen=False, step=-1, seq_done_t=None, title="Raid started",
-                 detail="Waiting for raid_start.png")
+                 detail="Waiting for the first skip")
     log("Female Raid: raid started")
     show(_raid["title"], _raid["detail"])
+    _raid["active"] = True
+    _skip_spam["until"] = 0.0
     try:
-        raid_watch(force=True)          # E if the skip button is what started the raid
-        while not _raid["start_seen"]:  # the buffs wait for raid_start.png
-            raid_wait(0.05)
-        log("Raid start seen - using buffs")
-        raid_sequence()                 # never returns by itself
-    except RaidFinished:
-        pass
-    show("Opening chests", "Finish clicked - waiting for the retry button")
-    while True:
-        wait(0.2)
+        try:
+            raid_watch(force=True)          # E if the skip button is what started the raid
+            while not _raid["start_seen"]:  # the buffs wait for the first skip
+                raid_wait(0.05)
+            log("First skip seen - using buffs")
+            raid_sequence()                 # never returns by itself
+        except RaidFinished:
+            pass
+        _raid["active"] = False             # finished: no more skip polling
+        _skip_spam["until"] = 0.0
+        show("Opening chests", "Finish clicked - waiting for the retry button")
+        while True:
+            wait(0.2)
+    finally:
+        _raid["active"] = False             # retry / stop: the raid is over
+        _skip_spam["until"] = 0.0
 
 
 def warn_raid_config():
     """Console warnings when Female Raid is the picked config and a chest spot is missing."""
-    if settings["family"] != "Female Raid":
+    if settings["family"] != "Female Raid" and settings["family"] not in ATTACK_FAMILIES:
         return
-    if tv("Female Raid", "chest1") is None:
-        log("WARNING: Female Raid - Chest 1 coordinate is not set! "
+    fam = settings["family"]
+    if tv(fam, "chest1") is None:
+        log(f"WARNING: {fam} - Chest 1 coordinate is not set! "
             "Set it in Settings > Configs > Chest locations.")
-    if tv("Female Raid", "open_chest2") and tv("Female Raid", "chest2") is None:
-        log("WARNING: Female Raid - 'Open chest 2' is on but the Chest 2 coordinate is not set.")
+    if tv(fam, "open_chest2") and tv(fam, "chest2") is None:
+        log(f"WARNING: {fam} - Chest 2 is enabled but its coordinate is not set.")
+
+
+
+# ---------------------------- Attack Titan Raid Fritz ----------------------------
+_attack_skip = {"next_scan": 0.0, "last_press": 0.0, "streak": 0, "busy": False}
+
+
+def attack_titan_auto_skip():
+    """Optional E-on-skip; main worker only. Rate-limited and double-frame confirmed."""
+    if (_attack_skip["busy"] or not tv(settings["family"], "auto_skip_cutscene")
+            or "skip" not in _raid_templates):
+        return False
+    now = time.monotonic()
+    if now < _attack_skip["next_scan"]:
+        return False
+    _attack_skip["next_scan"] = now + 0.20
+    visible = attack_titan_skip_visible()
+    if not visible:
+        _attack_skip["streak"] = 0
+        return False
+    _attack_skip["streak"] += 1
+    if (_attack_skip["streak"] >= 2 and
+            now - _attack_skip["last_press"] >= float(tv(settings["family"], "skip_press_interval"))):
+        _attack_skip["busy"] = True
+        try:
+            log(f"{FAMILY_LABELS[settings['family']]}: skip.png confirmed -> pressing E")
+            tap(KEY_RAID_SKIP)
+            _attack_skip["last_press"] = time.monotonic()
+        finally:
+            _attack_skip["busy"] = False
+    return True
+
+
+def attack_titan_skip_visible(frame=None):
+    """Cutscene detection in the bottom-right SKIP area, not the full combat HUD."""
+    if "skip" not in _raid_templates:
+        return False
+    frame = grab_screen() if frame is None else frame
+    h, w = frame.shape[:2]
+    # The supplied Raid recording places SKIP near x=91%, y=89%.
+    bottom_right = frame[int(h * 0.68):, int(w * 0.65):]
+    return raid_find("skip", bottom_right) is not None
+
+
+class AttackTitanChestFound(Exception):
+    """finish.png found. Stop all combat before clicking on the CHESTS screen."""
+
+
+def attack_titan_picture(kind, frame=None):
+    return raid_find(kind, grab_screen() if frame is None else frame)
+
+
+def attack_titan_wait(seconds, check_finish=True):
+    end = time.monotonic() + max(0.0, float(seconds))
+    while True:
+        tick()
+        if check_finish and attack_titan_picture("attack_finish"):
+            raise AttackTitanChestFound
+        remaining = end - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(0.06, remaining))
+
+
+def attack_titan_directional_dash(key, name):
+    """Perform exactly one D-D, A-A or S-S Dash.
+
+    Fritz pacing is defined by the explicit waits in its opening routine:
+    1.3s between the first two Right Dashes and 0.3s after later side Dashes.
+    An extra global cooldown here would silently override those timings.
+    """
+    tick(scan_retry=False)
+    if attack_titan_picture("attack_finish"):
+        raise AttackTitanChestFound
+    log(f"Attack Titan Fritz: {name}: {key.upper()} + {key.upper()}")
+    show("Directional Dash", f"{name}: {key.upper()} + {key.upper()}")
+    double_tap(key)
+
+
+def attack_titan_heatwave_transition(current, candidate, confirmed, stable_for):
+    """Pure edge-debounce helper: report a change only after the new icon state is stable."""
+    now = time.monotonic()
+    if candidate != confirmed["candidate"]:
+        confirmed["candidate"] = candidate
+        confirmed["since"] = now
+    if candidate != current and now - confirmed["since"] >= stable_for:
+        return candidate
+    return current
+
+
+def attack_titan_chests():
+    """Open opted-in chests once and click FINISH. Existing RetryFound handling does the loop."""
+    fam = settings["family"]
+    t = lambda k: tv(fam, k)
+    show("Opening chests", "CHESTS screen detected")
+    log("Attack Titan Raid: finish.png detected - stopping combat and opening chests")
+    raid_phase(4, "Opening chests", "CHESTS screen detected")
+    for key, label, enabled in (
+        ("chest1", "Raider's Chest", True),
+        ("chest2", "Emperor's Trove", bool(t("open_chest2"))),
+    ):
+        if not enabled:
+            log(f"Attack Titan Raid: skipping {label} (disabled)")
+            continue
+        spot = t(key)
+        if spot is None:
+            log(f"WARNING: {label} position not set. Use Pick spot in Settings > Configs.")
+            continue
+        log(f"Attack Titan Raid: opening {label} at {spot[0]}, {spot[1]}")
+        raid_click_spam(spot[0], spot[1], t("chest_click_time"),
+                        t("chest_click_interval"), label, jitter=0)
+        # The animation temporarily hides CHESTS. Avoid clicking twice during this transition.
+        attack_titan_wait(0.75, check_finish=False)
+        deadline = time.monotonic() + t("finish_wait")
+        while time.monotonic() < deadline:
+            tick()
+            if attack_titan_picture("attack_finish"):
+                break
+            time.sleep(0.15)
+        else:
+            log(f"WARNING: finish.png did not return after opening {label}")
+    # Locate the actual FINISH text from finish.png rather than using a fixed screen coordinate.
+    show("Opening chests", "Clicking FINISH")
+    deadline = time.monotonic() + t("finish_wait")
+    match = None
+    while time.monotonic() < deadline:
+        tick()
+        match = attack_titan_picture("attack_finish")
+        if match:
+            break
+        time.sleep(0.15)
+    if match:
+        cx, cy, _score, tw, th = match
+        raid_click_spam(*frame_to_screen(cx, cy),
+                        t("finish_click_time"), t("finish_click_interval"), "FINISH", jitter=0)
+    else:
+        log("WARNING: FINISH was not detected. Waiting for retry without clicking random positions.")
+    show("Raid completed", "Waiting for RETRY")
+    while True:
+        attack_titan_wait(0.2, check_finish=False)   # tick() scans Retry for the normal loop
+
+
+def attack_titan_colossal():
+    """Independent 1/3/5 timers + edge-driven Heatwave. No Skill 4 press on first reappearance."""
+    t = lambda k: tv(settings["family"], k)
+    show("Colossal Titan", "Waiting for Heatwave")
+    while True:
+        tick()
+        frame = grab_screen()
+        if attack_titan_picture("attack_finish", frame):
+            raise AttackTitanChestFound
+        if attack_titan_skip_visible(frame):
+            # Waiting for phase transition; auto-skip (if enabled) is handled in tick().
+            time.sleep(0.12)
+            continue
+        if attack_titan_heatwave_visible(frame):
+            break
+        time.sleep(0.1)
+    log(f"Colossal Titan: Heatwave icon detected; pressing Skill 4 ({KEY_ABILITY_3RD})")
+    tap(KEY_ABILITY_3RD)    # Skill 4 is a toggle; NEVER press this in the independent skill loop.
+    stage = "first_hidden"
+    stable_for = float(t("heatwave_confirm"))
+    state_icon = True
+    confirm = {"candidate": True, "since": time.monotonic()}
+    timers = {
+        "1": [KEY_GRAB, float(t("skill1_interval")), time.monotonic()],
+        "3": [KEY_ABILITY_2ND, float(t("skill3_interval")), time.monotonic()],
+        "5": [KEY_ABILITY_LAST, float(t("skill5_interval")), time.monotonic()],
+    }
+    last_heatwave_press = time.monotonic()
+    while True:
+        tick()
+        frame = grab_screen()
+        if attack_titan_picture("attack_finish", frame):
+            raise AttackTitanChestFound
+        if attack_titan_skip_visible(frame):
+            # Freeze all abilities and Heatwave transitions while a cutscene covers the HUD.
+            time.sleep(0.12)
+            continue
+        seen = attack_titan_heatwave_visible(frame)
+        next_icon = attack_titan_heatwave_transition(state_icon, seen, confirm, stable_for)
+        if next_icon != state_icon:
+            state_icon = next_icon
+            if stage == "first_hidden" and not seen:
+                stage = "first_visible"
+                log("Heatwave: first cooldown started")
+            elif stage == "first_visible" and seen:
+                stage = "second_hidden"
+                log("Heatwave: first cooldown ended. Skill 4 stays ON; do not press.")
+            elif stage == "second_hidden" and not seen:
+                stage = "true_ready"
+                log("Heatwave: real cooldown started")
+            elif stage == "true_ready" and seen:
+                if time.monotonic() - last_heatwave_press > 1.0:
+                    log("Heatwave: real cooldown ended. Activating Skill 4 again")
+                    tap(KEY_ABILITY_3RD)
+                    last_heatwave_press = time.monotonic()
+                    stage = "first_hidden"
+        # Independent polling: each ability has its own schedule; its keybind is user-configured.
+        now = time.monotonic()
+        for slot, values in timers.items():
+            key, interval, ready_at = values
+            if now >= ready_at:
+                tap(key)
+                values[2] = time.monotonic() + interval
+        time.sleep(0.06)
+
+
+def attack_titan_heatwave_visible(frame):
+    """Try exact icon, then the bottom HUD in several UI sizes.
+
+    Shift failures on 1920x1009 Roblox windows can be false negatives from HUD scaling.
+    Only the lower skill row is examined for a fallback, never full-screen blurry matches.
+    """
+    if attack_titan_picture("heatwave", frame):
+        return True
+    images = _raid_templates.get("heatwave") or {}
+    if not images:
+        return False
+    h, w = frame.shape[:2]
+    roi = frame[int(h * .67):, int(w * .31):int(w * .82)]
+    threshold = float(tv(settings["family"], "heatwave_threshold"))
+    for tpl in images.values():
+        best, _s = best_match_any_size(roi, tpl,
+                                       (0.55, 0.65, 0.75, 0.85, 1.0, 1.15, 1.30), top=2)
+        if best and best[2] >= relax(threshold):
+            return True
+    return False
+
+
+def attack_titan_shift_until_confirmed():
+    """Continue Shift until Colossal is confirmed or a REAL end screen appears.
+
+    No arbitrary timeout and no transition to Recovery while still in a Raid.
+    The existing tick() / Retry watchdog always runs; F7 and pause remain usable.
+    """
+    t = lambda k: tv(settings["family"], k)
+    sightings = 0
+    presses = 0
+    next_press = 0.0
+    status_at = time.monotonic() + 20.0
+    log(f"{FAMILY_LABELS[settings['family']]}: repeating Skill 5 until heatwave.png confirms Shift or Retry appears")
+    show("Colossal Shift", "Repeating Skill 5; waiting for heatwave.png or Retry")
+    while True:
+        tick()  # includes Retry, pause, stop and optional skip.png
+        frame = grab_screen()
+        if attack_titan_picture("attack_finish", frame):
+            raise AttackTitanChestFound
+        if attack_titan_skip_visible(frame):
+            sightings = 0
+            time.sleep(0.12)
+            continue
+        if attack_titan_heatwave_visible(frame):
+            sightings += 1
+            if sightings >= 2:
+                log(f"{FAMILY_LABELS[settings['family']]}: Colossal Shift CONFIRMED after {presses} Skill 5 presses")
+                return
+            # Do not accidentally cast Colossal Skill 5 during confirmation frames.
+            attack_titan_wait(0.10)
+            continue
+        sightings = 0
+        now = time.monotonic()
+        if now >= next_press:
+            tap(KEY_ABILITY_LAST)
+            presses += 1
+            next_press = time.monotonic() + float(t("shift_spam_interval"))
+        if now >= status_at:
+            log("Shift still unconfirmed; continuing Skill 5 (no timeout). Retry remains monitored")
+            status_at = now + 20.0
+        attack_titan_wait(0.10)
+
+
+def attack_titan_raid_routine():
+    """Fritz opening route. Other built-in and custom macro routines are unchanged."""
+    t = lambda k: tv(settings["family"], k)
+    _attack_skip.update(next_scan=0.0, last_press=0.0, streak=0, busy=False)
+    _raid.update(step=-1, title=ATTACK_DISPLAY_NAME, detail="Fritz opening combo")
+    show(ATTACK_DISPLAY_NAME, "Fritz opening combo")
+    log("Attack Titan Raid Fritz: acoustic_shells.png detected; entering Fritz opening")
+    try:
+        raid_phase(0, "Right Dashes", "D-D, pause, D-D")
+        attack_titan_directional_dash(KEY_STRAFE_D, "Right Dash 1/2")
+        log(f"Attack Titan Fritz: pause {t('right_dash_cooldown'):g}s between the opening Right Dashes")
+        attack_titan_wait(t("right_dash_cooldown"))
+        attack_titan_directional_dash(KEY_STRAFE_D, "Right Dash 2/2")
+        raid_phase(1, "Fritz opening", "Skill 1, Back Dash, Skill 3")
+        log("Attack Titan Fritz: Skill 1 - Flashbang")
+        tap(KEY_GRAB)
+        # Mandatory camera-down after Flashbang, BEFORE the single S-S Back Dash.
+        # Reuses Universal's CTRL -> relative mouse movement -> CTRL implementation.
+        show("Looking down", "CTRL -> mouse down -> CTRL")
+        log("Attack Titan Fritz: looking down after Flashbang (Universal camera control)")
+        look_down(lambda: tick(scan_retry=False),
+                  seconds=t("camera_down_time"),
+                  pixels=t("camera_down_pixels"),
+                  settle=0.15)
+        attack_titan_directional_dash(KEY_BACK, "Back Dash 1/1")
+        log("Attack Titan Fritz: Skill 3 -> animation wait")
+        tap(KEY_ABILITY_2ND)
+        attack_titan_wait(t("skill3_animation"))
+        raid_phase(2, "Fritz positioning", "Left Dash, Skill 2, Right Dash, Left Dash, Skill 4, Skill 1")
+        attack_titan_directional_dash(KEY_STRAFE, "Left Dash 1/2")
+        attack_titan_wait(t("after_left_dash"))       # 0.3s after first A-A
+        log("Attack Titan Fritz: Skill 2 Acoustic Shells")
+        tap(KEY_ABILITY_1ST)
+        attack_titan_wait(t("after_skill2"))          # 0.0s by default
+        attack_titan_directional_dash(KEY_STRAFE_D, "Right Dash 1/1")
+        attack_titan_wait(t("after_right_dash"))      # 0.3s after D-D
+        attack_titan_directional_dash(KEY_STRAFE, "Left Dash 2/2")
+        attack_titan_wait(t("after_last_left_dash"))  # 0.3s after second A-A
+        attack_titan_wait(t("before_skill4"))         # additional 1.0s before Skill 4
+        log("Attack Titan Fritz: Skill 4")
+        tap(KEY_ABILITY_3RD)
+        attack_titan_wait(t("after_skill4"))
+        log("Attack Titan Fritz: Skill 1 (second cast)")
+        tap(KEY_GRAB)
+        raid_phase(3, "Colossal Shift", "Skill 5 until Heatwave confirms Colossal")
+        attack_titan_shift_until_confirmed()
+        # Phase 1 can end at any time; the combat loop waits out/auto-skips cutscenes.
+        attack_titan_colossal()
+    except AttackTitanChestFound:
+        attack_titan_chests()
+
+
+def attack_titan_blood_routine():
+    """Attack Titan Raid: Acoustic Shells -> Space-Space forward Dash -> Shift.
+
+    No Fritz family combo, no camera movement; after Shift use the exact same
+    Colossal Heatwave / independent Skill 5, 3, 1 / chests / Retry logic.
+    """
+    _attack_skip.update(next_scan=0.0, last_press=0.0, streak=0, busy=False)
+    label = FAMILY_LABELS[ATTACK_BLOOD_KEY]
+    _raid.update(step=-1, title=label, detail="Acoustic Shells opening")
+    show(label, "Acoustic Shells, Forward Dash, Colossal Shift")
+    log(f"{label}: acoustic_shells.png detected; entering Blood Awakening opening")
+    try:
+        raid_phase(0, "Acoustic Shells", "Press Skill 2 immediately")
+        tap(KEY_ABILITY_1ST)  # Skill 2, user-configurable in Settings > Keybinds
+        raid_phase(1, "Forward Dash", "Double-tap Space")
+        log(f"{label}: Forward Dash ({KEY_DASH.upper()} + {KEY_DASH.upper()})")
+        double_tap(KEY_DASH)  # Forward Dash = Space twice, not W or D
+        raid_phase(2, "Colossal Shift", "Skill 5 until Heatwave confirms Colossal")
+        attack_titan_shift_until_confirmed()
+        raid_phase(3, "Colossal Titan", "Heatwave + independent Skills 5, 3, 1")
+        attack_titan_colossal()
+    except AttackTitanChestFound:
+        attack_titan_chests()
 
 
 def run_mission():
     state["manual_start"] = False   # a mission is running now: forget any leftover F8 press
     state["mission_t0"] = time.time()   # for the stuck-mission rescue (failsafe time)
     state["rescued"] = False
-    counters()[0]["missions"] += 1
+    state.pop("macro_loot", None)   # what trackloot() / addwin() / addlose() of a custom macro
+    state.pop("macro_result", None)  # counted in this run (so the retry handling skips it)
+    counters()[0]["missions"] += 1  # a mission - or a raid (Female Raid / custom type: raid)
     push_stats()
     ev.put(("mission_started",))
     set_status("running")
@@ -3078,6 +5904,16 @@ def run_mission():
 
     if fam == "Female Raid":
         raid_routine()          # never returns: ends with RetryFound / stop
+    if fam in ATTACK_FAMILIES:
+        log(f"Dispatch: {FAMILY_LABELS[fam]} selected - starting Raid routine")
+        if fam == ATTACK_FRITZ_KEY:
+            attack_titan_raid_routine()
+        else:
+            attack_titan_blood_routine()
+        return
+
+    if is_custom(fam):
+        custom_routine()        # your own .tbmacro macro; never returns: ends with RetryFound / stop
 
     if tv("Movement", "look_up"):
         show("Looking up", "ctrl, mouse up, ctrl")
@@ -3177,27 +6013,17 @@ def _screen_scale():
     pictures have to be scaled to 1080p size when they are loaded)."""
     if FORCE_SCALE:
         return FORCE_SCALE
+    area = adaptive_capture_area()
+    if area:
+        return area["height"] / BASE_HEIGHT
     try:
         with mss.mss() as tmp:
-            return tmp.monitors[MONITOR_INDEX]["height"] / BASE_HEIGHT
+            return pick_monitor(tmp.monitors)["height"] / BASE_HEIGHT
     except Exception:  # noqa: BLE001
         return 1.0
 
 
-def _log_overrides():
-    """Tell the user which of their own pictures from asset_override are in use."""
-    folder = ensure_override_dir()
-    mine = []
-    for root, _dirs, files in os.walk(folder):
-        for f in files:
-            if f.lower().endswith((".png", ".jpg", ".jpeg", ".bmp")):
-                mine.append(os.path.relpath(os.path.join(root, f), folder).replace("\\", "/"))
-    if mine:
-        log(f"asset_override: using your own picture(s) instead of the built-in ones: "
-            f"{', '.join(sorted(mine))}")
-
-
-def select_roblox_monitor():
+def auto_detect_roblox_monitor():
     """Look at the monitor the Roblox window is on (MONITOR_INDEX is only the fallback), and say so
     in the log when the picture can not be read well: the images are matched at screen size, so
     Roblox has to fill its monitor (borderless fullscreen / F11)."""
@@ -3232,17 +6058,40 @@ def select_roblox_monitor():
     except Exception as e:  # noqa: BLE001
         log(f"Screen check skipped ({type(e).__name__}: {e})")
 
+def _log_overrides():
+    """Tell the user which of their own pictures from asset_override are in use."""
+    folder = ensure_override_dir()
+    mine = []
+    for root, _dirs, files in os.walk(folder):
+        for f in files:
+            if f.lower().endswith((".png", ".jpg", ".jpeg", ".bmp")):
+                mine.append(os.path.relpath(os.path.join(root, f), folder).replace("\\", "/"))
+    if mine:
+        log(f"asset_override: using your own picture(s) instead of the built-in ones: "
+            f"{', '.join(sorted(mine))}")
+
 
 def macro_main():
-    global _sct, _monitor, _scale, _retry_template, _start_template, _grab_template
-    global _shiki_ability4_icon
+    global _sct, _monitor, _scale, _retry_template, _start_template, _attack_start_template, _grab_template
+    global _shiki_ability4_icon, _disconnect_template, _adaptive_run_enabled, _capture_rect
     try:
-        select_roblox_monitor()
+        _adaptive_run_enabled = bool(settings.get("adaptive_resolution", False)) and IS_WIN
+        _capture_rect = None
+        if settings.get("auto_monitor", True):
+            auto_detect_roblox_monitor()
+        log(f"Resolution mode: {capture_mode_description()}" +
+            (" (Beta: fallback to monitor if Roblox window is unavailable)"
+             if _adaptive_run_enabled else ""))
         _scale = _screen_scale()     # the user's own pictures (asset_override) are scaled with it
         _log_overrides()
         _retry_template = load_quality_templates(TEMPLATE_FILE)
         load_alt_retry()
         _start_template = load_quality_templates(START_TEMPLATE_FILE)
+        _attack_start_template = None
+        if settings["family"] in ATTACK_FAMILIES:
+            _attack_skip.update(next_scan=0.0, last_press=0.0, streak=0, busy=False)
+            _attack_start_template = load_quality_templates(ATTACK_START_FILE)
+            log(f"{FAMILY_LABELS[settings['family']]}: acoustic_shells.png loaded for raid-start detection")
         try:
             _shiki_ability4_icon = load_quality_templates(SHIKI_ABILITY4_FILE)
         except FileNotFoundError:
@@ -3250,25 +6099,43 @@ def macro_main():
             log(f"Shiki: {SHIKI_ABILITY4_FILE} not found - buying time uses the {tv('Shiki', 'cooldown'):.0f}s timer")
         _raid_templates.clear()
         for kind, filename in (("skip", RAID_SKIP_FILE), ("finish", RAID_FINISH_FILE),
-                               ("heatwave", RAID_HEATWAVE_FILE), ("start", RAID_START_FILE)):
+                               ("heatwave", RAID_HEATWAVE_FILE), ("start", RAID_START_FILE),
+                               ("attack_finish", ATTACK_FINISH_FILE)):
             try:
                 _raid_templates[kind] = load_quality_templates(filename)
             except FileNotFoundError:
-                if settings["family"] == "Female Raid":
-                    log(f"Female Raid: {filename} not found - add it in Settings > Configs > "
-                        "Asset override (the raid can't work without it)")
+                pass            # a missing picture is not logged
+        _disconnect_template = None
+        _reconnect_images.clear()
+        state["rc_next"] = 0.0
+        state["rc_request"] = False
+        state["rescue_t0"] = None
+        if settings["reconnect"]["enabled"] and reconnect_missing():
+            log("Reconnect is switched on but not complete for this macro (still needed: "
+                + ", ".join(reconnect_missing()) + ") - it stays of")
+        elif settings["reconnect"]["enabled"]:
+            try:
+                for kind, filename in RECONNECT_IMAGE_FILES.items():
+                    _reconnect_images[kind] = load_quality_templates(filename)
+                _disconnect_template = load_quality_templates(RECONNECT_IMAGE_FILE)
+                log(f"Reconnect is ON ({reconnect_macro_tab()} coordinates): rejoining game "
+                    f"{ROBLOX_GAME_ID} on a disconnect, a failsafe longer than "
+                    f"{RECONNECT_RESCUE_LIMIT / 60:g} min, or !reconnect")
+            except FileNotFoundError:
+                _reconnect_images.clear()
+                log("Reconnect: one of its pictures could not be loaded - it stays of")
         _grab_template = None
         if GRAB_ENABLED:
             try:
                 _grab_template = red_mask(load_template(GRAB_FILE))
             except FileNotFoundError:
-                log(f"Grab: {GRAB_FILE} not found - grab detection is off")
+                pass            # a missing picture is not logged
         _result_templates.clear()
         for kind, filename in RESULT_FILES.items():
             try:
                 _result_templates[kind] = gold_mask(load_template(filename))
             except FileNotFoundError:
-                log(f"Result: {filename} not found - skipping {kind}")
+                pass            # a missing picture is not logged
         _loot_templates.clear()
         if LOOT_ENABLED:
             for quality, folder in (("normal", ""), ("low", LOW_FOLDER)):
@@ -3282,8 +6149,7 @@ def macro_main():
                                 os.path.exists(asset_path(os.path.join(LOW_FOLDER, f)))
                                 for f in LOOT_FILES.values()):
                             tag = "" if quality == "normal" else " (low quality)"
-                            if kind in active_loot_kinds():
-                                log(f"Loot{tag}: {filename} not found - skipping {kind}")
+                            pass            # a missing picture is not logged
         if LOOT_ENABLED and settings.get("fix_loot"):
             log("Fix loot tracking (Beta) is ON: loot icons are looked for at any size")
         log("Started. Click into Roblox; the routine starts when the mission begins.")
@@ -3292,99 +6158,115 @@ def macro_main():
         # Initialise mss manually so _reinit_mss() can replace it while running.
         try:
             _sct = mss.mss()
-            _monitor = _sct.monitors[MONITOR_INDEX]
+            _monitor = pick_monitor(_sct.monitors)
             _scale = FORCE_SCALE if FORCE_SCALE else _monitor["height"] / BASE_HEIGHT
             if abs(_scale - 1.0) > 0.01:
-                log(f"Screen is {_monitor['width']}x{_monitor['height']}: scaling the picture "
-                    f"to 1080p size (x{1 / _scale:.2f}) so the images match")
+                log(f"Capture reference: {capture_mode_description()}; scaling frames "
+                    f"to 1080p size (x{1 / _scale:.2f}) to match template images")
 
+            start_retry_watchdog()
             need_start = True
             after_retry = False
             while True:
                 try:
-                    if need_start:
-                        # right after a retry click: do nothing until the next
-                        # mission starts (no retry scanning, no clicks, no keys)
-                        wait_for_mission_start(scan_retry=not after_retry)
-                        need_start = False
-                        after_retry = False
-                    run_mission()
-                except RetryFound as r:
-                    mission_t0 = state["mission_t0"]
-                    state["mission_t0"] = None     # the mission is over (no rescue needed)
-                    mission_len = time.time() - mission_t0 if mission_t0 else None
-                    was_rescued, state["rescued"] = state["rescued"], False
-                    cx, cy, score, tw, th = r.match
-                    # cx, cy are 1080p-picture positions: back to real screen pixels
-                    abs_x = _monitor["left"] + int(cx * _scale)
-                    abs_y = _monitor["top"] + int(cy * _scale)
-                    ev.put(("mission_ended",))
-                    set_status("retrying")
-                    raid_mode = settings["family"] == "Female Raid"
-                    retry_title = "Clicking retry" if raid_mode else "Retry found"
-                    set_step(5 if raid_mode else -1)
-                    log(f"Retry found ({r.quality} quality, score {score:.2f})")
-                    if was_rescued:
-                        log("Stuck mission is over - player eliminated")
-                        notify_rescue_async(True, counters()[0]["missions"],
-                                            time.time() - mission_t0 if mission_t0 else None)
-                    low = r.quality == "low"
-                    q = r.quality
-                    loot_found, result = {}, None
-                    loot_on = bool(_loot_templates.get(q))   # loot icons of THIS quality
-                    # fast mode: click first, read result + loot afterwards from the screenshot
-                    # taken when the button was found
-                    fast = bool(tv(settings["family"], "fast_mode")) and r.screen is not None
-                    # normal quality: result + loot are read before the click.
-                    # low quality: only the result now, the loot after the click (see below)
-                    if not fast and (_result_templates or (loot_on and not low)):
-                        show(retry_title, "Checking the result and loot..."
-                             if not low else "Checking the result...")
-                        loot_found, result = scan_end_screen(
-                            q, want_loot=not low, want_result=True)
-                        if _result_templates:
-                            record_result(result)
-                        if loot_on and not low:
-                            record_loot(loot_found)
-                    if not low and not fast:
-                        notify_mission_async(result, loot_found, mission_len)   # Discord stats embed (if on)
-                    show(retry_title, "Clicking...")
-                    log("Clicking retry")
-                    save_click_debug(cx, cy, tw, th)
-                    click_at(abs_x, abs_y, int(tw * _scale), int(th * _scale))
-                    clicked_at = time.time()
-                    counters()[0]["retries"] += 1
-                    push_stats()
-                    if fast:
-                        if _result_templates or (loot_on and not low):
-                            show("Retry clicked", "Fast mode: reading the result and loot")
+                    try:
+                        if need_start:
+                            # After Retry, monitor continuously; if Retry is still visible,
+                            # recover the click instead of waiting forever on a result screen.
+                            wait_for_mission_start(scan_retry=True, after_retry=after_retry)
+                            need_start = False
+                            after_retry = False
+                        run_mission()
+                    except RetryFound as r:
+                        state["retry_processing"] = True
+                        mission_t0 = state["mission_t0"]
+                        state["mission_t0"] = None     # the mission is over (no rescue needed)
+                        mission_len = time.time() - mission_t0 if mission_t0 else None
+                        was_rescued, state["rescued"] = state["rescued"], False
+                        cx, cy, score, tw, th = r.match
+                        # cx, cy are 1080p-picture positions: back to real screen pixels
+                        abs_x, abs_y = frame_to_screen(cx, cy)
+                        ev.put(("mission_ended",))
+                        set_status("retrying")
+                        raid_mode = settings["family"] == "Female Raid" or settings["family"] in ATTACK_FAMILIES
+                        retry_title = "Clicking retry" if raid_mode else "Retry found"
+                        set_step(5 if raid_mode else -1)
+                        log(f"Retry found ({r.quality} quality, score {score:.2f})")
+                        if was_rescued:
+                            log("Stuck mission is over - player eliminated")
+                            notify_rescue_async(True, counters()[0]["missions"],
+                                                time.time() - mission_t0 if mission_t0 else None)
+                        low = r.quality == "low"
+                        q = r.quality
+                        loot_found, result = {}, None
+                        # a custom macro that called trackloot() / addwin() / addlose() has counted that
+                        # itself: it is not counted a second time here
+                        tracked = state.pop("macro_loot", None)
+                        macro_result = state.pop("macro_result", None)
+                        macro_result_tuple = (macro_result, None) if macro_result else None
+                        loot_on = bool(_loot_templates.get(q)) and tracked is None   # icons of THIS quality
+                        # fast mode: click first, read result + loot afterwards from the screenshot
+                        # taken when the button was found
+                        fast = bool(tv(settings["family"], "fast_mode")) and r.screen is not None
+                        # normal quality: result + loot are read before the click.
+                        # low quality: only the result now, the loot after the click (see below)
+                        if not fast and (_result_templates or (loot_on and not low)):
+                            show(retry_title, "Checking the result and loot..."
+                                 if not low else "Checking the result...")
                             loot_found, result = scan_end_screen(
-                                q, want_loot=loot_on and not low, want_result=True, frame=r.screen)
+                                q, want_loot=loot_on and not low, want_result=True,
+                                retry_anchor=cx)
                             if _result_templates:
-                                record_result(result)
+                                record_result(result, counted=bool(macro_result))
                             if loot_on and not low:
                                 record_loot(loot_found)
-                        if not low:
-                            notify_mission_async(result, loot_found, mission_len)
-                    if low:
-                        if loot_on:
-                            show("Checking loot", f"Low quality: looking for the loot for "
-                                                  f"{LOW_LOOT_SCAN_TIME:g}s after the click")
-                            log(f"Low quality: checking the loot for {LOW_LOOT_SCAN_TIME:g}s "
-                                "after the retry click")
-                            loot_found, _ = scan_end_screen(
-                                q, want_loot=True, want_result=False,
-                                scan_time=LOW_LOOT_SCAN_TIME)
-                            record_loot(loot_found)
-                        notify_mission_async(result, loot_found, mission_len)
-                    # the loot scan above counts as part of the hands-off time
-                    left = max(0.0, AFTER_CLICK_DELAY - (time.time() - clicked_at))
-                    log(f"Hands off for {left:.0f}s more, then waiting for the next mission")
-                    hands_off_wait(left)
-                    wait_for_icon_gone()
-                    after_retry = True
+                        if not low and not fast:
+                            notify_mission_async(result or macro_result_tuple, loot_found or tracked or {}, mission_len)   # Discord stats embed (if on)
+                        show(retry_title, "Clicking...")
+                        log("Clicking retry")
+                        save_click_debug(cx, cy, tw, th)
+                        click_at(abs_x, abs_y, int(tw * _scale), int(th * _scale))
+                        clicked_at = time.time()
+                        state["retry_guard_until"] = time.monotonic() + AFTER_CLICK_DELAY + RETRY_GUARD_EXTRA
+                        counters()[0]["retries"] += 1
+                        push_stats()
+                        if fast:
+                            if _result_templates or (loot_on and not low):
+                                show("Retry clicked", "Fast mode: reading the result and loot")
+                                loot_found, result = scan_end_screen(
+                                    q, want_loot=loot_on and not low, want_result=True,
+                                    frame=r.screen, retry_anchor=cx)
+                                if _result_templates:
+                                    record_result(result, counted=bool(macro_result))
+                                if loot_on and not low:
+                                    record_loot(loot_found)
+                            if not low:
+                                notify_mission_async(result or macro_result_tuple, loot_found or tracked or {}, mission_len)
+                        if low:
+                            if loot_on:
+                                show("Checking loot", f"Low quality: looking for the loot for "
+                                                      f"{LOW_LOOT_SCAN_TIME:g}s after the click")
+                                log(f"Low quality: checking the loot for {LOW_LOOT_SCAN_TIME:g}s "
+                                    "after the retry click")
+                                loot_found, _ = scan_end_screen(
+                                    q, want_loot=True, want_result=False,
+                                    scan_time=LOW_LOOT_SCAN_TIME, retry_anchor=cx)
+                                record_loot(loot_found)
+                            notify_mission_async(result or macro_result_tuple, loot_found or tracked or {}, mission_len)
+                        # the loot scan above counts as part of the hands-off time
+                        left = max(0.0, AFTER_CLICK_DELAY - (time.time() - clicked_at))
+                        log(f"Hands off for {left:.0f}s more, then waiting for the next mission")
+                        hands_off_wait(left)
+                        wait_for_icon_gone()
+                        after_retry = True
+                        need_start = True
+                        state["retry_processing"] = False
+                except Disconnected as dc:
+                    reconnect_rejoin(dc.reason)
                     need_start = True
+                    after_retry = False
         finally:
+            stop_retry_watchdog()
             # Clean up the mss instance (whether we're stopping or _reinit_mss() replaced it):
             # close whatever is current now.
             with _sct_lock:
@@ -3398,7 +6280,7 @@ def macro_main():
     except Exception as e:  # noqa: BLE001 - show any error in the window
         log(f"Error: {type(e).__name__}: {e}")
         if settings["webhook"]["notify_error"]:
-            notify_async(f"{APP_NAME} stopped because of an error: {type(e).__name__}: {e}")
+            notify_async(f"thebums stopped because of an error: {type(e).__name__}: {e}")
     finally:
         state["mission_t0"] = None
         release_all_keys()
@@ -3411,6 +6293,35 @@ def fmt_time(sec):
     h, rem = divmod(sec, 3600)
     m, s = divmod(rem, 60)
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+
+GITHUB_URL = "https://github.com/HuyHG245/TheBums_macro"
+DISCORD_URL = ""     # Settings footer > Discord (invite link)
+# 64x64 alpha mask of the GitHub mark; it is tinted + resized at runtime (any theme colour, any DPI)
+GITHUB_MASK_B64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAAAAACPAi4CAAADt0lEQVR42pVXW2yMQRT+dnbpUvRCU3Vp1a0Xl7RItEE9IAgSkVQkLiVUCNEiooQEaUKppCX60gfx5E5F4vZC0jTufRGqoi5NpFRbLVva0j0edv+d88/+u//seZoz53zfP//MnMs4EEJScrPTUhNj3OjpbP3QWP+kGRGIyDvTRIq8r5zn0IQPL/lIlvKhZLgOvNxDIcVzMt4G7ir+QWGlY5czHH7Kc7KVpxmh8Vt+k4Z0bwq1/CrSlLOWvzHoNmnLLbcF/gFFIPeDGFy3KSKpUf+iiiKUSmX/KWLZwPGZgfNbNmPthZ+hML8vFWRndRu3Mo1tQOD+vAaAocUtVvAfh+MB4KahPxYA4AKAnbMMqocA8KuiumRfFLoamr62ERCblJo5At7qQ20AgEcr/b45288Z8SPv/3aDKaMwjUdv8rq5xnBBwLndiKxTcpmr7MN1mvQ+7l+AJyKCKdL7ZxwggK3R0ppgT5Aoh0O3AAKikFmn2xNwl60OAHn8qF7ZE1zj/rkAzjDdu1xjBd0McBoAz79VOkm3iAHeAuOY2qWTdeFqZJDRYjYzXWjXIfjHAzFXzGDaRb3CcaVfjrNFulQ8z/QI2thZpYsUqTT0a9au13I4ToyUyjfd2tkihyNFjFT6dAmYY4yIkspAXQLmOEiw+VhdAuZIolcqSboEo+WwR3SypiRKk2CyHHYKtvWuLM0OZDw7EPGZWRbqESxg2fKTaGCW1XoE+WzcgDU8P8zTwSf3EU+iKZygVqcRO88Ro4D3XN9pj1/iZf5vAFRygt5FdvipHdy/HMB8c/3MD4+f02pyzwEgzG2ltzpMXosu/WtyfusAgANERNR45FitPzOWTbSGjzr4VSnYe1hpuyWAxcb6XpatTBUm8NilR+v+qQW/y58LThIR0b1kIKNdWutYZDhuWDYcpcbd9m3slxRgRcDYN5kvIMGqA/4eCOtd/ibWxW7JZfP/l1sQbAtYnU99M7sB9x2/db2ZIC8YX8d2Kd1X7zqGAc6iZiLyXFWyS2xw62/6x42+ySIAcEyamTEg6Ax7VQJlib4a3RK6wehW8BWK3VlDRETPQuZF5SVwI6hhd9/zdV6HJgAABquB/ceEv2uRPt1GB/m9/kX9F+9gxdzD8dct06+zgvtEh9nEilDvpg2s4RuiljP55CkIk/DrAm7DFFMgjp+khX2zbmvz+6l1zh+K7TucdnWvtIuIiNS00k9E9OtEnEbWjdn7jqhZ/dAboqb9cZq1z5G7eYw6l7R5vu7jOzL5D54ffEhC1T+eAAAAAElFTkSuQmCC"
+)
+
+
+DISCORD_MASK_B64 = (     # 64x64 alpha mask of the Discord mark (same use as the GitHub one)
+    "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAAAAACPAi4CAAADKUlEQVRYCaXBf2iUdRzA8ffnca5Mc3rZEVuxCik2c3Yz7YcQ5sjZls2MsCEUShmSsfAH6JwLF2tROiSJ3NZqMBhLZH/UUqozzITM0igXcYxWWxbr0DvB9sNt19PdPc+z+z43Cu/5vl6CJkGToEnQJGgSNAmaBE3CFLPK1pTMrGrFrbTDONnVfYl0gpv/yTUrsoGxB75HldszFxg/c6T7FxOVoCgsf2qJgeX33WdGcWQtqluA7XzXJ9+SIjiMzS8VcG0GmhtHsAmOt1/m2n20NoZFsK08ZpCBF5uxCJbrfryLTFwqDJMkWPbUkZm2DSQJSQXnricz/5QGSRCSgiVkKlQ0RpyQUNlB5mrqiRPifD/7ydxIIAQIcU2b8CL4KCDAg19Nw5PKThDI/roYb/4oiiCw4028OrQZ4caBOXg1cXefsK4T76obhL21ePfhM8KBKtKEPg/fXnYLbpePhnKWF5PmWJlw+Glchra0x2BGdbWBonVHFOSxD/y4nL1P+PhxVFdXnSBpy0FSGrebJBSc8qH69U7hu8Wo6l7F1l2O43zxBJbn2lBFfULvfBSjuVFsy07heLYdW1bfbShMnxCZi+KLEhxZgzdhieWGcbQ8jypfciIGipZNTDpbjCXij+HY2YBqmeRdQPXeC0w6F8AS8cdw7Hod1Xq5/zSqE4/gmD7owxK7dRBH60ZU9bKuE9VoXgTbw1/i2NCGLeu3PFS9srcWl/oaLHJ0FY6fAuNYNrbiJj0LcBkrD5K0dT8pB6tMEhaenIObmKQZeeX9CZhVu81A0b71IhgVzfNIIyZT9AXDd6y8Gbcrn4VmL7+HKcREj5joERM9YqJHTPSIiR4ZnoEWuaFi10K8Gmg8ImBU1N6LF3+9dWgIIU5W715KSl/vEh9TDX0zc6kw6cK+lmFASJLSNxZh66ocmx4oLQnMJmW45/inp6+yswHbxdeaR0kQbMbaPUUkDBZGScr1zcvLzp/WP95/OdqP5fgKEsL73v0bizDJeKJmMbC+g/+W/0MO/Lm/aQiHoJCybQ+9s93kf6xuu9J0YIQUQZOgSdAkaBI0CZoETYImQdO/36PgccbCGAwAAAAASUVORK5CYII="
+)
+
+
+def tinted_icon(color_hex, px, mask_b64=None):
+    """The GitHub mark (or the mask given) in one colour, px x px, as a tk.PhotoImage (None if it
+    can't be made)."""
+    try:
+        raw = base64.b64decode(mask_b64 or GITHUB_MASK_B64)
+        mask = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_GRAYSCALE)
+        mask = cv2.resize(mask, (px, px), interpolation=cv2.INTER_AREA)
+        r, g, b = (int(color_hex[i:i + 2], 16) for i in (1, 3, 5))
+        img = np.zeros((px, px, 4), np.uint8)
+        img[..., 0], img[..., 1], img[..., 2], img[..., 3] = b, g, r, mask
+        ok, buf = cv2.imencode(".png", img)
+        return tk.PhotoImage(data=base64.b64encode(buf.tobytes())) if ok else None
+    except Exception:
+        return None
 
 
 def book_icon(color_hex, px):
@@ -3602,6 +6513,68 @@ class Pill(tk.Canvas):
                          font=(App.FONT, 9, "bold"))
 
 
+class HoverHelp(tk.Canvas):
+    """Round ? icon; a small English explanation appears when hovered or clicked."""
+    def __init__(self, parent, message, parent_bg=None):
+        super().__init__(parent, width=20, height=20, bg=parent_bg or App.CARD,
+                         highlightthickness=0, bd=0, cursor="question_arrow")
+        self.message = message
+        self.tip = None
+        self.job = None
+        self.create_oval(2, 2, 18, 18, outline=App.SUB, width=1)
+        self.create_text(10, 10, text="?", fill=App.SUB, font=(App.FONT, 9, "bold"))
+        self.bind("<Enter>", self.schedule)
+        self.bind("<Leave>", self.hide)
+        self.bind("<Button-1>", self.show)
+        self.bind("<Destroy>", self.hide)
+
+    def schedule(self, _event=None):
+        self.cancel_job()
+        self.job = self.after(280, self.show)
+
+    def cancel_job(self):
+        if self.job is not None:
+            try:
+                self.after_cancel(self.job)
+            except tk.TclError:
+                pass
+        self.job = None
+
+    def show(self, _event=None):
+        self.cancel_job()
+        if self.tip is not None:
+            return
+        try:
+            tip = tk.Toplevel(self)
+            tip.withdraw()
+            tip.overrideredirect(True)
+            tip.attributes("-topmost", True)
+            outer = tk.Frame(tip, bg=App.BORDER, padx=1, pady=1)
+            outer.pack()
+            tk.Label(outer, text=self.message, font=(App.FONT, 9), bg=App.CARD,
+                     fg=App.TEXT, justify="left", anchor="w", wraplength=315,
+                     padx=12, pady=10).pack()
+            tip.update_idletasks()
+            x = self.winfo_rootx() - 210
+            y = self.winfo_rooty() + 25
+            x = max(0, min(x, self.winfo_screenwidth() - tip.winfo_reqwidth()))
+            y = max(0, min(y, self.winfo_screenheight() - tip.winfo_reqheight()))
+            tip.geometry(f"+{x}+{y}")
+            tip.deiconify()
+            self.tip = tip
+        except tk.TclError:
+            pass
+
+    def hide(self, _event=None):
+        self.cancel_job()
+        tip, self.tip = self.tip, None
+        if tip is not None:
+            try:
+                tip.destroy()
+            except tk.TclError:
+                pass
+
+
 class ToggleSwitch(tk.Canvas):
     """Modern on/off switch bound to a BooleanVar (replaces the old tick boxes)."""
     ON, OFF, KNOB = "#3b82f6", "#272e40", "#ffffff"
@@ -3675,8 +6648,7 @@ class OpacitySlider(tk.Canvas):
             rounded_rect(self, self.PAD, mid - 2, x, mid + 2, 2, fill=ToggleSwitch.ON, outline="")
             self.create_oval(x - 6, mid - 6, x + 6, mid + 6, fill=ToggleSwitch.KNOB, outline="")
         except tk.TclError:
-            pass    # the window was closed
-
+            pass
 
 def switch_row(parent, text, var, command, bg, fg, sub_font=None, pady=4):
     """Label on the left, switch on the right. Clicking the label flips it too."""
@@ -3726,9 +6698,256 @@ class Stepper(tk.Canvas):
             rounded_rect(self, x1, 0, x1 + seg, 6, App.R_SEG, fill=col, outline="")
 
 
+def prepare_window(win):
+    """First line of a window's __init__: invisible AND hidden while it is being built, so nothing
+    of it can show (the default white window background, a half-built layout, the light title
+    bar) before it is finished."""
+    try:
+        win.attributes("-alpha", 0.0)
+    except tk.TclError:
+        pass
+    win.withdraw()
+
+
+def _ease_out(t):
+    return 1 - (1 - t) ** 3
+
+
+def animations_on():
+    """Settings > UI > GUI animations (off by default)."""
+    return bool(settings.get("animations"))
+
+
+def mix_color(c1, c2, t):
+    """Colour t (0..1) of the way from c1 to c2 (both '#rrggbb')."""
+    a = [int(c1[i:i + 2], 16) for i in (1, 3, 5)]
+    b = [int(c2[i:i + 2], 16) for i in (1, 3, 5)]
+    return "#%02x%02x%02x" % tuple(round(x + (y - x) * t) for x, y in zip(a, b))
+
+
+def _win_pos(win):
+    """(x, y) of the window's top-left corner as wm geometry reports it, or None."""
+    m = re.search(r"([+-]-?\d+)([+-]-?\d+)$", win.geometry())
+    if not m:
+        return None
+    return int(m.group(1).replace("+-", "-")), int(m.group(2).replace("+-", "-"))
+
+
+def reveal_window(win, steps=9, delay=14, rise=14):
+    """Show a window that is completely built. It is mapped while still fully transparent, Tk lays
+    it out and paints it (all the <Configure> re-wrapping happens now, unseen), and only then it
+    fades in - so it appears finished instead of flashing white / jumping into place.
+    Sub windows also glide up `rise` pixels while they fade in (the main window only fades)."""
+    try:
+        win.attributes("-alpha", 0.0)
+        win.deiconify()
+        win.update()
+    except tk.TclError:
+        return
+    anim = animations_on()
+    if not anim:                         # animations off: the plain quick fade, no gliding
+        steps, delay, rise = 6, 12, 0
+    pos = _win_pos(win) if isinstance(win, tk.Toplevel) and rise else None
+
+    def step(i=1):
+        try:
+            if not win.winfo_exists():
+                return
+            k = _ease_out(min(1.0, i / steps)) if anim else min(1.0, i / steps)
+            win.attributes("-alpha", k * (clamp_opacity(settings.get("opacity", 100)) / 100.0))
+            if pos:
+                win.geometry(f"+{pos[0]}+{pos[1] + round(rise * (1 - k))}")
+        except tk.TclError:
+            return
+        if i < steps:
+            win.after(delay, step, i + 1)
+    step()
+
+
+def fade_close(win, steps=5, delay=12):
+    """Fade a window out, then destroy it (use instead of win.destroy() for a close button)."""
+    if getattr(win, "_closing", False):
+        return
+    win._closing = True
+    if not animations_on():              # animations off: close right away
+        try:
+            win.destroy()
+        except tk.TclError:
+            pass
+        return
+
+    def step(i=1):
+        try:
+            if not win.winfo_exists():
+                return
+            win.attributes("-alpha", max(0.0, 1 - i / steps) * (clamp_opacity(settings.get("opacity", 100)) / 100.0))
+        except tk.TclError:
+            return
+        if i < steps:
+            win.after(delay, step, i + 1)
+        else:
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
+    step()
+
+
+# ---- collapsing a window to its title bar ------------------------------------------------
+COLLAPSED_H = 46          # height of the strip that stays visible when a window is collapsed
+
+
+def _animate_height(win, h0, h1, done=None, steps=10, delay=14):
+    """Smoothly change the window height (width and place stay) from h0 to h1."""
+    try:
+        w = win.winfo_width()
+        if not animations_on():          # animations off: jump straight to the end size
+            win.geometry(f"{w}x{max(1, h1)}")
+            win.update_idletasks()
+            if done:
+                done()
+            return
+    except tk.TclError:
+        return
+
+    def step(i=1):
+        try:
+            if not win.winfo_exists():
+                return
+            k = _ease_out(min(1.0, i / steps))
+            win.geometry(f"{w}x{max(1, round(h0 + (h1 - h0) * k))}")
+        except tk.TclError:
+            return
+        if i < steps:
+            win.after(delay, step, i + 1)
+        elif done:
+            done()
+    step()
+
+
+def toggle_collapse(win):
+    """Minimize <-> restore: the window rolls up to a slim bar under its title bar (with the
+    title in big text) and rolls back down to the size it had. Never raises: if anything goes
+    wrong the window is simply left as it is."""
+    try:
+        if not win.winfo_exists():
+            return
+        st = win.__dict__.setdefault("_col", {"on": False, "busy": False})
+        if st["busy"]:
+            return
+        st["busy"] = True
+        if not st["on"]:
+            st.update(h=win.winfo_height(), min=win.minsize(), max=win.maxsize(),
+                      title=win.title())
+            win.minsize(st["min"][0], 1)             # lift the minimum height while collapsed
+
+            def collapsed():
+                try:
+                    name = st["title"].split(" - ", 1)[-1]
+                    name = name[:1].upper() + name[1:]
+                    bg = getattr(App, "CARD", "#11151e")
+                    strip = tk.Frame(win, bg=bg, cursor="hand2")
+                    strip.place(x=0, y=0, relwidth=1, relheight=1)
+                    tk.Frame(strip, bg=getattr(App, "ACCENT", "#3b82f6"), width=4).pack(
+                        side="left", fill="y")
+                    lbl = tk.Label(strip, text=name, font=(App.FONT, 16, "bold"), fg=App.TEXT,
+                                   bg=bg, anchor="w", cursor="hand2")
+                    lbl.pack(side="left", padx=(14, 8), fill="y")
+                    chev = tk.Label(strip, text="\u25be", font=(App.FONT, 16), fg=App.SUB,
+                                    bg=bg, cursor="hand2")
+                    chev.pack(side="right", padx=16, fill="y")
+                    for wdg in (strip, lbl, chev):
+                        wdg.bind("<Button-1>", lambda _e: toggle_collapse(win))
+                    win.title(APP_NAME)                # the big text says which window it is
+                    win.maxsize(st["max"][0], COLLAPSED_H)    # can't be dragged taller
+                    st["strip"] = strip
+                    st["on"] = True
+                except Exception as e:  # noqa: BLE001
+                    log(f"Error: collapse - {type(e).__name__}: {e}")
+                finally:
+                    st["busy"] = False
+            _animate_height(win, st["h"], COLLAPSED_H, collapsed)
+        else:
+            try:
+                st["strip"].destroy()
+            except Exception:  # noqa: BLE001
+                pass
+            win.title(st["title"])
+            win.maxsize(*st["max"])
+
+            def expanded():
+                try:
+                    win.minsize(*st["min"])
+                except Exception:  # noqa: BLE001
+                    pass
+                st["on"] = False
+                st["busy"] = False
+            _animate_height(win, win.winfo_height(), st["h"], expanded)
+    except Exception as e:  # noqa: BLE001
+        try:
+            win.__dict__["_col"]["busy"] = False
+        except Exception:  # noqa: BLE001
+            pass
+        log(f"Error: collapse - {type(e).__name__}: {e}")
+
+
+def _unminimize(win):
+    """The minimize button was pressed: bring the window straight back and collapse it."""
+    try:
+        if win.winfo_exists() and win.state() == "iconic":
+            win.deiconify()
+            toggle_collapse(win)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+if IS_WIN:
+    from ctypes import wintypes
+    _U32 = ctypes.WinDLL("user32")
+    _U32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
+    _U32.GetWindowLongW.restype = ctypes.c_long
+    _U32.SetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_long]
+    _U32.SetWindowLongW.restype = ctypes.c_long
+    _U32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+                                  ctypes.c_int, ctypes.c_int, wintypes.UINT]
+
+
+def _enable_collapse(win):
+    """Give a sub window a minimize button (Windows) - pressing it collapses / restores the
+    window instead of sending it to the taskbar. No window-procedure hooks are used: the button
+    is switched on with a style flag and the resulting minimize is turned into a collapse.
+    macOS: Cmd+M does the same."""
+    try:
+        if IS_MAC:
+            win.bind("<Command-m>", lambda _e: (toggle_collapse(win), "break")[1])
+            return
+        if not IS_WIN:
+            return
+        hwnd = ctypes.windll.user32.GetParent(win.winfo_id())
+        if hwnd:
+            style = _U32.GetWindowLongW(hwnd, -16)
+            if not style & 0x20000:                   # WS_MINIMIZEBOX
+                _U32.SetWindowLongW(hwnd, -16, style | 0x20000)
+                _U32.SetWindowPos(hwnd, None, 0, 0, 0, 0, 0x37)   # redraw the frame
+        if not win.__dict__.get("_min_bound"):
+            win.__dict__["_min_bound"] = True
+
+            def on_unmap(e):
+                try:
+                    if e.widget is win and win.state() == "iconic":
+                        win.after(0, _unminimize, win)
+                except Exception:  # noqa: BLE001
+                    pass
+            win.bind("<Unmap>", on_unmap, add="+")
+    except Exception:  # noqa: BLE001  (no minimize button - everything else still works)
+        pass
+
+
 def style_title_bar(root, bg_hex):
     """Dark title bar on Windows 10/11 (silently skipped if unsupported / on macOS)."""
     if not IS_WIN:
+        if isinstance(root, tk.Toplevel):
+            _enable_collapse(root)
         return
     try:
         root.update()
@@ -3739,9 +6958,175 @@ def style_title_bar(root, bg_hex):
             dwm.DwmSetWindowAttribute(hwnd, attr, ctypes.byref(on), ctypes.sizeof(on))
         r, g, b = (int(bg_hex[i:i + 2], 16) for i in (1, 3, 5))
         color = ctypes.c_int(b << 16 | g << 8 | r)  # COLORREF 0x00BBGGRR
-        dwm.DwmSetWindowAttribute(hwnd, 35, ctypes.byref(color), ctypes.sizeof(color))
+        dwm.DwmSetWindowAttribute(hwnd, 35, ctypes.byref(color), ctypes.sizeof(color))   # caption
+        dwm.DwmSetWindowAttribute(hwnd, 34, ctypes.byref(color), ctypes.sizeof(color))   # border (Win 11)
+        txt = App.TEXT
+        tr, tg, tb = (int(txt[i:i + 2], 16) for i in (1, 3, 5))
+        tcolor = ctypes.c_int(tb << 16 | tg << 8 | tr)
+        dwm.DwmSetWindowAttribute(hwnd, 36, ctypes.byref(tcolor), ctypes.sizeof(tcolor))  # caption text
     except Exception:
         pass
+    if isinstance(root, tk.Toplevel):
+        _enable_collapse(root)      # minimize button = collapse to the title bar
+
+
+# ------------------------------- updater --------------------------------
+_update = {"busy": False}
+
+
+def parse_version(text):
+    """'v1.1.2' -> (1, 1, 2, 0) so versions can be compared."""
+    nums = [int(n) for n in re.findall(r"\d+", str(text))][:4]
+    return tuple(nums + [0] * (4 - len(nums)))
+
+
+def update_repo_ok():
+    return bool(re.fullmatch(r"[\w.-]+/[\w.-]+", UPDATE_REPO)) and "REPO_NAME" not in UPDATE_REPO
+
+
+def _github_api(path):
+    """Fetch current public repository information (never execute remote code)."""
+    req = urllib.request.Request(
+        f"https://api.github.com/repos/{UPDATE_REPO}/{path}",
+        headers={"User-Agent": "thebums-macro-updater", "Accept": "application/vnd.github+json"})
+    with urllib.request.urlopen(req, timeout=UPDATE_TIMEOUT) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def local_build_revision():
+    """An optional Git revision embedded at build time; local beta files may have no known SHA."""
+    for folder in (app_dir(), getattr(sys, "_MEIPASS", app_dir())):
+        try:
+            revision = open(os.path.join(folder, "build_revision.txt"), encoding="utf-8").read().strip()
+        except OSError:
+            continue
+        if re.fullmatch(r"[a-fA-F0-9]{40}", revision):
+            return revision.lower()
+    return None
+
+
+def fetch_repo_updates():
+    """Ask GitHub about both releases and default-branch commits.
+    A repository without Releases is valid: the Commits API is still checked.
+    """
+    latest_release = None
+    try:
+        release = _github_api("releases/latest")
+        latest_release = {"tag": str(release.get("tag_name", "")),
+                          "page": release.get("html_url") or GITHUB_URL + "/releases",
+                          "title": release.get("name") or str(release.get("tag_name", ""))}
+    except urllib.error.HTTPError as exc:
+        if exc.code != 404:  # 404 means this project has no published release, not a broken repository
+            raise
+    commits = _github_api("commits?per_page=1")
+    latest_commit = None
+    if commits:
+        obj = commits[0]
+        raw = obj.get("commit", {})
+        latest_commit = {"sha": obj.get("sha", ""),
+                         "message": str(raw.get("message", "")).split("\n")[0][:150],
+                         "date": raw.get("committer", {}).get("date") or
+                                 raw.get("author", {}).get("date") or "Unknown date",
+                         "page": obj.get("html_url") or GITHUB_URL + "/commits"}
+    return {"release": latest_release, "commit": latest_commit, "local_sha": local_build_revision()}
+
+
+def _update_check_worker(manual):
+    info, error = None, None
+    try:
+        info = fetch_repo_updates()
+    except urllib.error.HTTPError as exc:
+        error = f"GitHub API returned HTTP {exc.code}"
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+    ev.put(("update_result", manual, info, error))
+
+
+def start_update_check(manual=False):
+    if _update["busy"]:
+        return
+    if not update_repo_ok():
+        if manual:
+            log("Error: update checker - set UPDATE_REPO (owner/repo) at the top of the script")
+        return
+    _update["busy"] = True
+    if manual:
+        log("Checking for updates...")
+    threading.Thread(target=_update_check_worker, args=(manual,), daemon=True).start()
+
+
+def _install_update_worker(info):
+    """Download the new .exe next to the running one, check it, then hand over to a small .bat
+    that waits for this program to close, swaps the files and starts the new version."""
+    exe = sys.executable
+    new_path = exe + ".new"
+    try:
+        log(f"Downloading {info['tag']}...")
+        req = urllib.request.Request(info["url"], headers={"User-Agent": "thebums-macro-updater"})
+        sha = hashlib.sha256()
+        done, last_pct = 0, -1
+        with urllib.request.urlopen(req, timeout=UPDATE_TIMEOUT) as r, open(new_path, "wb") as f:
+            total = int(r.headers.get("Content-Length") or info.get("size") or 0)
+            while True:
+                chunk = r.read(1 << 16)
+                if not chunk:
+                    break
+                f.write(chunk)
+                sha.update(chunk)
+                done += len(chunk)
+                if total:
+                    pct = done * 100 // total // 20 * 20
+                    if pct != last_pct:
+                        last_pct = pct
+                        log(f"Downloading update... {pct}%")
+        # make sure it is the whole, real file
+        if info.get("size") and done != info["size"]:
+            raise RuntimeError(f"incomplete download ({done} of {info['size']} bytes)")
+        with open(new_path, "rb") as f:
+            if f.read(2) != b"MZ":
+                raise RuntimeError("the downloaded file is not a Windows program")
+        digest = str(info.get("digest") or "")
+        if digest.startswith("sha256:") and digest[7:].lower() != sha.hexdigest():
+            raise RuntimeError("the download does not match GitHub's checksum")
+
+        q = lambda path: path.replace("%", "%%")      # % is special inside a .bat
+        bat = os.path.join(tempfile.gettempdir(), "thebums_update.bat")
+        with open(bat, "w", encoding="mbcs", errors="replace", newline="\r\n") as f:
+            f.write("\n".join([
+                "@echo of",
+                "set _MEIPASS2=",
+                "set PYINSTALLER_RESET_ENVIRONMENT=1",
+                f'cd /d "{q(os.path.dirname(exe))}"',
+                "set /a n=0",
+                ":wait",
+                "set /a n+=1",
+                f'move /y "{q(new_path)}" "{q(exe)}" >nul 2>&1',
+                "if not errorlevel 1 goto done",
+                "if %n% geq 60 goto end",
+                "ping -n 2 127.0.0.1 >nul",
+                "goto wait",
+                ":done",
+                f'start "" "{q(exe)}"',
+                ":end",
+                '(goto) 2>nul & del "%~f0"',
+            ]) + "\n")
+        env = {k: v for k, v in os.environ.items() if k != "_MEIPASS2"}
+        env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+        subprocess.Popen(["cmd", "/c", bat], env=env, close_fds=True,
+                         creationflags=0x08000000 | 0x00000008)   # no window, detached
+        log("Update downloaded - restarting...")
+        ev.put(("update_ready",))
+    except Exception as e:  # noqa: BLE001
+        log(f"Error: update failed - {type(e).__name__}: {e}")
+        try:
+            os.remove(new_path)
+        except OSError:
+            pass
+        _update["busy"] = False
+
+
+def install_update(info):
+    threading.Thread(target=_install_update_worker, args=(info,), daemon=True).start()
 
 
 # main window words: (not Female Raid, Female Raid)
@@ -3754,7 +7139,7 @@ UI_WORDS = {
 
 def ui_word(key):
     """The caption of a main window counter for the config that is picked now."""
-    return UI_WORDS[key][settings["family"] == "Female Raid"]
+    return UI_WORDS[key][raid_counting()]
 
 
 class App:
@@ -3792,7 +7177,7 @@ class App:
         self.geo_job = None
         self.mini = None    # small stats bar shown instead of the window while the macro runs
 
-        root.withdraw()     # stay hidden while building, so the window never flickers on open
+        prepare_window(root)    # hidden + transparent while building, so the window never flickers on open
         apply_theme(settings["theme"])
         root.title(APP_NAME)
         try:
@@ -3822,11 +7207,13 @@ class App:
         root.geometry(f"{w}x{h}+{x}+{y}")
         root.minsize(400, min_h)
         style_title_bar(root, self.BG)
-        root.deiconify()
+        reveal_window(root)
         root.bind("<Configure>", self.on_configure)       # remember moves / resizes
         root.bind("<FocusIn>", self.keep_settings_on_top, add="+")   # settings stays above this window
         root.bind("<ButtonPress>", self.keep_settings_on_top, add="+")
         self.pump()
+        if UPDATE_CHECK_ON_START:
+            root.after(1500, start_update_check)
 
     # ----- (re)building the window, themes -----
     def apply_styles(self):
@@ -3857,6 +7244,10 @@ class App:
         r = self.root
         self.disarm_reset()
         geo = r.geometry()      # size + position now: the theme change must not move / resize the window
+        try:
+            r.attributes("-alpha", 0.0)     # rebuilt unseen, then shown at once (no half-drawn flicker)
+        except tk.TclError:
+            pass
         keep = {
             "title": self.now_title.cget("text"),
             "detail": self.now_detail.cget("text"),
@@ -3888,7 +7279,7 @@ class App:
         for kind, value, _index in keep["log"]:
             if kind == "tagon":
                 active.add(value)
-            elif kind == "tagoff":
+            elif kind == "tagof":
                 active.discard(value)
             elif kind == "text":
                 t.insert("end", value, tuple(tag for tag in active if tag in
@@ -3898,6 +7289,11 @@ class App:
         r.update_idletasks()
         r.geometry(geo)         # same size and place as before (the log takes up any difference)
         style_title_bar(r, self.BG)
+        r.update()
+        try:
+            r.attributes("-alpha", 1.0)
+        except tk.TclError:
+            pass
         self.keep_settings_on_top()      # (debounced: one single lift, no flicker)
 
     # ----- layout helpers -----
@@ -3921,11 +7317,16 @@ class App:
             self.logo_img = tk.PhotoImage(file=logo_path)
         except (tk.TclError, OSError):
             pass
+        brand = tk.Frame(head, bg=self.BG)
+        brand.pack(side="left", fill="x", expand=True)
         if self.logo_img:
-            tk.Label(head, image=self.logo_img, bg=self.BG, bd=0).pack(side="left")
+            tk.Label(brand, image=self.logo_img, bg=self.BG, bd=0).pack(side="top", anchor="w")
         else:
-            tk.Label(head, text=APP_NAME, font=(App.FONT, 16, "bold"),
-                     fg=self.TEXT, bg=self.BG).pack(side="left")
+            tk.Label(brand, text=APP_NAME, font=(App.FONT, 16, "bold"),
+                     fg=self.TEXT, bg=self.BG).pack(side="top", anchor="w")
+        tk.Label(brand, text="This is just a macro • keyboard/mouse automation only",
+                 font=(App.FONT, 8), fg=self.SUB, bg=self.BG,
+                 anchor="w", justify="left").pack(side="top", anchor="w", pady=(4, 0))
         self.pill = Pill(head, self.BG)
         self.pill.pack(side="right")
 
@@ -4004,9 +7405,9 @@ class App:
         px = max(18, round(20 * max(1.0, self.root.winfo_fpixels("1i") / 96)))
         self.loot_imgs = {name: emoji_icon(f"emoji_{name}.png", px)
                           for name in ("scroll", "vessel", "fragments", "serums")}
-        raid = settings["family"] == "Female Raid"
-        top_icons = {"scrolls": "vessel" if raid else "scroll", "fragments": "fragments",
-                     "serums": "serums"}
+        raid = raid_counting()
+        top_icons = {"scrolls": "scroll", "vessels": "vessel",
+                     "fragments": "fragments", "serums": "serums"}
 
         def counter(parent, col, key, caption, color=None, size=15):
             parent.columnconfigure(col, weight=1, uniform=f"loot_{id(parent)}")
@@ -4037,14 +7438,16 @@ class App:
             """A thin vertical divider between two counters."""
             tk.Frame(parent, bg=self.BORDER, width=1).grid(row=0, column=col, sticky="ns", pady=2)
 
-        # Scrolls (Vessels for Female Raid) | Fragments (all four kinds) | Serums (all five kinds)
+        # Always show the scrolls obtained in THIS app session separately from raid vessels.
         top = tk.Frame(c, bg=self.CARD)
         top.pack(fill="x")
-        counter(top, 0, "scrolls", ui_word("scrolls"))
+        counter(top, 0, "scrolls", "Scrolls", size=14)
         ridge(top, 1)
-        counter(top, 2, "fragments", "Fragments")
+        counter(top, 2, "vessels", "Vessels", size=14)
         ridge(top, 3)
-        counter(top, 4, "serums", "Serums")
+        counter(top, 4, "fragments", "Fragments", size=14)
+        ridge(top, 5)
+        counter(top, 6, "serums", "Serums", size=14)
 
         # "Details" section: the fragment types, a ridge, then the serum types; opened / closed
         # with the line above it
@@ -4059,6 +7462,10 @@ class App:
         frag_row.pack(fill="x")
         for n, (key, caption, color) in enumerate(self.LOOT_CHIPS):
             counter(frag_row, n, key, caption, color, size=13)
+        tk.Frame(self.frag_frame, bg=self.BORDER, height=1).pack(fill="x", pady=6)
+        vessel_row = tk.Frame(self.frag_frame, bg=self.CARD)
+        vessel_row.pack(fill="x")
+        counter(vessel_row, 0, "attack_vessel", "Primordial Devil", "#d97706", size=13)
         tk.Frame(self.frag_frame, bg=self.BORDER, height=1).pack(fill="x", pady=6)
         serum_row = tk.Frame(self.frag_frame, bg=self.CARD)
         serum_row.pack(fill="x")
@@ -4083,11 +7490,8 @@ class App:
         try:
             for key in ("missions", "mission_time"):
                 self.stat_captions[key].configure(text=ui_word(key).upper())
-            self.loot_captions["scrolls"].configure(text=ui_word("scrolls").upper())
-            ic = self.loot_icon_labels.get("scrolls")
-            img = self.loot_imgs.get("vessel" if settings["family"] == "Female Raid" else "scroll")
-            if ic is not None and img is not None:
-                ic.configure(image=img)
+            self.loot_captions["scrolls"].configure(text="SCROLLS")
+            self.loot_captions["vessels"].configure(text="VESSELS")
             self.stepper.set_count(len(step_names()))
             if self.mini is not None:
                 self.mini_stepper.set_count(len(step_names()))
@@ -4098,15 +7502,16 @@ class App:
             pass
 
     def show_loot(self, counts):
-        """Put the loot counts on the labels (vessels for Female Raid, scrolls otherwise)."""
+        """Refresh session Scrolls, lifetime Vessels, Fragments and Serums separately."""
         App.last_loot = dict(counts)
-        raid = settings["family"] == "Female Raid"
-        self.loot_labels["scrolls"].configure(text=str(counts.get("vessel" if raid else "scroll", 0)))
+        self.loot_labels["scrolls"].configure(text=str(counts.get("session_scroll", 0)))
+        self.loot_labels["vessels"].configure(
+            text=str(counts.get("vessel", 0) + counts.get("attack_vessel", 0)))
         self.loot_labels["fragments"].configure(
             text=str(sum(counts.get(k, 0) for k in FRAGMENT_KINDS)))
         self.loot_labels["serums"].configure(
             text=str(sum(counts.get(k, 0) for k in SERUM_KINDS)))
-        for kind in FRAGMENT_KINDS + SERUM_KINDS:
+        for kind in FRAGMENT_KINDS + SERUM_KINDS + ("attack_vessel",):
             self.loot_labels[kind].configure(text=str(counts.get(kind, 0)))
 
     def on_reset_click(self, _e=None):
@@ -4171,8 +7576,8 @@ class App:
         save_stats()
 
     def on_opacity(self, value):
-        settings["opacity"] = value
-        self.opacity_pct.configure(text=f"{value}%")
+        settings["opacity"] = clamp_opacity(value)
+        self.opacity_pct.configure(text=f"{settings['opacity']}%")
         apply_opacity(self.root)
         if self.mini is not None:
             apply_opacity(self.mini)
@@ -4185,7 +7590,6 @@ class App:
         foot.pack(side="bottom", fill="x", padx=18, pady=(4, 12))
         self.topmost = tk.BooleanVar(value=bool(settings.get("always_on_top")))
         self.root.attributes("-topmost", self.topmost.get())     # restore the saved state
-        apply_opacity(self.root)                                 # ... and the saved opacity
         left = tk.Frame(foot, bg=self.BG)
         left.pack(side="left")
         sw = ToggleSwitch(left, self.topmost, self.on_topmost_toggle, parent_bg=self.BG)
@@ -4194,14 +7598,17 @@ class App:
                        bg=self.BG, cursor="hand2")
         lbl.pack(side="left", padx=(8, 0))
         lbl.bind("<Button-1>", sw.flip)
-        tk.Label(left, text="\u25d0", font=(App.FONT, 10), fg=self.SUB,
-                 bg=self.BG).pack(side="left", padx=(14, 4))      # half-filled circle = opacity
-        self.opacity_slider = OpacitySlider(left, settings["opacity"], self.on_opacity,
-                                            parent_bg=self.BG)
+        tk.Label(left, text="◐", font=(App.FONT, 10), fg=self.SUB, bg=self.BG).pack(side="left", padx=(12, 4))
+        self.opacity_slider = OpacitySlider(left, settings["opacity"], self.on_opacity, parent_bg=self.BG)
         self.opacity_slider.pack(side="left")
-        self.opacity_pct = tk.Label(left, text=f"{settings['opacity']}%", font=(App.FONT, 9),
-                                    fg=self.SUB, bg=self.BG, width=4, anchor="w")
+        self.opacity_pct = tk.Label(left, text=f"{settings['opacity']}%", font=(App.FONT, 9), fg=self.SUB, bg=self.BG, width=4)
         self.opacity_pct.pack(side="left", padx=(4, 0))
+        upd = tk.Label(left, text="\u21bb  Updates", font=(App.FONT, 9), fg=self.SUB,
+                       bg=self.BG, cursor="hand2")
+        upd.pack(side="left", padx=(14, 0))
+        upd.bind("<Button-1>", lambda _e: start_update_check(manual=True))
+        upd.bind("<Enter>", lambda _e: upd.configure(fg=self.TEXT))
+        upd.bind("<Leave>", lambda _e: upd.configure(fg=self.SUB))
 
         self.reset_btn = tk.Label(foot, text="Reset stats", font=(App.FONT, 9),
                                   fg=self.SUB, bg=self.BG, cursor="hand2")
@@ -4261,7 +7668,7 @@ class App:
             tag = "err"
         elif low.startswith("loot:") and "nothing" not in low:
             tag = "good"
-        elif low.startswith(("retry found", "hands off", "waiting")):
+        elif low.startswith(("retry found", "hands of", "waiting")):
             tag = "info"
         else:
             tag = ""
@@ -4296,6 +7703,10 @@ class App:
         elif kind == "settings_msg":
             if self.settings_win:
                 self.settings_win.say(e[1], error=e[2], good=e[3])
+        elif kind == "update_result":
+            self.on_update_result(e[1], e[2], e[3])
+        elif kind == "update_ready":
+            self.on_close()          # the .bat swaps the files and starts the new version
         elif kind == "mission_started":
             self.mission_t0 = time.time()
         elif kind == "mission_ended":
@@ -4341,10 +7752,10 @@ class App:
     # ----- mini stats bar (instead of the window while the macro runs) -----
     MINI_ITEMS = (("missions", "Missions"), ("completed", "Completed"), ("failed", "Failed"),
                   ("run_time", "Run time"), ("serums", "Serums"), ("scrolls", "Scrolls"),
-                  ("fragments", "Fragments"))
+                  ("vessels", "Vessels"), ("fragments", "Fragments"))
     MINI_ICONS = {"serums": "emoji_serums.png", "scrolls": "emoji_scroll.png",
-                  "fragments": "emoji_fragments.png"}  # Discord emojis
-    MINI_RAID_ICONS = {"scrolls": "emoji_vessel.png"}     # Female Raid: vessels instead of scrolls
+                  "vessels": "emoji_vessel.png", "fragments": "emoji_fragments.png"}
+    MINI_RAID_ICONS = {}
 
     def show_mini(self):
         """Hide the window and show a small always-on-top stats bar in the top-right corner.
@@ -4353,6 +7764,7 @@ class App:
             return
         m = self.mini = tk.Toplevel(self.root, bg=self.CARD, highlightbackground=self.BORDER,
                                     highlightthickness=self.CARD_BW)
+        m.withdraw()                        # built + placed unseen, shown at the end
         m.overrideredirect(True)            # no title bar / taskbar button
         m.attributes("-topmost", True)
         apply_opacity(m)
@@ -4383,9 +7795,9 @@ class App:
             row = tk.Frame(box, bg=self.CARD)
             row.pack()
             icons = dict(self.MINI_ICONS, **(self.MINI_RAID_ICONS
-                                             if settings["family"] == "Female Raid" else {}))
+                                             if raid_counting() else {}))
             icon = emoji_icon(icons[key], px) if key in icons else None
-            if key in UI_WORDS:        # Missions / Scrolls -> Raids / Vessels, like the window
+            if key in UI_WORDS and key != "scrolls":  # Session Scrolls must not turn into Vessels
                 caption = ui_word(key)
             if icon is not None:
                 self.mini_imgs.append(icon)
@@ -4407,6 +7819,7 @@ class App:
         self.mini_stepper.pack(fill="x", padx=10, pady=(0, 8))
         self.mini_stepper.set_index(self.step_idx)
         self.set_mini_paused(self.pill_key == "paused")   # also places the bar
+        m.deiconify()
         self.root.withdraw()
 
     def set_mini_paused(self, on):
@@ -4433,19 +7846,46 @@ class App:
             return
         self.mini.destroy()
         self.mini = None
-        self.root.deiconify()
+        reveal_window(self.root)
 
-    def open_changelog(self):
-        """Footer > Changelog: a window showing change.md."""
-        win = getattr(self, "changelog_win", None)
-        try:
-            if win is not None and win.winfo_exists():
-                win.lift()
-                win.focus_force()
-                return
-        except tk.TclError:
-            pass
-        self.changelog_win = ChangelogWindow(self)
+    def on_update_result(self, manual, info, error):
+        _update["busy"] = False
+        if error:
+            log(f"GitHub update check failed: {error}")
+            if manual:
+                messagebox.showerror("GitHub updates", f"Could not check GitHub.\n\n{error}",
+                                     parent=self.root)
+            return
+        release, commit = (info or {}).get("release"), (info or {}).get("commit")
+        if not release and not commit:
+            log("GitHub: no release or commit information was returned")
+            if manual:
+                messagebox.showinfo("GitHub updates", "No update information was returned.",
+                                    parent=self.root)
+            return
+        lines = ["The Bums Macro — GitHub"]
+        if release:
+            lines.append(f"Latest release: {release['tag']}  ({release['title']})")
+        else:
+            lines.append("Latest release: No published GitHub release")
+        if commit:
+            lines.append(f"Latest commit: {commit['sha'][:10]}")
+            lines.append(f"Date: {commit['date']}")
+            lines.append(f"Change: {commit['message']}")
+        local = (info or {}).get("local_sha")
+        if local and commit:
+            if local == commit["sha"].lower():
+                lines.append("Your embedded Git revision matches the latest repository commit.")
+            else:
+                lines.append("The repository commit differs from this build's embedded revision.")
+        else:
+            lines.append("This local test build has no verifiable Git revision; update status is unknown.")
+        log("GitHub checked: " + (commit["sha"][:10] if commit else release["tag"]))
+        if manual and messagebox.askyesno(
+                "GitHub updates", "\n".join(lines) + "\n\nOpen the repository in your browser?",
+                parent=self.root):
+            webbrowser.open(GITHUB_URL)
+
 
     def open_settings(self):
         if self.settings_win is not None:
@@ -4555,13 +7995,14 @@ class ModernDropdown(tk.Frame):
     WIP_BG, WIP_FG = "#2e2410", "#fbbf24"
     BETA_BG, BETA_FG = "#10223d", "#60a5fa"
 
-    def __init__(self, parent, items, value, on_change):
+    def __init__(self, parent, items, value, on_change, provider=None):
         super().__init__(parent, bg=self.BG, cursor="hand2", highlightthickness=1,
                          highlightbackground=self.EDGE, highlightcolor=self.EDGE)
         self.items = {it[0]: it for it in items}
         self.order = [it[0] for it in items]
         self.value = value if value in self.items else self.order[0]
         self.on_change = on_change
+        self.provider = provider    # optional: called each time the list opens (new / deleted entries)
         self.popup = None
         self.row = None
         self.render_trigger()
@@ -4620,11 +8061,27 @@ class ModernDropdown(tk.Frame):
         edge = self.ACCENT if (on or self.popup) else self.EDGE
         self.configure(highlightbackground=edge, highlightcolor=edge)
 
+    def set_items(self, items, value=None, notify=False):
+        """Swap the entries. value=None keeps the pick (falls back to the first entry if it is gone)."""
+        old = self.items
+        self.items = {it[0]: it for it in items}
+        self.order = [it[0] for it in items]
+        want = self.value if value is None else value
+        new = want if want in self.items else self.order[0]
+        changed = new != self.value
+        self.value = new
+        if changed or value is not None or old.get(new) != self.items.get(new):
+            self.render_trigger()
+        if changed and notify:
+            self.on_change(new)
+
     # ----- open state -----
     def toggle(self):
         if self.popup is not None:
             self.close_popup()
             return
+        if self.provider is not None:
+            self.set_items(self.provider(), notify=True)
         self.update_idletasks()
         x = self.winfo_rootx()
         y = self.winfo_rooty() + self.winfo_height() + 4
@@ -4632,6 +8089,7 @@ class ModernDropdown(tk.Frame):
         pop.withdraw()                         # hidden until it is sized + placed (no flicker)
         pop.overrideredirect(True)
         pop.attributes("-topmost", True)      # stays above the always-on-top settings window
+        pop.attributes("-alpha", 0.0)
         pop.configure(bg=self.EDGE)
         inner = tk.Frame(pop, bg=self.BG)
         inner.pack(fill="both", expand=True, padx=1, pady=1)
@@ -4650,6 +8108,8 @@ class ModernDropdown(tk.Frame):
         self.popup = pop
         self.hover(True)
         pop.deiconify()
+        pop.update_idletasks()
+        pop.attributes("-alpha", 1.0)
         pop.lift()
         pop.focus_force()
 
@@ -4748,14 +8208,14 @@ class ThemeCard(tk.Canvas):
 class SettingsWindow(tk.Toplevel):
     """Settings: Keybinds / Discord / Configs / UI. Every change is saved right away
     (into the same json as the stats)."""
-    TABS = (("keys", "Keybinds"), ("discord", "Discord"), ("family", "Configs"),
-            ("themes", "UI"))
+    TABS = (("keys", "Keybinds"), ("family", "Configs"), ("recovery", "Recovery"),
+            ("discord", "Discord"), ("themes", "UI"))
     UID_HELP = ("Discord > Settings > Advanced > Developer Mode on, then right-click "
                 "your name > Copy User ID.")
 
     def __init__(self, app):
         super().__init__(app.root)
-        self.withdraw()     # build everything hidden, then show it once - no flicker
+        prepare_window(self)    # build everything hidden, then show it once - no flicker
         self.app = app
         self.capturing = None       # bind id waiting for a key press
         self.capture_hook = None
@@ -4775,7 +8235,6 @@ class SettingsWindow(tk.Toplevel):
         self.wrap_w = 353                    # wraplength of the notes / hints (follows the width)
         self.transient(app.root)             # owned by the main window = always drawn above it
         self.attributes("-topmost", True)    # settings always stays above everything
-        apply_opacity(self)
         self.protocol("WM_DELETE_WINDOW", self.close)
 
         self.build_ui("keys")
@@ -4784,7 +8243,7 @@ class SettingsWindow(tk.Toplevel):
         h = min(self.winfo_reqheight(), max(380, self.winfo_screenheight() - 120))
         self.geometry(f"460x{h}+{x}+{max(0, min(y, self.winfo_screenheight() - h - 60))}")
         style_title_bar(self, App.BG)
-        self.deiconify()
+        reveal_window(self)
         self.lift()
         self.attributes("-topmost", True)
         self.focus_force()
@@ -4793,7 +8252,8 @@ class SettingsWindow(tk.Toplevel):
         """(Re)build every widget - on open, and again when the theme changes."""
         self.cancel_capture()
         for child in self.winfo_children():
-            if isinstance(child, (AssetOverrideWindow, ConfigEditorWindow, GuideWindow)):
+            if isinstance(child, (AssetOverrideWindow, ConfigEditorWindow, GuideWindow,
+                                  FailsafeConfigWindow, ReconnectConfigWindow)):
                 continue
             child.destroy()
         self.key_buttons, self.pages, self.tab_widgets = {}, {}, {}
@@ -4805,11 +8265,14 @@ class SettingsWindow(tk.Toplevel):
         # the pages sit in a scrollable area: the window can be resized, a scrollbar shows when
         # the content no longer fits
         body = tk.Frame(self, bg=App.BG)
-        body.pack(side="top", fill="both", expand=True, padx=(18, 8))
+        body.pack(side="top", fill="both", expand=True, padx=(18, 4))
         body.columnconfigure(0, weight=1)
         body.rowconfigure(0, weight=1)
         self.canvas = tk.Canvas(body, bg=App.BG, highlightthickness=0, bd=0)
         self.vscroll = ttk.Scrollbar(body, orient="vertical", command=self.canvas.yview)
+        # the scrollbar's column keeps its width even while the bar is hidden: the pages then
+        # keep the same width on every tab, so switching tabs never re-wraps / jumps the text
+        body.columnconfigure(1, minsize=max(12, self.vscroll.winfo_reqwidth()))
         self.canvas.configure(yscrollcommand=self.vscroll.set)
         self.canvas.grid(row=0, column=0, sticky="nsew")
         self.vscroll.grid(row=0, column=1, sticky="ns")
@@ -4827,33 +8290,38 @@ class SettingsWindow(tk.Toplevel):
         self.build_keys(self.pages["keys"])
         self.build_discord(self.pages["discord"])
         self.build_family(self.pages["family"])
+        self.build_recovery(self.pages["recovery"])
         self.build_themes(self.pages["themes"])
         self.update_idletasks()
-        # opens just tall enough to show everything down to the Asset override "Open" button;
-        # the rest of the page (and every other page) is reached by scrolling
-        full = inner.winfo_reqheight()
+        # opens tall enough to show the whole Configs tab (capped to the screen in __init__);
+        # a taller page on another tab is reached by scrolling
         try:
-            y, w = self.asset_open_btn.winfo_height(), self.asset_open_btn
-            while w is not inner and w is not None:
-                y += w.winfo_y()
-                w = w.master
-            shown = min(full, y + 12)
-        except (AttributeError, tk.TclError):
-            shown = full
+            shown = self.pages["family"].winfo_reqheight()
+        except (KeyError, tk.TclError):
+            shown = inner.winfo_reqheight()
         self.canvas.configure(height=shown)
 
-        # footer: the status line on the left, Changelog on the right
+        # Footer: status on the left, The Bums GitHub shortcut on the right.
+        # The Discord Settings tab and notifications still work; only its footer icon is hidden.
         self.status = tk.Label(foot, text="", font=(App.FONT, 9), fg=App.SUB, bg=App.BG,
-                               anchor="w", wraplength=210, justify="left")
+                               anchor="w", wraplength=170, justify="left")
         self.status.pack(side="left", fill="x", expand=True)
         links = tk.Frame(foot, bg=App.BG)
         links.pack(side="right")
-        chg = tk.Label(links, text="\u2630  Changelog", font=(App.FONT, 9), fg=App.SUB,
-                       bg=App.BG, cursor="hand2")
-        chg.pack(side="left")
-        chg.bind("<Button-1>", lambda _e: self.app.open_changelog())
-        chg.bind("<Enter>", lambda _e: chg.configure(fg=App.TEXT))
-        chg.bind("<Leave>", lambda _e: chg.configure(fg=App.SUB))
+        px = max(14, round(16 * max(1.0, self.winfo_fpixels("1i") / 96)))
+        # GitHub icon opens the official The Bums Macro repository.
+        self.gh_dim, self.gh_hi = tinted_icon(App.SUB, px), tinted_icon(App.TEXT, px)
+        if self.gh_dim is not None and self.gh_hi is not None:
+            gh = tk.Label(links, image=self.gh_dim, bg=App.BG, bd=0, cursor="hand2")
+            gh.bind("<Enter>", lambda _e: gh.configure(image=self.gh_hi))
+            gh.bind("<Leave>", lambda _e: gh.configure(image=self.gh_dim))
+        else:
+            gh = tk.Label(links, text="GitHub", font=(App.FONT, 9), fg=App.SUB, bg=App.BG,
+                          cursor="hand2")
+            gh.bind("<Enter>", lambda _e: gh.configure(fg=App.TEXT))
+            gh.bind("<Leave>", lambda _e: gh.configure(fg=App.SUB))
+        gh.pack(side="left", padx=(16, 0))
+        gh.bind("<Button-1>", lambda _e: webbrowser.open(GITHUB_URL))
         self.show_tab(tab)
 
     def on_size(self, width=None):
@@ -4891,33 +8359,39 @@ class SettingsWindow(tk.Toplevel):
         """The theme changed: rebuild this window in the new look (same place, same size)."""
         self.commit()
         old_w, old_h = self.winfo_width(), self.winfo_height()
-        self.withdraw()      # a half-built window must never be on screen: show it when complete
         try:
-            self.build_ui(tab)
-            self.update_idletasks()
-            # keep the size it had; it only grows if the new look really needs more room
-            self.geometry(f"{max(old_w, self.winfo_reqwidth())}x{max(old_h, self.winfo_reqheight())}")
-            style_title_bar(self, App.BG)
-        finally:
-            self.deiconify()
-            self.lift()
-            self.focus_force()
+            self.attributes("-alpha", 0.0)      # rebuilt unseen
+        except tk.TclError:
+            pass
+        self.build_ui(tab)
+        self.update_idletasks()
+        # keep the size it had; it only grows if the new look really needs more room
+        self.geometry(f"{max(old_w, self.winfo_reqwidth())}x{max(old_h, self.winfo_reqheight())}")
+        style_title_bar(self, App.BG)
+        self.update()
+        try:
+            self.attributes("-alpha", 1.0)
+        except tk.TclError:
+            pass
         self.app.keep_settings_on_top()
 
     # ----- look -----
     def setup_styles(self):
         pass    # nothing to style: the dropdown and theme cards are custom widgets
 
-    def card(self, parent, title, note=None):
+    def card(self, parent, title, note=None, hot=False):
+        """hot=True: a brighter, bigger title and note (for a card that must not be overlooked)."""
         outer = tk.Frame(parent, bg=App.CARD, highlightbackground=App.BORDER,
                          highlightthickness=App.CARD_BW)
         outer.pack(fill="x", pady=6)
         inner = tk.Frame(outer, bg=App.CARD)
         inner.pack(fill="x", padx=16, pady=14)
-        tk.Label(inner, text=title, font=(App.FONT, 8, "bold"), fg=App.SUB, bg=App.CARD,
+        tk.Label(inner, text=title, font=(App.FONT, 10 if hot else 8, "bold"),
+                 fg=App.TEXT if hot else App.SUB, bg=App.CARD,
                  anchor="w").pack(fill="x")
         if note:
-            tk.Label(inner, text=note, font=(App.FONT, 9), fg=App.SUB, bg=App.CARD,
+            tk.Label(inner, text=note, font=(App.FONT, 9), fg=App.TEXT if hot else App.SUB,
+                     bg=App.CARD,
                      anchor="w", justify="left",
                      wraplength=self.wrap_w).pack(fill="x", pady=(2, 0))
         tk.Frame(inner, height=8, bg=App.CARD).pack()
@@ -4937,10 +8411,14 @@ class SettingsWindow(tk.Toplevel):
 
     def flat_button(self, parent, text, command):
         b = tk.Label(parent, text=text, font=(App.FONT, 9, "bold"), fg=App.ACCENT_TEXT,
-                     bg=App.ACCENT_BG, padx=12, pady=5, cursor="hand2")
+                     bg=App.ACCENT_BG, padx=14, pady=6, cursor="hand2",
+                     highlightthickness=1, highlightbackground=App.ACCENT_BG,
+                     highlightcolor=App.ACCENT_BG)
         b.bind("<Button-1>", lambda _e: command())
-        b.bind("<Enter>", lambda _e: b.configure(bg=App.ACCENT_BG_HOVER))
-        b.bind("<Leave>", lambda _e: b.configure(bg=App.ACCENT_BG))
+        b.bind("<Enter>", lambda _e: b.configure(bg=App.ACCENT_BG_HOVER,
+                                                 highlightbackground=App.ACCENT_LINE))
+        b.bind("<Leave>", lambda _e: b.configure(bg=App.ACCENT_BG,
+                                                 highlightbackground=App.ACCENT_BG))
         return b
 
     def hint(self, parent, text="", color=None):
@@ -4960,26 +8438,65 @@ class SettingsWindow(tk.Toplevel):
             lbl = tk.Label(cell, text=text, font=(App.FONT, 11, "bold"), fg=App.SUB,
                            bg=App.BG, cursor="hand2")
             lbl.pack(fill="x")
-            line = tk.Frame(cell, height=2, bg=App.BG)
-            line.pack(fill="x", pady=(3, 0))
+            line = tk.Frame(cell, height=3, bg=App.BG)
+            line.pack(fill="x", pady=(5, 0))
             for w in (cell, lbl):
                 w.bind("<Button-1>", lambda _e, k=key: self.show_tab(k))
             self.tab_widgets[key] = (lbl, line)
 
     def show_tab(self, key):
         self.cancel_capture()
-        for k, (lbl, line) in self.tab_widgets.items():
-            on = k == key
-            lbl.configure(fg=App.TEXT if on else App.SUB)
-            line.configure(bg=App.ACCENT if on else App.BG)
-        for k, page in self.pages.items():     # unmap the other pages, so nothing of them can
-            if k != key:                       # show through (or be left behind) while redrawing
-                page.grid_remove()
-        self.pages[key].grid()
+        prev = getattr(self, "cur_tab", None)
+        job = getattr(self, "tab_job", None)
+        if job:                              # a switch still animating: finish it at once
+            try:
+                self.after_cancel(job)
+                self.canvas.coords(self.inner_id, 0, 0)
+            except tk.TclError:
+                pass
+            self.tab_job = None
+        animate = animations_on() and prev in self.pages and prev != key
+        if not animate:
+            for k, (lbl, line) in self.tab_widgets.items():
+                on = k == key
+                lbl.configure(fg=App.TEXT if on else App.SUB)
+                line.configure(bg=App.ACCENT if on else App.BG)
+        self.pages[key].tkraise()
         self.cur_tab = key
         self.canvas.yview_moveto(0)          # every page starts at its top
         self.on_size()                       # scroll extent / scrollbar follow this page
         self.say("")
+        if animate:
+            self.animate_tab(prev, key)
+
+    def animate_tab(self, old, new, steps=9, delay=14, dx=18):
+        """Tab switch: the new page slides in a few pixels while the tab names / underlines
+        fade between their two colours."""
+        def paint(k):
+            for name, (lbl, line) in self.tab_widgets.items():
+                if name == new:
+                    lbl.configure(fg=mix_color(App.SUB, App.TEXT, k))
+                    line.configure(bg=mix_color(App.BG, App.ACCENT, k))
+                elif name == old:
+                    lbl.configure(fg=mix_color(App.TEXT, App.SUB, k))
+                    line.configure(bg=mix_color(App.ACCENT, App.BG, k))
+                else:
+                    lbl.configure(fg=App.SUB)
+                    line.configure(bg=App.BG)
+            self.canvas.coords(self.inner_id, round(dx * (1 - k)), 0)
+
+        def step(i=1):
+            try:
+                paint(_ease_out(min(1.0, i / steps)))
+            except (tk.TclError, ValueError):
+                self.tab_job = None
+                return
+            self.tab_job = self.after(delay, step, i + 1) if i < steps else None
+        try:
+            paint(0)
+        except (tk.TclError, ValueError):
+            return
+        step()
 
     # ----- keybinds tab -----
     def build_keys(self, page):
@@ -4996,6 +8513,39 @@ class SettingsWindow(tk.Toplevel):
         reset.bind("<Button-1>", lambda _e: self.reset_keybinds())
         reset.bind("<Enter>", lambda _e: reset.configure(fg=App.TEXT))
         reset.bind("<Leave>", lambda _e: reset.configure(fg=App.SUB))
+        self.build_monitor_card(page)
+
+    def build_monitor_card(self, page):
+        """More than one screen: pick the monitor the macro looks at and clicks on."""
+        mons = list_monitors()
+        c = self.card(page, "MONITOR",
+                      "Using more than one screen? Pick the monitor Roblox is on - the macro "
+                      "only looks at and clicks on that one.")
+        if not mons:
+            self.hint(c, "Could not read your monitors.", "#f87171")
+            return
+        items = []
+        for i, m in enumerate(mons, 1):
+            label = f"Monitor {i}  \u00b7  {m['width']}\u00d7{m['height']}"
+            if m["left"] == 0 and m["top"] == 0:
+                label += "  \u00b7  main"
+            items.append((i, label, (str(i), "#10223d", "#60a5fa"), None))
+        cur = settings["monitor"] if settings["monitor"] <= len(mons) else 1
+        self.monitor_dd = ModernDropdown(c, items, cur, self.on_monitor_pick)
+        self.monitor_dd.pack(fill="x")
+        self.hint(c, "Change it before pressing Start. After switching monitors, pick the "
+                     "failsafe spot again (Configs > Failsafe).")
+
+    def on_monitor_pick(self, key):
+        if running():
+            self.say("Stop the macro before changing the monitor.", error=True)
+            self.monitor_dd.value = min(settings["monitor"], len(self.monitor_dd.order))
+            self.monitor_dd.render_trigger()
+            return
+        settings["monitor"] = int(key)
+        apply_settings()
+        save_stats()
+        self.say(f"Monitor {key} selected", good=True)
 
     def key_row(self, parent, bind_id, label):
         row = tk.Frame(parent, bg=App.CARD)
@@ -5088,8 +8638,18 @@ class SettingsWindow(tk.Toplevel):
         self.v_hours = tk.StringVar(value=str(wh["graph_hours"]))
         self.v_mission = tk.BooleanVar(value=wh["notify_mission"])
         self.v_error = tk.BooleanVar(value=wh["notify_error"])
+        self.v_bot = tk.BooleanVar(value=wh["use_bot"])
+        self.v_token = tk.StringVar(value=wh["bot_token"])
+        self.v_channel = tk.StringVar(value=wh["channel_id"])
+        self.v_show_token = tk.BooleanVar(value=False)
+
+        c = self.card(page, "CONNECTION",
+                      "Send the Discord messages with a webhook, or with a bot - a bot can also be "
+                      "controlled from Discord with commands like !start, !pause and !stop.")
+        self.check(c, "Use a bot instead of a webhook", self.v_bot, self.on_bot_toggle)
 
         c = self.card(page, "WEBHOOK", "Optional. Leave the URL empty to keep Discord off.")
+        self.wh_outer = c.master
         self.url_entry = self.entry(c, self.v_url, show="\u2022")
         self.hint_url = self.hint(c, "", "#f87171")
         row = tk.Frame(c, bg=App.CARD)
@@ -5106,7 +8666,36 @@ class SettingsWindow(tk.Toplevel):
         self.flat_button(row, "Send test message", self.test_webhook).pack(side="right")
         self.hint(c, "By Hemo")
 
+        c = self.card(page, "BOT", "Your bot posts the messages and listens for commands in one channel.")
+        self.bot_outer = c.master
+        for label, var, secret in (("Bot token", self.v_token, True),
+                                   ("Channel ID", self.v_channel, False),
+                                   ("Your user ID  (only you can use the commands)", self.v_uid, False)):
+            tk.Label(c, text=label, font=(App.FONT, 9), fg=App.SUB, bg=App.CARD,
+                     anchor="w").pack(fill="x", pady=(8, 2))
+            e = self.entry(c, var, show="\u2022" if secret else None)
+            if secret:
+                self.token_entry = e
+        self.hint_bot = self.hint(c, "", "#f87171")
+        row = tk.Frame(c, bg=App.CARD)
+        row.pack(fill="x", pady=(6, 0))
+        show = tk.Frame(row, bg=App.CARD)
+        show.pack(side="left")
+        sw = ToggleSwitch(show, self.v_show_token, self.toggle_show_token, parent_bg=App.CARD)
+        sw.pack(side="left")
+        lbl = tk.Label(show, text="Show token", font=(App.FONT, 9), fg=App.SUB, bg=App.CARD,
+                       cursor="hand2")
+        lbl.pack(side="left", padx=(8, 0))
+        lbl.bind("<Button-1>", sw.flip)
+        self.flat_button(row, "Send test message", self.test_webhook).pack(side="right")
+        self.hint(c, "Commands:  " + BOT_COMMANDS_TEXT + "\n"
+                     "Setup: discord.com/developers > New Application > Bot. Turn on Message Content "
+                     "Intent, copy the token, then invite the bot to your server with View Channel, "
+                     "Send Messages, Attach Files and Read Message History. Channel ID: Developer "
+                     "Mode on, right-click the channel > Copy Channel ID.")
+
         c = self.card(page, "MESSAGES")
+        self.msgs_outer = c.master
         self.check(c, "Post my stats + a screenshot after every mission / raid", self.v_mission,
                    self.on_toggle)
         self.check(c, "Message me when the macro hits an error", self.v_error, self.on_toggle)
@@ -5139,12 +8728,29 @@ class SettingsWindow(tk.Toplevel):
         self.flat_button(row, "Send test graph", self.test_graph).pack(side="right")
         self.hint(c, "Sent while the macro is running. It never pings you.")
 
-        for var in (self.v_url, self.v_uid, self.v_hours):
+        for var in (self.v_url, self.v_uid, self.v_hours, self.v_token, self.v_channel):
             var.trace_add("write", lambda *_: self.save_soon())
         self.update_dependents()
+        self.show_bot_cards(redraw=False)
 
     def toggle_show(self):
         self.url_entry.configure(show="" if self.v_show.get() else "\u2022")
+
+    def toggle_show_token(self):
+        self.token_entry.configure(show="" if self.v_show_token.get() else "\u2022")
+
+    def show_bot_cards(self, redraw=True):
+        """Bot switch on: the BOT card replaces the WEBHOOK card."""
+        on = bool(self.v_bot.get())
+        self.wh_outer.pack_forget()
+        self.bot_outer.pack_forget()
+        (self.bot_outer if on else self.wh_outer).pack(fill="x", pady=6, before=self.msgs_outer)
+        if redraw:
+            self.on_size()
+
+    def on_bot_toggle(self):
+        self.show_bot_cards()
+        self.commit()
 
     def update_dependents(self):
         self.uid_entry.configure(state="normal" if self.v_mention.get() else "disabled")
@@ -5156,7 +8762,8 @@ class SettingsWindow(tk.Toplevel):
     def test_webhook(self):
         self.commit()
         if not webhook_url():
-            self.say("Paste a valid webhook URL first.", error=True)
+            self.say("Fill in the bot token and the channel ID first." if self.v_bot.get()
+                     else "Paste a valid webhook URL first.", error=True)
             return
         self.say("Sending test message...")
 
@@ -5165,7 +8772,7 @@ class SettingsWindow(tk.Toplevel):
                 png = cv2.imencode(".png", grab_roblox())[1].tobytes()
                 embed = dict(mission_embed(("completed",), set()),
                              title="Test message  ·  the webhook works")
-                ok, msg = post_webhook(f"Test message from {APP_NAME} - the webhook works.",
+                ok, msg = post_webhook("Test message from thebums - the webhook works.",
                                        png=png, embed=embed)
             except Exception as e:  # noqa: BLE001
                 ok, msg = False, f"Could not take the screenshot: {type(e).__name__}: {e}"
@@ -5175,7 +8782,8 @@ class SettingsWindow(tk.Toplevel):
     def test_graph(self):
         self.commit()
         if not webhook_url():
-            self.say("Paste a valid webhook URL first.", error=True)
+            self.say("Fill in the bot token and the channel ID first." if self.v_bot.get()
+                     else "Paste a valid webhook URL first.", error=True)
             return
         self.say("Building the graph...")
 
@@ -5192,9 +8800,15 @@ class SettingsWindow(tk.Toplevel):
         # section 1: abilities (the family)
         self.v_family = tk.StringVar(value=settings["family"])
         c = self.card(page, "ABILITIES")
-        items = [(f, FAMILY_LABELS[f], FAMILY_BADGES[f], FAMILY_TAGS.get(f)) for f in FAMILIES]
-        self.family_dd = ModernDropdown(c, items, settings["family"], self.on_family_pick)
-        self.family_dd.pack(fill="x")
+        dd_row = tk.Frame(c, bg=App.CARD)
+        dd_row.pack(fill="x")
+        self.family_dd = ModernDropdown(dd_row, family_items(), settings["family"],
+                                        self.on_family_pick, provider=family_items)
+        self.family_dd.pack(side="left", fill="x", expand=True)
+        self.add_macro_btn = self.square_button(dd_row, "+", self.open_macro_editor)
+        self.add_macro_btn.pack(side="left", fill="y", padx=(8, 0))
+        self.edit_macro_btn = self.square_button(dd_row, "Edit", self.edit_current_macro)
+        self.update_edit_btn()
         btn_row = tk.Frame(c, bg=App.CARD)
         btn_row.pack(anchor="w", pady=(10, 0))
         self.flat_button(btn_row, "Edit configs", self.open_config_window).pack(side="left")
@@ -5204,7 +8818,9 @@ class SettingsWindow(tk.Toplevel):
         if self.book_img is not None:
             guide_btn.configure(image=self.book_img, compound="left")
         guide_btn.pack(side="left", padx=(8, 0))
-        self.hint(c, "Every timing of the macro: movement and the three ability configs.")
+        self.hint(c, "Edit the selected macro's timing; settings are saved separately for each macro.")
+        self.hint(c, "+ makes your own macro: write it as a pseudo-script or record it. It is saved as "
+                     "a .tbmacro file in Documents/thebums Macro/Custom-Macros - send that file to share it.")
 
         # section 2: movement while shifted (step 9)
         self.v_move_shifted = tk.StringVar(value=settings["move_shifted"])
@@ -5224,25 +8840,28 @@ class SettingsWindow(tk.Toplevel):
         self.v_fs_sec = tk.StringVar(value=str(fs["seconds"]))
         self.v_fs_x = tk.StringVar(value="" if fs["click_x"] is None else str(fs["click_x"]))
         self.v_fs_y = tk.StringVar(value="" if fs["click_y"] is None else str(fs["click_y"]))
+        self.v_fs_look = tk.BooleanVar(value=bool(fs["look_down"]))
         for var in (self.v_fs_min, self.v_fs_sec, self.v_fs_x, self.v_fs_y):
             var.trace_add("write", lambda *_: self.save_soon())
 
         self.v_chest = {}
+        self.chest_family = settings["family"] if settings["family"] == "Female Raid" or settings["family"] in ATTACK_FAMILIES else "Female Raid"
         for key in ("chest1", "chest2"):
-            cur = tv("Female Raid", key)
+            cur = tv(self.chest_family, key)
             vx = tk.StringVar(value="" if cur is None else str(cur[0]))
             vy = tk.StringVar(value="" if cur is None else str(cur[1]))
             for v in (vx, vy):
                 v.trace_add("write", lambda *_: self.save_soon())
             self.v_chest[key] = (vx, vy)
-        self._chest_saved = {k: tv("Female Raid", k) for k in self.v_chest}
+        self._chest_saved = {k: tv(self.chest_family, k) for k in self.v_chest}
         self.fs_slot = tk.Frame(page, bg=page.cget("bg"))
         self.fs_slot.pack(fill="x")
         self.build_fs_slot()
 
-        # section 4: asset override
-        a = self.card(page, "ASSET OVERRIDE",
-                      "Detection not working? Replace the macro's pictures with your own screenshots.")
+        # section 4: fix image detection (replace the macro's pictures with your own)
+        a = self.card(page, "FIX IMAGE DETECTION",
+                      "Detection not working? Replace the macro's pictures with your own screenshots.",
+                      hot=True)
         self.asset_open_btn = self.flat_button(a, "Open", self.open_asset_window)
         self.asset_open_btn.pack(anchor="w")
         tk.Frame(a, height=10, bg=App.CARD).pack()
@@ -5259,25 +8878,123 @@ class SettingsWindow(tk.Toplevel):
                  bg=ModernDropdown.BETA_BG, padx=6, pady=1).pack(side="left", padx=(8, 0))
         self.hint(a, "Some UIs let you resize the loot drops, so the loot pictures no longer match. "
                      "When on, every loot icon is looked for at many sizes. Costs a little extra time "
-                     "when the mission ends. Off by default.")
+                     "when the mission ends. Off by default.", App.TEXT)
 
     def on_fix_loot(self):
         settings["fix_loot"] = bool(self.v_fix_loot.get())
         save_stats()
 
+    # ----- custom macros (the "+" next to the config dropdown) -----
+    def square_button(self, parent, text, command):
+        """A small button that looks like the dropdown next to it."""
+        one = len(text) == 1
+        b = tk.Label(parent, text=text, font=(App.FONT, 15 if one else 9, "bold"),
+                     fg=ModernDropdown.ACCENT, bg=ModernDropdown.BG, width=3 if one else 5,
+                     cursor="hand2", highlightthickness=1,
+                     highlightbackground=ModernDropdown.EDGE, highlightcolor=ModernDropdown.EDGE)
+        b.bind("<Button-1>", lambda _e: command())
+        b.bind("<Enter>", lambda _e: b.configure(highlightbackground=ModernDropdown.ACCENT))
+        b.bind("<Leave>", lambda _e: b.configure(highlightbackground=ModernDropdown.EDGE))
+        return b
+
+    def update_edit_btn(self):
+        """The Edit button only exists while one of your own macros is picked."""
+        if is_custom(self.v_family.get()):
+            self.edit_macro_btn.pack(side="left", fill="y", padx=(8, 0))
+        else:
+            self.edit_macro_btn.pack_forget()
+
+    def open_macro_editor(self, key=None):
+        win = getattr(self, "macro_win", None)
+        try:
+            if win is not None and win.winfo_exists():
+                win.deiconify()
+                win.lift()
+                win.focus_force()
+                return
+        except tk.TclError:
+            pass
+        self.macro_win = MacroEditorWindow(self, key if is_custom(key) else None)
+
+    def edit_current_macro(self):
+        self.open_macro_editor(self.v_family.get())
+
+    def macro_saved(self, key):
+        """The editor saved a macro: list it and pick it."""
+        self.v_family.set(key)
+        self.family_dd.set_items(family_items(), key)
+        self.commit()
+        self.update_edit_btn()
+        self.build_fs_slot()
+
+    def macro_deleted(self, key):
+        if self.v_family.get() == key:
+            self.v_family.set(DEFAULT_FAMILY)
+        self.family_dd.set_items(family_items(), self.v_family.get())
+        self.commit()
+        self.update_edit_btn()
+        self.build_fs_slot()
+
     def build_fs_slot(self):
-        """Failsafe card for missions, chest spots card while Female Raid is picked."""
+        """The chest spots card (Female Raid, or a custom macro that opens chests). The failsafe
+        itself lives in the Recovery tab."""
         for w in self.fs_slot.winfo_children():
             w.destroy()
-        if settings["family"] == "Female Raid":
-            self.build_chest_card(self.fs_slot)
-        else:
-            self.build_failsafe_card(self.fs_slot)
+        fam = settings["family"]
+        if fam == "Female Raid" or fam in ATTACK_FAMILIES or (is_custom(fam) and (
+                custom_macro_type(fam) == "raid" or custom_uses_chest(fam))):
+            self.build_chest_card(self.fs_slot)         # openchest() clicks these spots
+
+    def build_recovery(self, page):
+        """Recovery tab: what happens when something goes wrong - the failsafe and Reconnect."""
+        self.build_failsafe_card(page)
+        self.build_reconnect_card(page)
+
+    def build_reconnect_card(self, parent):
+        f = self.card(parent, "RECONNECT",
+                      "Rejoins the game and clicks back into a mission / raid when you disconnect, "
+                      "when the failsafe has been rescuing for 2 minutes, or on the bot command "
+                      "!reconnect. Off by default - Configure it first.")
+        row = tk.Frame(f, bg=App.CARD)
+        row.pack(fill="x", pady=(10, 0))
+        self.reconnect_status = tk.Label(row, text="", font=(App.FONT, 10), anchor="w",
+                                         bg=App.CARD)
+        self.reconnect_status.pack(side="left")
+        self.flat_button(row, "Configure", self.open_reconnect_config).pack(side="right")
+        self.update_reconnect_status()
+
+    def update_reconnect_status(self):
+        lbl = getattr(self, "reconnect_status", None)
+        if lbl is None:
+            return
+        on = settings["reconnect"]["enabled"]
+        incomplete = on and bool(reconnect_missing())     # e.g. the macro was switched to Raids
+        try:
+            if incomplete:
+                lbl.configure(text="Reconnect: Off - fill in the " + reconnect_macro_tab()
+                                   + " tab for this macro", fg="#fbbf24")
+            else:
+                lbl.configure(text="Reconnect: On" if on else "Reconnect: Of",
+                              fg="#34d399" if on else App.SUB)
+        except tk.TclError:
+            pass
+
+    def open_reconnect_config(self):
+        win = getattr(self, "rc_cfg_win", None)
+        try:
+            if win is not None and win.winfo_exists():
+                win.lift()
+                win.focus_force()
+                return
+        except tk.TclError:
+            pass
+        self.rc_cfg_win = ReconnectConfigWindow(self)
 
     def build_failsafe_card(self, parent):
         f = self.card(parent, "FAILSAFE",
                       "If a mission lasts longer than the time below, the macro spams ability 2, "
-                      "waits 15s, looks down and clicks until the retry button shows up.")
+                      "waits 15s and clicks until the retry button shows up. Female Raid has its "
+                      "own 3 min raid failsafe (the wait time below isn't used there).")
 
         def spin(parent, var, hi, unit):
             sp = tk.Spinbox(parent, from_=0, to=hi, width=4, textvariable=var,
@@ -5320,7 +9037,20 @@ class SettingsWindow(tk.Toplevel):
         reset.bind("<Enter>", lambda _e: reset.configure(fg=App.TEXT))
         reset.bind("<Leave>", lambda _e: reset.configure(fg=App.SUB))
         self.hint(f, "Where the failsafe clicks. Empty = middle of the X axis, 80% down the Y axis; "
-                     "a picked coordinate overrides it.")
+                     "a picked coordinate overrides it. Tip: pick a spot near the HP bar.")
+
+        row = tk.Frame(f, bg=App.CARD)
+        row.pack(fill="x", pady=(14, 2))
+        tk.Label(row, text="Look down", font=(App.FONT, 10), fg=App.TEXT, bg=App.CARD,
+                 anchor="w").pack(side="left")
+        self.flat_button(row, "Configure", self.open_failsafe_config).pack(side="right")
+        tb = self.flat_button(row, "Test", self.toggle_failsafe_test)
+        tb.pack(side="right", padx=(0, 8))
+        self.fs_test_btns = [tb]
+        self.hint(f, "Before clicking: press ctrl, move the mouse down, press ctrl again (off by "
+                     "default). Configure turns it on and sets the time / pixels. Test runs only the "
+                     "look down + clicking part, 3s after you press it - click into Roblox first.")
+        self.hint(f, "Adaptation not recommended", color=App.SUB).configure(font=(App.FONT, 7))
 
     def build_chest_card(self, parent):
         """Female Raid: where the chests are on the screen (the same two coordinates as
@@ -5337,7 +9067,8 @@ class SettingsWindow(tk.Toplevel):
                                    bg=App.CARD)
         self.chest_warn.pack(side="left", padx=(6, 0))
         self.update_chest_warning()
-        for key, label in (("chest1", "Chest 1"), ("chest2", "Chest 2")):
+        names = (("chest1", "Raider's Chest"), ("chest2", "Emperor's Trove")) if settings["family"] in ATTACK_FAMILIES else (("chest1", "Chest 1"), ("chest2", "Chest 2"))
+        for key, label in names:
             vx, vy = self.v_chest[key]
             row = tk.Frame(c, bg=App.CARD)
             row.pack(fill="x", pady=(8, 2))
@@ -5361,8 +9092,8 @@ class SettingsWindow(tk.Toplevel):
             clear.bind("<Button-1>", lambda _e, k=key, l=label: self.clear_chest_spot(k, l))
             clear.bind("<Enter>", lambda _e, w=clear: w.configure(fg=App.TEXT))
             clear.bind("<Leave>", lambda _e, w=clear: w.configure(fg=App.SUB))
-        self.hint(c, "Chest 1 is needed for the raid. Whether chest 2 is opened too is set in "
-                     "Edit configs > Female Raid.")
+        self.hint(c, "Chest 1 is required. Chest 2 can be enabled in Edit configs "
+                     "for the selected Raid mode.")
 
     def update_chest_warning(self):
         """Yellow ! next to CHEST LOCATIONS while the Chest 1 coordinate is not provided."""
@@ -5371,7 +9102,7 @@ class SettingsWindow(tk.Toplevel):
             return
         try:
             vx, vy = self.v_chest["chest1"]
-            valid, val = parse_spot_text(CONFIG_INDEX["Female Raid"]["chest1"], [vx.get(), vy.get()])
+            valid, val = parse_spot_text(CONFIG_INDEX[self.chest_family]["chest1"], [vx.get(), vy.get()])
             if valid and val is not None:
                 lbl.configure(text="")
             else:
@@ -5397,10 +9128,10 @@ class SettingsWindow(tk.Toplevel):
         """Save the chest spots into the Female Raid timings (same place as Edit configs). Only a
         changed spot is written, so an older value in these boxes never overwrites a newer one
         that was set in Edit configs."""
-        store = settings["timings"].setdefault("Female Raid", {})
+        store = settings["timings"].setdefault(self.chest_family, {})
         changed = False
         for key, (vx, vy) in self.v_chest.items():
-            spec = CONFIG_INDEX["Female Raid"][key]
+            spec = CONFIG_INDEX[self.chest_family][key]
             valid, val = parse_spot_text(spec, [vx.get(), vy.get()])
             if not valid or val == self._chest_saved[key]:
                 continue
@@ -5411,26 +9142,34 @@ class SettingsWindow(tk.Toplevel):
                 store[key] = val
             changed = True
         if not store:
-            settings["timings"].pop("Female Raid", None)
+            settings["timings"].pop(self.chest_family, None)
         self.update_chest_warning()
         if not changed:
             return
         save_timings()
 
-    def open_asset_window(self):
+    def open_asset_window(self, tab=None):
+        """tab = "UI" / "Loot" / "Macros": open straight on that tab (the macro editor's Images button)."""
         win = getattr(self, "asset_win", None)
         try:
             if win is not None and win.winfo_exists():
                 win.deiconify()
                 win.lift()
                 win.focus_force()
+                if tab:
+                    win.set_tab(tab, force=True)
                 return
         except tk.TclError:
             pass
         self.asset_win = AssetOverrideWindow(self)
+        if tab:
+            self.asset_win.set_tab(tab, force=True)
 
     def open_guide_window(self):
         fam = self.v_family.get()
+        if is_custom(fam):              # the "guide" of your own macro is its script
+            self.open_macro_editor(fam)
+            return
         win = getattr(self, "guide_win", None)
         try:
             if win is not None and win.winfo_exists():
@@ -5444,9 +9183,15 @@ class SettingsWindow(tk.Toplevel):
         self.guide_win = GuideWindow(self, fam)
 
     def open_config_window(self):
+        family = self.v_family.get()
+        if is_custom(family):
+            # Custom macros store their per-action timings in the macro script.
+            self.open_macro_editor(family)
+            return
         win = getattr(self, "config_win", None)
         try:
             if win is not None and win.winfo_exists():
+                win.set_family(family)
                 win.deiconify()
                 win.lift()
                 win.focus_force()
@@ -5465,6 +9210,70 @@ class SettingsWindow(tk.Toplevel):
             self.say(f"Failsafe click spot set to {x}, {y}", good=True)
         pick_screen_spot(self, "Click where the failsafe should click   (Esc to cancel)", picked)
 
+    def open_failsafe_config(self):
+        win = getattr(self, "fs_cfg_win", None)
+        try:
+            if win is not None and win.winfo_exists():
+                win.lift()
+                win.focus_force()
+                return
+        except tk.TclError:
+            pass
+        self.fs_cfg_win = FailsafeConfigWindow(self)
+
+    def fs_say(self, msg, error=False, good=False):
+        self.say(msg, error=error, good=good)
+        win = getattr(self, "fs_cfg_win", None)
+        try:
+            if win is not None and win.winfo_exists():
+                win.say(msg, error=error, good=good)
+        except tk.TclError:
+            pass
+
+    def set_fs_test_buttons(self, running):
+        btns = list(getattr(self, "fs_test_btns", []))
+        win = getattr(self, "fs_cfg_win", None)
+        try:
+            if win is not None and win.winfo_exists():
+                btns.append(win.test_btn)
+        except tk.TclError:
+            pass
+        for b in btns:
+            try:
+                b.configure(text="Stop test" if running else "Test")
+            except tk.TclError:
+                pass
+
+    def toggle_failsafe_test(self):
+        """Test the failsafe's look down + clicking part only (press again to stop it)."""
+        if failsafe_test_running():
+            failsafe_test_stop()
+            return
+        if worker is not None and worker.is_alive():
+            self.fs_say("Stop the macro first, then test the failsafe", error=True)
+            return
+        self.commit()
+        failsafe_test_start()
+        self.set_fs_test_buttons(True)
+        self.after(100, self.poll_failsafe_test)
+
+    def poll_failsafe_test(self):
+        try:
+            while True:
+                msg, kind = _fs_test["msgs"].get_nowait()
+                if kind == "done":
+                    self.set_fs_test_buttons(False)
+                    return
+                self.fs_say(msg, error=(kind == "error"), good=(kind == "good"))
+        except queue.Empty:
+            pass
+        except tk.TclError:
+            return
+        if failsafe_test_running() or not _fs_test["msgs"].empty():
+            self.after(100, self.poll_failsafe_test)
+        else:
+            self.set_fs_test_buttons(False)
+
     def clear_failsafe_spot(self):
         self.v_fs_x.set("")
         self.v_fs_y.set("")
@@ -5476,12 +9285,33 @@ class SettingsWindow(tk.Toplevel):
         self.commit()
 
     def on_family_pick(self, key):
+        old = getattr(self, "chest_family", "Female Raid")
+        if settings["family"] == "Female Raid" or settings["family"] in ATTACK_FAMILIES:
+            self.commit_chests()
         self.v_family.set(key)
+        self.chest_family = key if key == "Female Raid" or key in ATTACK_FAMILIES else "Female Raid"
+        for chest_key, (vx, vy) in self.v_chest.items():
+            cur = tv(self.chest_family, chest_key)
+            vx.set("" if cur is None else str(cur[0]))
+            vy.set("" if cur is None else str(cur[1]))
+        self._chest_saved = {chest_key: tv(self.chest_family, chest_key) for chest_key in self.v_chest}
         self.commit()
         self.build_fs_slot()
+        self.update_edit_btn()
+        cfg_win = getattr(self, "config_win", None)
+        try:
+            if cfg_win is not None and cfg_win.winfo_exists():
+                if key in FAMILIES:
+                    cfg_win.set_family(key)
+                else:
+                    cfg_win.commit()
+                    cfg_win.destroy()
+                    self.config_win = None
+        except tk.TclError:
+            pass
         win = getattr(self, "guide_win", None)      # an open Guide window follows the pick
         try:
-            if win is not None and win.winfo_exists():
+            if win is not None and win.winfo_exists() and not is_custom(key):
                 win.set_family(key)
         except tk.TclError:
             pass
@@ -5503,6 +9333,38 @@ class SettingsWindow(tk.Toplevel):
         self.check(c, "Compact mode", self.v_compact, self.on_compact_toggle)
         self.hint(c, "On: while the macro runs, the window is replaced by a small stats bar "
                      "over Roblox. Off: the main window stays open.")
+        c = self.card(page, "ROBLOX MONITOR")
+        self.v_auto_monitor = tk.BooleanVar(value=bool(settings.get("auto_monitor", True)))
+        self.check(c, "Auto-detect Roblox monitor", self.v_auto_monitor, self.on_auto_monitor_toggle)
+        self.hint(c, "The Bums: use the monitor Roblox is on, falling back to the selected monitor.")
+        adaptive_row = tk.Frame(c, bg=App.CARD)
+        adaptive_row.pack(fill="x", pady=(12, 2))
+        self.v_adaptive = tk.BooleanVar(value=bool(settings.get("adaptive_resolution", False)))
+        adaptive_switch = ToggleSwitch(adaptive_row, self.v_adaptive,
+                                       self.on_adaptive_resolution_toggle, parent_bg=App.CARD)
+        adaptive_switch.pack(side="right")
+        help_text = (
+            "Adaptive Resolution (Beta)\n\n"
+            "OFF (recommended): original full-monitor image detection.\n\n"
+            "ON (Windows): capture the Roblox game window's client area, normalize images by "
+            "its height, and translate detected clicks back to desktop coordinates. "
+            "May improve windowed mode or non-1080p detection.\n\n"
+            "Experimental: HUD/UI Scale differences may still cause missed images. "
+            "Turn OFF if you notice incorrect detection. Changes take effect next Start."
+        )
+        help_icon = HoverHelp(adaptive_row, help_text, parent_bg=App.CARD)
+        help_icon.pack(side="right", padx=(0, 8))  # directly beside the switch
+        adaptive_label = tk.Label(adaptive_row, text="Adaptive Resolution (Beta)",
+                                  fg=App.TEXT, bg=App.CARD, font=(App.FONT, 10),
+                                  anchor="w", cursor="hand2")
+        adaptive_label.pack(side="left", fill="x", expand=True)
+        adaptive_label.bind("<Button-1>", adaptive_switch.flip)
+        self.hint(c, "OFF by default. Hover over ? for details. Applies when starting the macro.")
+        c = self.card(page, "ANIMATIONS")
+        self.v_anim = tk.BooleanVar(value=bool(settings.get("animations", False)))
+        self.check(c, "GUI animations", self.v_anim, self.on_animations_toggle)
+        self.hint(c, "On: windows glide and fade in and out, tabs slide, and collapsing a window "
+                     "is animated. Off (default): everything appears instantly.")
         c = self.card(page, "MINI BAR POSITION",
                       "Where the small stats bar sits along the top of Roblox (when Compact mode is on).")
         items = [(o, o, MINI_POS_BADGES[o], None) for o in MINI_POS_OPTIONS]
@@ -5510,12 +9372,25 @@ class SettingsWindow(tk.Toplevel):
                                           self.on_mini_pos_pick)
         self.mini_pos_dd.pack(fill="x")
 
+    def on_auto_monitor_toggle(self):
+        settings["auto_monitor"] = bool(self.v_auto_monitor.get())
+        save_stats()
+
+    def on_adaptive_resolution_toggle(self):
+        settings["adaptive_resolution"] = bool(self.v_adaptive.get())
+        save_stats()
+        self.say("Adaptive Resolution setting saved. It takes effect next time you press Start.", good=True)
+
     def on_mini_pos_pick(self, key):
         if key not in MINI_POS_OPTIONS:
             return
         settings["mini_pos"] = key
         save_stats()
         self.app.set_mini_paused(self.app.pill_key == "paused")   # move the bar right away
+
+    def on_animations_toggle(self):
+        settings["animations"] = bool(self.v_anim.get())
+        save_stats()
 
     def on_compact_toggle(self):
         settings["compact_ui"] = bool(self.v_compact.get())
@@ -5557,10 +9432,13 @@ class SettingsWindow(tk.Toplevel):
             hours = wh["graph_hours"]      # box is empty / being typed: keep the old value
         wh["graph_hours"] = min(MAX_GRAPH_HOURS, max(1, hours))
         wh["notify_error"] = bool(self.v_error.get())
+        wh["use_bot"] = bool(self.v_bot.get())
+        wh["bot_token"] = self.v_token.get().strip()
+        wh["channel_id"] = self.v_channel.get().strip()
         fam = self.v_family.get()
         old_fam = settings["family"]
-        settings["family"] = fam if fam in FAMILIES else DEFAULT_FAMILY
-        if (old_fam == "Female Raid") != (settings["family"] == "Female Raid"):
+        settings["family"] = fam if family_valid(fam) else DEFAULT_FAMILY
+        if family_is_raid(old_fam) != raid_counting():
             report_rebase()
             push_stats(save=False)      # mission <-> raid counters on the main window
         self.app.refresh_labels()
@@ -5582,10 +9460,12 @@ class SettingsWindow(tk.Toplevel):
         except ValueError:
             if not self.v_fs_x.get().strip() and not self.v_fs_y.get().strip():
                 fs["click_x"] = fs["click_y"] = None     # both empty = default spot
+        fs["look_down"] = bool(self.v_fs_look.get())
         self.commit_chests()
         save_stats()
+        bot_restart()                       # start / stop the Discord command listener if needed
         # gentle warnings (it still saves what was typed)
-        bad_url = bool(wh["url"]) and not webhook_url()
+        bad_url = (not wh["use_bot"]) and bool(wh["url"]) and not webhook_url()
         self.hint_url.configure(
             text="That doesn't look like a Discord webhook URL." if bad_url else "")
         bad_uid = wh["mention"] and not wh["user_id"].isdigit()
@@ -5593,6 +9473,9 @@ class SettingsWindow(tk.Toplevel):
             text="The user ID must be numbers only." if bad_uid else
                  self.UID_HELP,
             fg="#f87171" if bad_uid else App.SUB)
+        bad_bot = wh["use_bot"] and bool(wh["bot_token"] or wh["channel_id"]) and not bot_ready()
+        self.hint_bot.configure(
+            text="Check the bot token and the channel ID (numbers only)." if bad_bot else "")
 
     def say(self, msg, error=False, good=False):
         self.status.configure(text=msg,
@@ -5604,10 +9487,11 @@ class SettingsWindow(tk.Toplevel):
             self.say_job = self.after(5000, lambda: self.status.configure(text=""))
 
     def close(self):
+        failsafe_test_stop()
         self.cancel_capture()
         self.commit()
         self.app.settings_win = None
-        self.destroy()
+        fade_close(self)
 
 
 _spot_picker = {"win": None}   # the open picker overlay (only one at a time)
@@ -5619,14 +9503,14 @@ def pick_screen_spot(owner, prompt, on_pick):
     Raid chests."""
     if _spot_picker["win"] is not None:
         return
-    sw, sh = owner.winfo_screenwidth(), owner.winfo_screenheight()
+    ml, mt, sw, sh = macro_monitor_rect(owner)     # the monitor the macro runs on
     pk = tk.Toplevel(owner)
     _spot_picker["win"] = pk
     pk.overrideredirect(True)
     pk.attributes("-topmost", True)
     pk.attributes("-alpha", 0.55)                    # the tint
     pk.configure(bg="black", cursor="fleur")         # "fleur" = the four-arrow move cursor
-    pk.geometry(f"{sw}x{sh}+0+0")
+    pk.geometry(f"{sw}x{sh}{ml:+d}{mt:+d}")
     tk.Label(pk, text=prompt, font=(App.FONT, 16, "bold"), fg="white", bg="black",
              cursor="fleur").pack(pady=40)
 
@@ -5644,9 +9528,9 @@ def pick_screen_spot(owner, prompt, on_pick):
         tip.update_idletasks()
         w, h = tip.winfo_reqwidth(), tip.winfo_reqheight()
         tx, ty = x + 18, y + 18                      # bottom right of the cursor
-        if tx + w > sw:                              # flip near the screen edges
+        if tx + w > ml + sw:                         # flip near the screen edges
             tx = x - 18 - w
-        if ty + h > sh:
+        if ty + h > mt + sh:
             ty = y - 18 - h
         tip.geometry(f"+{tx}+{ty}")
 
@@ -5675,22 +9559,1324 @@ def pick_screen_spot(owner, prompt, on_pick):
     pk.focus_force()
 
 
+class MacroEditorWindow(tk.Toplevel):
+    """The "+" window: write a macro as a pseudo-script (or record one), check it and save it as a
+    .tbmacro file in Documents/thebums Macro/Custom-Macros."""
+    # the Syntax box: ("title", text) / ("row", usage, description) / ("code", lines) / ("note", text)
+    SYNTAX_DOC = (
+        ("title", "COMMANDS   (one per line, everything after a # is a comment)"),
+        ("row", "press KEY", "tap a key once; e.g. press ability1, press ability2, ... press ability5"),
+        ("row", "press ability1  ... ability5", "ability1 uses Escape grab; 2-5 use their own Keybinds"),
+        ("row", "doubletap KEY", "tap it twice (a dash)"),
+        ("row", "hold KEY SECONDS", "hold a key down for a while"),
+        ("row", "down KEY  /  up KEY", "press / release (don't forget the 'up')"),
+        ("row", "strafe left|right|back", "one directional Dash: tap A/A, D/D or S/S"),
+        ("row", "strafe left|right|back SECONDS [GAP]", "keep repeating Dashes for SECONDS; GAP in seconds"),
+        ("row", "dash [DIRECTION] [COUNT] [COOLDOWN]", "forward/left/right/back; COUNT dashes; pause between them in seconds"),
+        ("row", "dash right 2 1.0", "D-D, wait 1.0 second, then D-D again"),
+        ("row", "backdash [COUNT] [COOLDOWN]", "S-S once by default; e.g. backdash 2 1.0"),
+        ("row", "spam KEY SECONDS [GAP]", "tap over and over (GAP = seconds between taps, default 0.1)"),
+        ("row", "wait SECONDS", "pause   (wait 0.5-1.2 = a random pause)"),
+        ("row", "click [X Y] [right]", "click where the mouse is, or at a screen spot"),
+        ("row", "imgclick IMAGE [SECONDS] [right]",
+         "find the picture on screen and click it (SECONDS = keep looking that long, "
+         "not found = skipped)"),
+        ("row", "move X Y", "move the mouse to a screen spot"),
+        ("row", "moverel DX DY", "move the mouse by pixels (turns the camera)"),
+        ("row", "status TEXT", "show TEXT on the status card"),
+        ("row", "log TEXT", "write TEXT in the log"),
+        ("row", "name: / author: / description:",
+         "info about the macro (name and type come from the boxes at the top)"),
+        ("row", "type: mission", "every run counts as a mission (Missions, Completed / Failed, Discord)"),
+        ("row", "type: raid", "every run counts as a raid (Raids, Vessels, raid Completed / Failed)"),
+        ("title", "FUNCTIONS   (the () is optional)"),
+        ("row", "retry()", "wait for the retry button and retry, like every config (nothing below it runs)"),
+        ("row", "trackloot()", "look for the loot pictures now and add what is seen to the loot"),
+        ("row", "openchest()", "the raid's chests: wait for the finish button, open the chests, click "
+                               "finish (spots: Settings > Configs)"),
+        ("row", "addwin()  /  addlose()", "add one to Completed / Failed"),
+        ("row", "addmission()  /  addraid()", "add one to the Missions / Raids counter"),
+        ("title", "LOGIC"),
+        ("row", "if CONDITION", "run the lines below only when the condition is true"),
+        ("row", "else", "(optional) run the lines below when it is not"),
+        ("row", "end", "closes an if / repeat"),
+        ("row", "repeat [N] ... end", "run the lines inside N times (no N = until the mission ends)"),
+        ("row", "CONDITION", "find IMAGE   -   picture is on screen now"),
+        ("row", "", "not find IMAGE   -   it is not"),
+        ("row", "", "a and b   /   a or b   (and goes first)"),
+        ("title", "EXAMPLE — timed double-tap dashes and five abilities"),
+        ("code", ("type: mission",
+                  "dash right 2 1.0",
+                  "press ability1",
+                  "moverel 0 600",
+                  "backdash 1",
+                  "press ability2",
+                  "wait 0.4",
+                  "press ability4",
+                  "press ability3",
+                  "wait 0.7",
+                  "press ability5",
+                  "if find finish.png",
+                  "    log Result screen found",
+                  "end",
+                  "retry()")),
+        ("note", "Indenting is optional: Tab adds 4 spaces, Enter keeps the indent, 'Tidy' fixes the "
+                 "whole script. The macro only reads the words."),
+        ("title", "PICTURES   (IMAGE = a file name like retry.png)"),
+        ("note", "Add them with the Images button (or drop the files into asset_override). Every "
+                 "picture a macro uses is listed in Settings > Fix image detection > Macros, so "
+                 "whoever gets your .tbmacro sees what it looks for. Send the picture files along with "
+                 "it - they go into their asset_override folder. A picture that is missing shows "
+                 "red in the editor."),
+        ("title", "KEYS"),
+        ("note", "KEY = ability1 ability2 ability3 ability4 ability5 dash strafe strafe_d back grab\n"
+                 "(those follow Settings > Keybinds, so a shared macro uses the keys of whoever "
+                 "runs it) or any key: a  2  space  f1  shiftleft  ctrlleft  enter ...\n"
+                 "When the lines run out the macro waits for the retry button, like every other "
+                 "config."),
+    )
+    STARTER = (
+        "author: you\n"
+        "# Example: two right Dashes, one back Dash, and abilities 1-5.\n"
+        "dash right 2 1.0\n"
+        "press ability1\n"
+        "moverel 0 600\n"
+        "backdash 1\n"
+        "press ability2\n"
+        "wait 0.4\n"
+        "press ability4\n"
+        "press ability3\n"
+        "wait 0.7\n"
+        "press ability5\n"
+        "retry()\n")
+
+    def __init__(self, settings_win, key=None):
+        super().__init__(settings_win)
+        prepare_window(self)
+        self.sw = settings_win
+        self.key = key                          # None = a new macro
+        self.orig_file = custom_filename(key) if key else None
+        self.say_job = None
+        self.rec = None
+        self.indicator = None
+        self.title(f"{APP_NAME} - edit macro" if key else f"{APP_NAME} - new macro")
+        try:
+            self.iconbitmap(asset_path(ICON_FILE))
+        except (tk.TclError, OSError):
+            pass
+        self.configure(bg=App.BG)
+        self.transient(settings_win)
+        self.attributes("-topmost", True)
+        self.minsize(520, 460)
+        self.protocol("WM_DELETE_WINDOW", self.close)
+
+        # bottom bar first, so it always stays visible
+        bottom = tk.Frame(self, bg=App.BG)
+        bottom.pack(side="bottom", fill="x", padx=18, pady=(8, 14))
+        self.sw.flat_button(bottom, "Save", self.save).pack(side="right")
+        if key:
+            self.sw.flat_button(bottom, "Delete", self.delete).pack(side="right", padx=(0, 8))
+        self.sw.flat_button(bottom, "Open folder", self.open_folder).pack(side="left")
+        self.note = tk.Label(self, text="", font=(App.FONT, 9), fg=App.SUB, bg=App.BG,
+                             anchor="w", justify="left", wraplength=480)
+        self.note.pack(side="bottom", fill="x", padx=18)
+
+        top = tk.Frame(self, bg=App.BG)
+        top.pack(side="top", fill="x", padx=18, pady=(16, 0))
+        top.columnconfigure(0, weight=1)
+        tk.Label(top, text="NAME", font=(App.FONT, 8, "bold"), fg=App.SUB, bg=App.BG,
+                 anchor="w").grid(row=0, column=0, sticky="w")
+        tk.Label(top, text="TYPE", font=(App.FONT, 8, "bold"), fg=App.SUB, bg=App.BG,
+                 anchor="w").grid(row=0, column=1, sticky="w", padx=(14, 0))
+        self.v_name = tk.StringVar()
+        tk.Entry(top, textvariable=self.v_name, font=(App.FONT, 10), bg=App.LOGBG, fg=App.TEXT,
+                 insertbackground=App.TEXT, relief="flat", highlightthickness=1,
+                 highlightbackground=App.BORDER, highlightcolor=App.ACCENT).grid(
+            row=1, column=0, sticky="ew", ipady=6, pady=(4, 0))
+        self.v_type = tk.StringVar(value=DEFAULT_MACRO_TYPE)
+        self.type_btns = {}
+        seg = tk.Frame(top, bg=App.BORDER, padx=1, pady=1)
+        seg.grid(row=1, column=1, sticky="ns", padx=(14, 0), pady=(4, 0))
+        for kind in MACRO_TYPES:
+            b = tk.Label(seg, text=kind.capitalize(), font=(App.FONT, 9, "bold"), padx=12,
+                         cursor="hand2", bg=App.CARD, fg=App.SUB)
+            b.pack(side="left", fill="y")
+            b.bind("<Button-1>", lambda _e, k=kind: self.set_type(k))
+            b.bind("<Enter>", lambda _e, k=kind: self.paint_type(hover=k))
+            b.bind("<Leave>", lambda _e: self.paint_type())
+            self.type_btns[kind] = b
+        self.paint_type()
+        self.type_hint = tk.Label(self, text="", font=(App.FONT, 8), fg=App.SUB, bg=App.BG,
+                                  anchor="w", justify="left")
+        self.type_hint.pack(side="top", fill="x", padx=18, pady=(4, 0))
+        self.paint_type()
+
+        bar = tk.Frame(self, bg=App.BG)
+        bar.pack(side="top", fill="x", padx=18, pady=(10, 0))
+        self.rec_btn = self.sw.flat_button(bar, "Record", self.start_record)
+        self.rec_btn.pack(side="left")
+        self.sw.flat_button(bar, "Pick click spot", self.pick_click).pack(side="left", padx=(8, 0))
+        self.sw.flat_button(bar, "Check", self.check).pack(side="left", padx=(8, 0))
+        self.sw.flat_button(bar, "Syntax", self.toggle_syntax).pack(side="left", padx=(8, 0))
+        self.sw.flat_button(bar, "Tidy", self.tidy).pack(side="left", padx=(8, 0))
+        self.sw.flat_button(bar, "Images", lambda: self.sw.open_asset_window("Macros")).pack(
+            side="left", padx=(8, 0))
+        self.v_binds = tk.BooleanVar(value=True)
+        switch_row(self, "Record keys as my keybind names (ability1–5, dash ...)", self.v_binds,
+                   lambda: None, App.BG, App.SUB, sub_font=(App.FONT, 9), pady=6).pack_configure(
+            padx=18, side="top")
+        help_bar = tk.Frame(self, bg=App.BG)
+        help_bar.pack(side="top", fill="x", padx=18, pady=(0, 3))
+        tk.Label(help_bar, text="Commands, parameters and timing examples",
+                 font=(App.FONT, 8), fg=App.SUB, bg=App.BG).pack(side="left")
+        self.sw.flat_button(help_bar, "Guide", self.open_command_guide).pack(side="right")
+
+        self.syntax_wrap = tk.Frame(self, bg=App.BG)
+        self.doc_col = tkfont.Font(font=("Consolas", 9)).measure("0") * 36     # description column
+        self.syntax_box = tk.Text(self.syntax_wrap, height=16, font=("Consolas", 9), bg=App.CARD,
+                                  fg=App.TEXT, relief="flat", wrap="word", highlightthickness=1,
+                                  highlightbackground=App.BORDER, padx=8, pady=6,
+                                  tabs=(self.doc_col,), cursor="arrow")
+        doc_sb = ttk.Scrollbar(self.syntax_wrap, orient="vertical", command=self.syntax_box.yview)
+        self.syntax_box.configure(yscrollcommand=doc_sb.set)
+        doc_sb.pack(side="right", fill="y")
+        self.syntax_box.pack(side="left", fill="both", expand=True)
+        for tag, opts in self.HL_STYLES.items():
+            self.syntax_box.tag_configure(tag, **opts)
+        self.fill_syntax()
+        self.syntax_shown = False
+
+        wrap = tk.Frame(self, bg=App.BG)
+        wrap.pack(side="top", fill="both", expand=True, padx=18, pady=(4, 6))
+        self.text = tk.Text(wrap, font=("Consolas", 10), bg=App.LOGBG, fg=App.TEXT,
+                            insertbackground=App.TEXT, relief="flat", undo=True, wrap="none",
+                            highlightthickness=1, highlightbackground=App.BORDER,
+                            highlightcolor=App.ACCENT, padx=8, pady=6)
+        sb = ttk.Scrollbar(wrap, orient="vertical", command=self.text.yview)
+        self.text.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self.text.pack(side="left", fill="both", expand=True)
+        for tag, opts in self.HL_STYLES.items():
+            self.text.tag_configure(tag, **opts)
+        self.text.tag_configure("bad", background="#3b1219")
+        self.text.tag_raise("bad")                  # error lines stay visible under the colours
+        self.hl_job = None
+        self.text.bind("<KeyRelease>", self.on_key_release)
+        self.text.bind("<Return>", self.on_return)
+        self.text.bind("<Tab>", self.on_tab)
+        for seq in ("<Shift-Tab>", "<ISO_Left_Tab>"):
+            try:
+                self.text.bind(seq, self.on_shift_tab)
+            except tk.TclError:
+                pass
+        self.text.bind("<FocusIn>", self.hl_soon)     # (a picture may have been added meanwhile)
+        for seq in ("<<Paste>>", "<<Cut>>", "<<Undo>>", "<<Redo>>"):
+            self.text.bind(seq, self.hl_soon, add="+")
+
+        self.load()
+        self.highlight()
+        self.update_idletasks()
+        x, y = settings_win.winfo_x() + 30, settings_win.winfo_y() + 30
+        self.geometry(f"600x660+{x}+{y}")
+        style_title_bar(self, App.BG)
+        reveal_window(self)
+        self.lift()
+        self.focus_force()
+
+    # ----- the Type selector -----
+    HEAD_LINES = 2          # name: and type: are written on top of the file by Save / Check
+
+    def set_type(self, kind):
+        self.v_type.set(kind)
+        self.paint_type()
+        self.text.edit_modified(True)
+
+    def paint_type(self, hover=None):
+        cur = self.v_type.get()
+        for kind, b in self.type_btns.items():
+            on = kind == cur
+            b.configure(bg=App.ACCENT_BG if on else (App.FIELD_HOVER if kind == hover else App.CARD),
+                        fg=App.ACCENT_TEXT if on else App.SUB)
+        if hasattr(self, "type_hint"):
+            self.type_hint.configure(text=f"type: {cur}  -  {MACRO_TYPES.get(cur, '')}")
+
+    # ----- syntax highlighting -----
+    HL_STYLES = {
+        "hl_comment": {"foreground": "#6b7694"},
+        "hl_header": {"foreground": "#fbbf24"},
+        "hl_cmd": {"foreground": "#60a5fa"},
+        "hl_flow": {"foreground": "#c084fc"},
+        "hl_key": {"foreground": "#34d399"},
+        "hl_num": {"foreground": "#fb923c"},
+        "hl_text": {"foreground": "#a5b4cf"},
+        "hl_img": {"foreground": "#2dd4bf"},                  # a picture that exists
+        "hl_imgbad": {"foreground": "#f87171", "underline": True},   # a picture that is missing
+        "hl_arg": {"foreground": "#fda4af"},                  # KEY / SECONDS ... in the docs
+        "hl_desc": {"foreground": "#8b97b5"},                 # the docs' descriptions
+        "hl_title": {"foreground": "#e2e8f0", "font": ("Consolas", 9, "bold"), "spacing1": 8,
+                     "spacing3": 2},
+    }
+    HL_KEY_CMDS = ("press", "tap", "doubletap", "dtap", "down", "up", "hold", "spam")
+    HL_TEXT_CMDS = ("log", "status")
+    HL_FLOW = ("repeat", "end", "if", "else")
+    HL_COND = ("not", "and", "or")
+    HL_CMDS = (HL_KEY_CMDS + HL_TEXT_CMDS
+               + ("strafe", "dash", "backdash", "dashback", "wait", "sleep", "click", "imgclick", "move", "moverel", "find")
+               + MACRO_FUNCS)
+    HL_NUM_RE = re.compile(r"^-?\d+(\.\d+)?(-\d+(\.\d+)?)?$")
+
+    def hl_soon(self, _event=None):
+        """Colour the text a moment after the last change (one pass, however fast you type)."""
+        if self.hl_job:
+            self.after_cancel(self.hl_job)
+        self.hl_job = self.after(60, self.highlight)
+
+    def _img_tag(self, word, cache):
+        """hl_img when the picture exists, hl_imgbad when it doesn't (None: not a picture name)."""
+        name = normalize_image_name(word)
+        if name is None:
+            return None
+        if name not in cache:
+            cache[name] = image_exists(name)
+        return "hl_img" if cache[name] else "hl_imgbad"
+
+    def _hl_line(self, t, ln, line, cache):
+        """Colour one line of code (indentation is just spaces and is skipped)."""
+        cut = len(line)
+        m = re.search(r"(^|\s)(#|//)", line)        # a comment starts at # or // (after a space)
+        if m:
+            cut = m.start(2)
+            t.tag_add("hl_comment", f"{ln}.{cut}", f"{ln}.{len(line)}")
+        code = line[:cut]
+
+        def mark(tag, a, b):
+            t.tag_add(tag, f"{ln}.{a}", f"{ln}.{b}")
+
+        h = MACRO_HEADER_RE.match(code.strip())
+        if h:
+            a = code.index(h.group(1))
+            mark("hl_header", a, a + len(h.group(1)) + 1)       # "name:"
+            if h.group(1).lower() == "type":
+                v = code.index(h.group(2), a + len(h.group(1))) if h.group(2) else -1
+                if v >= 0:
+                    mark("hl_key" if normalize_macro_type(h.group(2)) else "hl_imgbad", v, v + len(h.group(2)))
+            return
+        tokens = list(re.finditer(r"\S+", code))
+        if not tokens:
+            return
+        first = tokens[0]
+        cmd = first.group().lower()
+        if cmd.endswith("()"):
+            cmd = cmd[:-2]                              # retry()  ->  retry
+        if cmd in self.HL_FLOW:
+            mark("hl_flow", first.start(), first.end())
+        elif cmd in self.HL_CMDS and cmd != "find":
+            mark("hl_cmd", first.start(), first.end())
+        else:
+            return                                      # unknown command: left plain (Check flags it)
+        if cmd in self.HL_TEXT_CMDS:
+            if len(tokens) > 1:
+                mark("hl_text", tokens[1].start(), len(code.rstrip()))
+            return
+        prev = ""
+        for i, tok in enumerate(tokens[1:]):
+            word = tok.group().lower()
+            if cmd == "if":
+                if word == "find":
+                    mark("hl_cmd", tok.start(), tok.end())
+                elif prev == "find":
+                    tag = self._img_tag(tok.group(), cache)
+                    if tag:
+                        mark(tag, tok.start(), tok.end())
+                elif word in self.HL_COND:
+                    mark("hl_flow", tok.start(), tok.end())
+            elif i == 0 and cmd == "imgclick":
+                tag = self._img_tag(tok.group(), cache)
+                if tag:
+                    mark(tag, tok.start(), tok.end())
+            elif i == 0 and cmd in ("strafe", "dash"):
+                if _strafe_key(word) or word in DASH_DIRECTION_BINDS:
+                    mark("hl_key", tok.start(), tok.end())
+            elif i == 0 and cmd in self.HL_KEY_CMDS:
+                if resolve_macro_key(word):
+                    mark("hl_key", tok.start(), tok.end())
+            elif word in ("left", "right") and cmd in ("click", "imgclick"):
+                mark("hl_key", tok.start(), tok.end())
+            elif self.HL_NUM_RE.match(word):
+                mark("hl_num", tok.start(), tok.end())
+            prev = word
+
+    def highlight(self):
+        self.hl_job = None
+        t = self.text
+        for tag in self.HL_STYLES:
+            t.tag_remove(tag, "1.0", "end")
+        cache = {}
+        for ln, line in enumerate(t.get("1.0", "end-1c").split("\n"), 1):
+            self._hl_line(t, ln, line, cache)
+
+    # ----- the Syntax box (highlighted like the editor) -----
+    def fill_syntax(self):
+        box = self.syntax_box
+        box.configure(state="normal")
+        box.delete("1.0", "end")
+        box.tag_configure("doc_row", lmargin1=0, lmargin2=self.doc_col)
+        cache = {}
+        first = True
+        for item in self.SYNTAX_DOC:
+            kind = item[0]
+            if kind == "title":
+                box.insert("end", ("" if first else "\n") + item[1] + "\n", "hl_title")
+            elif kind == "row":
+                start = box.index("end-1c")
+                self._doc_usage(box, item[1])
+                box.insert("end", "\t" + item[2] + "\n", "hl_desc")
+                box.tag_add("doc_row", start, "end-1c")
+            elif kind == "code":
+                for line in item[1]:
+                    ln = int(box.index("end-1c").split(".")[0])
+                    box.insert("end", line + "\n")
+                    self._hl_line(box, ln, line, cache)
+            else:
+                box.insert("end", item[1] + "\n", "hl_desc")
+            first = False
+        box.configure(state="disabled")
+
+    def _doc_usage(self, box, usage):
+        """A usage line like 'spam KEY SECONDS [GAP]': the command coloured, the placeholders too."""
+        for m in re.finditer(r"\S+|\s+", usage):
+            w = m.group()
+            core, low = w.strip("[]"), w.strip("[]").lower()
+            if w.isspace() or not core:
+                tag = None
+            elif core.endswith(":") and MACRO_HEADER_RE.match(core + " x"):
+                tag = "hl_header"
+            elif low in self.HL_FLOW or low in self.HL_COND:
+                tag = "hl_flow"
+            elif low in self.HL_CMDS:
+                tag = "hl_cmd"
+            elif low in ("left", "right"):
+                tag = "hl_key"
+            elif core.isalpha() and core.isupper():
+                tag = "hl_arg"
+            else:
+                tag = None
+            box.insert("end", w, tag) if tag else box.insert("end", w)
+
+    # ----- indentation (optional) -----
+    @staticmethod
+    def _first_word(line):
+        words = _strip_macro_comment(line).lower().split()
+        return words[0] if words else ""
+
+    def on_return(self, _event=None):
+        """Enter keeps the indentation of the line above (one level deeper after if / else / repeat)."""
+        t = self.text
+        before = t.get("insert linestart", "insert")
+        indent = re.match(r"[ \t]*", before).group()
+        if self._first_word(before) in ("if", "else", "repeat"):
+            indent += MACRO_INDENT
+        t.insert("insert", "\n" + indent)
+        t.see("insert")
+        self.hl_soon()
+        return "break"
+
+    def on_tab(self, _event=None):
+        self.text.insert("insert", MACRO_INDENT)
+        self.hl_soon()
+        return "break"
+
+    def on_shift_tab(self, _event=None):
+        t = self.text
+        ln = t.index("insert").split(".")[0]
+        line = t.get(f"{ln}.0", f"{ln}.end")
+        cut = len(line) - len(line.lstrip(" "))
+        cut = min(cut, len(MACRO_INDENT))
+        if cut:
+            t.delete(f"{ln}.0", f"{ln}.{cut}")
+        self.hl_soon()
+        return "break"
+
+    def on_key_release(self, event=None):
+        """Typing 'end' / 'else' at the start of an indented line pulls it back one level."""
+        t = self.text
+        if event is not None and event.keysym in ("d", "D", "e", "E"):
+            ln = t.index("insert").split(".")[0]
+            line = t.get(f"{ln}.0", f"{ln}.end")
+            if (line.strip().lower() in ("end", "else") and line.startswith(MACRO_INDENT)
+                    and t.compare("insert", "==", f"{ln}.end")):
+                t.delete(f"{ln}.0", f"{ln}.{len(MACRO_INDENT)}")
+        self.hl_soon()
+
+    def tidy(self):
+        """Indent the whole script by its if / else / repeat blocks."""
+        t = self.text
+        pos = t.index("insert")
+        level, out = 0, []
+        for raw in t.get("1.0", "end-1c").split("\n"):
+            word = self._first_word(raw)
+            if word in ("end", "else"):
+                level = max(0, level - 1)
+            out.append(MACRO_INDENT * level + raw.strip() if raw.strip() else "")
+            if word in ("if", "else", "repeat"):
+                level += 1
+        new = "\n".join(out)
+        if new != t.get("1.0", "end-1c"):
+            t.edit_separator()
+            t.delete("1.0", "end")
+            t.insert("1.0", new)
+            t.edit_separator()
+        try:
+            t.mark_set("insert", pos)
+        except tk.TclError:
+            pass
+        self.highlight()
+        self.say("Indentation fixed.", good=True)
+
+    # ----- file -----
+    def load(self):
+        body = self.STARTER
+        if self.key:
+            try:
+                with open(custom_path(self.key), "r", encoding="utf-8-sig") as fh:
+                    raw = fh.read()
+            except (OSError, UnicodeDecodeError) as e:
+                raw = ""
+                self.say(f"Could not read the file: {e}", error=True)
+            meta, _prog, _err = parse_macro(raw)
+            self.v_name.set(meta.get("name") or os.path.splitext(self.orig_file)[0])
+            self.v_type.set(normalize_macro_type(meta.get("type")) or DEFAULT_MACRO_TYPE)
+            self.paint_type()
+            kept, dropped, dropped_t = [], False, False
+            for line in raw.splitlines():
+                m = MACRO_HEADER_RE.match(line.strip())
+                if m and m.group(1).lower() == "name" and not dropped:
+                    dropped = True          # the Name box owns this line
+                    continue
+                if m and m.group(1).lower() == "type" and not dropped_t:
+                    dropped_t = True        # ... and the Type selector this one
+                    continue
+                kept.append(line)
+            body = "\n".join(kept).strip("\n") + "\n"
+        self.text.insert("1.0", body)
+        self.text.edit_reset()
+        self.text.edit_modified(False)
+
+    def build_text(self):
+        name = self.v_name.get().strip()
+        lines = []
+        for line in self.text.get("1.0", "end-1c").splitlines():
+            m = MACRO_HEADER_RE.match(line.strip())
+            if m and m.group(1).lower() in ("name", "type"):
+                continue                    # only the Name box / Type selector set these
+            lines.append(line)
+        return name, f"name: {name}\ntype: {self.v_type.get()}\n" + "\n".join(lines).rstrip() + "\n"
+
+    def save(self):
+        name, text = self.build_text()
+        if not name:
+            self.say("Give the macro a name first.", error=True)
+            return
+        _meta, _prog, errors = parse_macro(text)
+        if errors:
+            self.show_errors(errors)
+            return
+        fname = safe_macro_filename(name)
+        path = os.path.join(custom_dir(), fname)
+        if os.path.exists(path) and fname != self.orig_file:
+            if not messagebox.askyesno("thebums", f"{fname} already exists. Replace it?", parent=self):
+                return
+        try:
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write(text)
+            os.replace(tmp, path)           # never leaves a half-written file behind
+            if self.orig_file and self.orig_file != fname:      # renamed: remove the old file
+                old = os.path.join(custom_dir(), os.path.basename(self.orig_file))
+                if os.path.isfile(old):
+                    os.remove(old)
+        except OSError as e:
+            self.say(f"Could not save: {e}", error=True)
+            return
+        self.text.edit_modified(False)
+        self.sw.macro_saved(CUSTOM_PREFIX + fname)
+        self.sw.say(f"Saved {fname} - it is the picked config now", good=True)
+        self.destroy()
+
+    def delete(self):
+        name = self.v_name.get().strip() or self.orig_file
+        if not messagebox.askyesno("thebums", f"Delete '{name}'?\nThe .tbmacro file is removed for good.",
+                                   parent=self):
+            return
+        try:
+            os.remove(custom_path(self.key))
+        except OSError as e:
+            self.say(f"Could not delete: {e}", error=True)
+            return
+        self.sw.macro_deleted(self.key)
+        self.sw.say(f"Deleted {name}", good=True)
+        self.destroy()
+
+    def open_folder(self):
+        folder = custom_dir()
+        try:
+            if IS_WIN:
+                os.startfile(folder)    # noqa
+            else:
+                subprocess.Popen(["open" if IS_MAC else "xdg-open", folder])
+        except Exception:  # noqa: BLE001
+            self.say(folder)
+
+    def close(self):
+        if self.rec is not None:
+            return                          # recording: finish that first (the stop key)
+        if self.text.edit_modified() and not messagebox.askyesno(
+                "thebums", "Close without saving your changes?", parent=self):
+            return
+        fade_close(self)
+
+    # ----- checking -----
+    def show_errors(self, errors):
+        self.text.tag_remove("bad", "1.0", "end")
+        # line numbers of the file = line numbers here + HEAD_LINES (name: / type: are added on top)
+        for no, _msg in errors:
+            ln = no - self.HEAD_LINES
+            if ln >= 1:
+                self.text.tag_add("bad", f"{ln}.0", f"{ln}.end+1c")
+        no, msg = errors[0]
+        more = f"  (+{len(errors) - 1} more)" if len(errors) > 1 else ""
+        self.say(f"Line {max(1, no - self.HEAD_LINES)}: {msg}{more}", error=True)
+        self.text.see(f"{max(1, no - self.HEAD_LINES)}.0")
+
+    def check(self):
+        self.text.tag_remove("bad", "1.0", "end")
+        _name, text = self.build_text()
+        _meta, prog, errors = parse_macro(text)
+        if errors:
+            self.show_errors(errors)
+        else:
+            msg = f"Looks good - {count_macro_nodes(prog)} command(s)."
+            missing = [n for n in macro_node_images(prog) if not image_exists(n)]
+            if missing:
+                self.say(f"{msg} Missing picture(s): {', '.join(missing)} - add them with the "
+                         "Images button.", warn=True)
+            else:
+                self.say(msg, good=True)
+
+    def open_command_guide(self):
+        """Open the custom-macro command guide with the same markdown renderer as the raid guides."""
+        existing = getattr(self, "command_guide", None)
+        if existing is not None and existing.winfo_exists():
+            existing.set_family("__custom_macro__")
+            existing.deiconify()
+            existing.lift()
+            existing.focus_force()
+            return
+        self.command_guide = GuideWindow(self, "__custom_macro__")
+
+    def toggle_syntax(self):
+        if self.syntax_shown:
+            self.syntax_wrap.pack_forget()
+        else:
+            self.syntax_wrap.pack(side="top", fill="x", padx=18, pady=(6, 0), before=self.text.master)
+        self.syntax_shown = not self.syntax_shown
+
+    # ----- helpers for the text box -----
+    def insert_lines(self, lines):
+        if self.text.index("insert").split(".")[1] != "0":
+            self.text.insert("insert", "\n")
+        self.text.insert("insert", "\n".join(lines) + "\n")
+        self.text.see("insert")
+        self.highlight()
+
+    def pick_click(self):
+        def picked(x, y):
+            self.insert_lines([f"click {x} {y}"])
+            self.say(f"Added: click {x} {y}", good=True)
+            self.deiconify()
+            self.lift()
+        pick_screen_spot(self, "Click the spot the macro should click   (Esc to cancel)", picked)
+
+    # ----- recording -----
+    def start_record(self):
+        if running():
+            self.say("Stop the macro before recording.", error=True)
+            return
+        if self.rec is not None:
+            return
+        self.rec = MacroRecorder(use_binds=bool(self.v_binds.get()))
+        try:
+            self.rec.start()
+        except Exception as e:  # noqa: BLE001
+            self.rec = None
+            self.say(f"Could not start recording: {type(e).__name__}: {e}", error=True)
+            return
+        self.withdraw()
+        self.sw.withdraw()                      # nothing of thebums in the way of the game
+        ind = tk.Toplevel(self.sw.app.root)
+        self.indicator = ind
+        ind.overrideredirect(True)
+        ind.attributes("-topmost", True)
+        ind.configure(bg="#111111", highlightthickness=1, highlightbackground="#ef4444")
+        self.ind_label = tk.Label(ind, text="", font=(App.FONT, 11, "bold"), fg="#ffffff",
+                                  bg="#111111", padx=14, pady=8)
+        self.ind_label.pack(side="left")
+        stop = tk.Label(ind, text="Stop", font=(App.FONT, 10, "bold"), fg="#ffffff", bg="#ef4444",
+                        padx=12, pady=8, cursor="hand2")
+        stop.pack(side="left")
+        stop.bind("<Button-1>", lambda _e: setattr(self.rec, "stop_requested", True))
+        self.ind_label.configure(text="Recording starts in 3 ... switch to the game")
+        ind.update_idletasks()
+        ml, mt, mw, _mh = macro_monitor_rect(self)
+        w, h = ind.winfo_reqwidth() + 60, ind.winfo_reqheight()
+        x, y = ml + (mw - w) // 2, mt + 8
+        ind.geometry(f"{w}x{h}{x:+d}{y:+d}")
+        self.rec.ignore = (x, y, x + w, y + h)
+        self.countdown(3)
+
+    def countdown(self, n):
+        if self.rec is None:
+            return
+        if n > 0:
+            self.ind_label.configure(text=f"Recording starts in {n} ... switch to the game")
+            self.after(1000, lambda: self.countdown(n - 1))
+            return
+        self.ind_label.configure(text=f"\u25cf REC   press {QUIT_KEY.upper()} to stop")
+        self.rec.begin()
+        self.poll_record()
+
+    def poll_record(self):
+        if self.rec is None:
+            return
+        if self.rec.stop_requested:
+            self.finish_record()
+            return
+        self.after(80, self.poll_record)
+
+    def finish_record(self):
+        rec, self.rec = self.rec, None
+        try:
+            lines = rec.to_lines()
+        finally:
+            rec.stop()                          # also binds F8 / F6 / F7 again
+        if self.indicator is not None:
+            self.indicator.destroy()
+            self.indicator = None
+        self.sw.deiconify()
+        self.deiconify()
+        self.lift()
+        self.focus_force()
+        self.sw.app.keep_settings_on_top()
+        if not lines:
+            self.say("Nothing was recorded - press some keys while it counts as recording.",
+                     error=True)
+            return
+        self.insert_lines(["# recorded " + time.strftime("%Y-%m-%d %H:%M")] + lines)
+        extra = ""
+        if rec.skipped:
+            extra += f" Skipped keys the macro can't press: {', '.join(sorted(rec.skipped))}."
+        if not rec.mouse_ok:
+            extra += " Mouse clicks can't be recorded on this system."
+        self.say(f"Recorded {len(lines)} line(s). Mouse movement is not recorded - "
+                 f"use moverel for camera turns.{extra}", good=True)
+
+    def say(self, msg, error=False, good=False, warn=False):
+        self.note.configure(text=msg, fg="#f87171" if error else "#34d399" if good
+                            else "#fbbf24" if warn else App.SUB)
+        if self.say_job:
+            self.after_cancel(self.say_job)
+            self.say_job = None
+        if msg and not error:
+            self.say_job = self.after(8000 if not warn else 14000,
+                                      lambda: self.note.configure(text=""))
+
+
+class FailsafeConfigWindow(tk.Toplevel):
+    """Failsafe > Configure: the look down switch and its time / pixels / step delay, plus a Test
+    button (look down + clicking only). Every change is saved right away."""
+    FIELDS = (
+        ("look_time", "Time", "sec", "How long the mouse is moved down."),
+        ("look_pixels", "Pixels per step", "px", "How far the mouse moves down in one step "
+                                                 "(relative movement, works in a locked mouse)."),
+        ("look_step", "Step delay", "sec", "Pause between two steps."),
+    )
+
+    def __init__(self, sw):
+        super().__init__(sw)
+        prepare_window(self)
+        self.sw = sw
+        self.save_job = None
+        self.say_job = None
+        self.vars = {}
+        self.title(f"{APP_NAME} - failsafe look down")
+        try:
+            self.iconbitmap(asset_path(ICON_FILE))
+        except (tk.TclError, OSError):
+            pass
+        self.configure(bg=App.BG)
+        self.transient(sw)
+        self.attributes("-topmost", True)
+        self.resizable(False, False)
+        self.protocol("WM_DELETE_WINDOW", self.close)
+
+        card = tk.Frame(self, bg=App.CARD, highlightthickness=1, highlightbackground=App.BORDER)
+        card.pack(fill="both", expand=True, padx=18, pady=(16, 8))
+        f = tk.Frame(card, bg=App.CARD)
+        f.pack(fill="both", expand=True, padx=16, pady=14)
+        tk.Label(f, text="LOOK DOWN", font=(App.FONT, 8, "bold"), fg=App.SUB, bg=App.CARD,
+                 anchor="w").pack(fill="x")
+
+        row = tk.Frame(f, bg=App.CARD)
+        row.pack(fill="x", pady=(10, 2))
+        sw_btn = ToggleSwitch(row, sw.v_fs_look, sw.commit, parent_bg=App.CARD)
+        sw_btn.pack(side="right")
+        lbl = tk.Label(row, text="Look down before clicking", font=(App.FONT, 10), fg=App.TEXT,
+                       bg=App.CARD, anchor="w", cursor="hand2")
+        lbl.pack(side="left")
+        lbl.bind("<Button-1>", sw_btn.flip)
+        self.hint(f, "Press ctrl, move the mouse down, press ctrl again - before the failsafe "
+                     "clicks. Some setups look up instead, so leave it off if that happens to you.")
+
+        fs = settings["failsafe"]
+        for key, label, unit, hint in self.FIELDS:
+            row = tk.Frame(f, bg=App.CARD)
+            row.pack(fill="x", pady=(12, 0))
+            tk.Label(row, text=label, font=(App.FONT, 10), fg=App.TEXT, bg=App.CARD,
+                     width=14, anchor="w").pack(side="left")
+            var = tk.StringVar(value=f"{fs[key]:g}")
+            var.trace_add("write", lambda *_: self.save_soon())
+            self.vars[key] = var
+            e = tk.Entry(row, textvariable=var, width=8, font=(App.FONT, 10), justify="center",
+                         bg=App.LOGBG, fg=App.TEXT, insertbackground=App.TEXT, relief="flat",
+                         highlightthickness=1, highlightbackground=App.BORDER,
+                         highlightcolor=App.ACCENT)
+            e.pack(side="left", ipady=3)
+            e.bind("<FocusOut>", lambda _e: self.commit())
+            tk.Label(row, text=unit, font=(App.FONT, 9), fg=App.SUB,
+                     bg=App.CARD).pack(side="left", padx=(6, 0))
+            self.hint(f, hint)
+        self.total = tk.Label(f, text="", font=(App.FONT, 9), fg=App.SUB, bg=App.CARD, anchor="w")
+        self.total.pack(fill="x", pady=(12, 0))
+
+        btns = tk.Frame(f, bg=App.CARD)
+        btns.pack(fill="x", pady=(14, 0))
+        self.test_btn = sw.flat_button(btns, "Stop test" if failsafe_test_running() else "Test",
+                                       sw.toggle_failsafe_test)
+        self.test_btn.pack(side="left")
+        sw.flat_button(btns, "Reset", self.reset).pack(side="left", padx=(8, 0))
+        self.hint(f, "Test runs only the look down + clicking part (5 clicks at the failsafe spot), "
+                     "3s after you press it - click into Roblox first. Press it again to stop.")
+
+        self.note = tk.Label(self, text="", font=(App.FONT, 9), fg=App.SUB, bg=App.BG,
+                             anchor="w", justify="left", wraplength=400)
+        self.note.pack(fill="x", padx=20, pady=(0, 12))
+
+        self.update_total()
+        self.update_idletasks()
+        self.geometry(f"+{sw.winfo_x() + 30}+{sw.winfo_y() + 30}")
+        style_title_bar(self, App.BG)
+        reveal_window(self)
+        self.lift()
+        self.focus_force()
+
+    def hint(self, parent, text):
+        lbl = tk.Label(parent, text=text, font=(App.FONT, 8), fg=App.SUB, bg=App.CARD,
+                       anchor="w", justify="left", wraplength=400)
+        lbl.pack(fill="x", pady=(4, 0))
+        return lbl
+
+    def say(self, msg, error=False, good=False):
+        self.note.configure(text=msg, fg="#f87171" if error else "#34d399" if good else App.SUB)
+        if self.say_job:
+            self.after_cancel(self.say_job)
+            self.say_job = None
+        if msg and not error:
+            self.say_job = self.after(6000, lambda: self.note.configure(text=""))
+
+    def update_total(self):
+        fs = settings["failsafe"]
+        steps = max(1, int(fs["look_time"] / fs["look_step"]))
+        self.total.configure(text=f"About {steps} steps x {fs['look_pixels']}px = "
+                                  f"{steps * fs['look_pixels']}px of mouse movement in total")
+
+    def save_soon(self):
+        if self.save_job:
+            self.after_cancel(self.save_job)
+        self.save_job = self.after(500, self.commit)
+
+    def commit(self):
+        if self.save_job:
+            try:
+                self.after_cancel(self.save_job)
+            except tk.TclError:
+                pass
+            self.save_job = None
+        fs = settings["failsafe"]
+        for key, var in self.vars.items():
+            lo, hi = FAILSAFE_LOOK_LIMITS[key]
+            try:
+                v = float(var.get().replace(",", "."))
+            except ValueError:
+                continue                        # being typed / empty: keep the old value
+            v = min(hi, max(lo, v))
+            fs[key] = int(round(v)) if key == "look_pixels" else v
+        save_stats()
+        self.update_total()
+
+    def reset(self):
+        fs = settings["failsafe"]
+        defaults = {"look_time": LOOK_DOWN_TIME, "look_pixels": LOOK_DOWN_PIXELS,
+                    "look_step": LOOK_DOWN_STEP}
+        for key, val in defaults.items():
+            fs[key] = val
+            self.vars[key].set(f"{val:g}")
+        self.commit()
+        self.say("Look down settings reset to the defaults", good=True)
+
+    def close(self):
+        self.commit()
+        self.destroy()
+
+
+class ReconnectConfigWindow(tk.Toplevel):
+    """Recovery > Reconnect > Configure. The Reconnect switch is off by default and can only be
+    turned on once every setting below it is filled in (reconnect_missing())."""
+    THUMB_W, THUMB_H = 200, 70
+    SMALL_W, SMALL_H = 110, 36          # the Select / Play thumbnails
+
+    def __init__(self, sw):
+        super().__init__(sw)
+        prepare_window(self)
+        self.sw = sw
+        self.say_job = None
+        self.save_job = None
+        self.spot_vars = {}                 # key -> (X var, Y var)
+        for key, _name in RECONNECT_SPOTS:
+            cur = settings["reconnect"]["spots"].get(key)
+            vx = tk.StringVar(value="" if cur is None else str(cur[0]))
+            vy = tk.StringVar(value="" if cur is None else str(cur[1]))
+            for v in (vx, vy):
+                v.trace_add("write", lambda *_: self.save_soon())
+            self.spot_vars[key] = (vx, vy)
+        self.title(f"{APP_NAME} - reconnect")
+        try:
+            self.iconbitmap(asset_path(ICON_FILE))
+        except (tk.TclError, OSError):
+            pass
+        self.configure(bg=App.BG)
+        self.transient(sw)
+        self.attributes("-topmost", True)
+        self.resizable(False, True)          # taller / shorter by dragging; the content scrolls
+        self.minsize(300, 260)
+        self.protocol("WM_DELETE_WINDOW", self.close)
+
+        # everything scrolls (mouse wheel or the bar) when the window is shorter than its content
+        holder = tk.Frame(self, bg=App.BG)
+        self.canvas = tk.Canvas(holder, bg=App.BG, highlightthickness=0, bd=0)
+        self.scroll = ttk.Scrollbar(holder, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=self.scroll.set)
+        self.scroll.pack(side="right", fill="y")
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.inner = tk.Frame(self.canvas, bg=App.BG)
+        self.inner_id = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
+        self.inner.bind("<Configure>",
+                        lambda _e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+        self.canvas.bind("<Configure>",
+                         lambda e: self.canvas.itemconfigure(self.inner_id, width=e.width))
+        self.bind("<MouseWheel>", self._wheel)
+
+        card = tk.Frame(self.inner, bg=App.CARD, highlightthickness=1, highlightbackground=App.BORDER)
+        card.pack(fill="both", expand=True, padx=(0, 6))
+        f = tk.Frame(card, bg=App.CARD)
+        f.pack(fill="both", expand=True, padx=16, pady=14)
+
+        # the switch
+        self.v_on = tk.BooleanVar(value=bool(settings["reconnect"]["enabled"]))
+        row = tk.Frame(f, bg=App.CARD)
+        row.pack(fill="x")
+        self.toggle = ToggleSwitch(row, self.v_on, self.on_toggle, parent_bg=App.CARD)
+        self.toggle.pack(side="right")
+        lbl = tk.Label(row, text="Reconnect", font=(App.FONT, 11, "bold"), fg=App.TEXT,
+                       bg=App.CARD, anchor="w", cursor="hand2")
+        lbl.pack(side="left")
+        lbl.bind("<Button-1>", self.toggle.flip)
+        self.req = tk.Label(f, text="", font=(App.FONT, 8), anchor="w", justify="left",
+                            bg=App.CARD, wraplength=400)
+        self.req.pack(fill="x", pady=(4, 0))
+
+        tk.Label(f, text=f"When the Disconnect Image shows, the failsafe has been rescuing for "
+                         f"{RECONNECT_RESCUE_LIMIT / 60:g} minutes or !reconnect is sent, Roblox is "
+                         f"closed and game {ROBLOX_GAME_ID} is launched again.",
+                 font=(App.FONT, 8), fg=App.SUB,
+                 bg=App.CARD, anchor="w", justify="left", wraplength=400).pack(fill="x", pady=(4, 0))
+
+        tk.Frame(f, height=1, bg=App.BORDER).pack(fill="x", pady=(12, 10))
+
+        # setting 1: the Images (the Disconnect Image + the two that gate the clicks)
+        tk.Label(f, text="Images", font=(App.FONT, 10, "bold"), fg=App.TEXT, bg=App.CARD,
+                 anchor="w").pack(fill="x")
+        tk.Label(f, text=f'A screenshot of just that text or button. Disconnect: the message Roblox '
+                         f'shows when you are disconnected (the macro watches for it). Select: the '
+                         f'first click happens {RECONNECT_FIRST_DELAY:g}s after it shows. Play: '
+                         f'Click play (lobby) waits until it shows. Same for both tabs.',
+                 font=(App.FONT, 8), fg=App.SUB, bg=App.CARD, anchor="w", justify="left",
+                 wraplength=400).pack(fill="x", pady=(2, 0))
+        self.img_lbls = {}
+        self.img_thumbs = {}
+        for kind in RECONNECT_ALL_IMAGES:
+            self._image_row(f, kind)
+
+        tk.Frame(f, height=1, bg=App.BORDER).pack(fill="x", pady=(14, 10))
+
+        # setting: the delay between the clicks
+        tk.Label(f, text="Click delay", font=(App.FONT, 10, "bold"), fg=App.TEXT, bg=App.CARD,
+                 anchor="w").pack(fill="x")
+        tk.Label(f, text=f"Seconds the macro waits before each click after the first one "
+                         f"(default {RECONNECT_CLICK_DELAY:g}s), except Play after Create. The first click happens "
+                         f"{RECONNECT_FIRST_DELAY:g}s after \"Select\" shows.",
+                 font=(App.FONT, 8), fg=App.SUB, bg=App.CARD, anchor="w", justify="left",
+                 wraplength=400).pack(fill="x", pady=(2, 0))
+        drow = tk.Frame(f, bg=App.CARD)
+        drow.pack(fill="x", pady=(8, 0))
+        tk.Label(drow, text="Delay between clicks", font=(App.FONT, 10), fg=App.TEXT, bg=App.CARD,
+                 width=17, anchor="w").pack(side="left")
+        self.delay_var = tk.StringVar(value=f"{reconnect_click_delay():g}")
+        self.delay_var.trace_add("write", lambda *_: self.save_soon())
+        de = tk.Entry(drow, textvariable=self.delay_var, width=6, font=(App.FONT, 10),
+                      justify="center", bg=App.LOGBG, fg=App.TEXT, insertbackground=App.TEXT,
+                      relief="flat", highlightthickness=1, highlightbackground=App.BORDER,
+                      highlightcolor=App.ACCENT)
+        de.pack(side="left", ipady=3, padx=(0, 6))
+        de.bind("<FocusOut>", lambda _e: self.commit_spots())
+        tk.Label(drow, text="sec", font=(App.FONT, 9), fg=App.SUB, bg=App.CARD).pack(side="left")
+        prow = tk.Frame(f, bg=App.CARD)
+        prow.pack(fill="x", pady=(6, 0))
+        tk.Label(prow, text="Create > Play delay", font=(App.FONT, 10), fg=App.TEXT, bg=App.CARD,
+                 width=17, anchor="w").pack(side="left")
+        self.play_var = tk.StringVar(value=f"{reconnect_play_delay():g}")
+        self.play_var.trace_add("write", lambda *_: self.save_soon())
+        pe = tk.Entry(prow, textvariable=self.play_var, width=6, font=(App.FONT, 10),
+                      justify="center", bg=App.LOGBG, fg=App.TEXT, insertbackground=App.TEXT,
+                      relief="flat", highlightthickness=1, highlightbackground=App.BORDER,
+                      highlightcolor=App.ACCENT)
+        pe.pack(side="left", ipady=3, padx=(0, 6))
+        pe.bind("<FocusOut>", lambda _e: self.commit_spots())
+        tk.Label(prow, text="sec", font=(App.FONT, 9), fg=App.SUB, bg=App.CARD).pack(side="left")
+        tk.Label(f, text=f"The wait before the Play click that follows Create (default "
+                         f"{RECONNECT_PLAY_DELAY:g}s).", font=(App.FONT, 8), fg=App.SUB, bg=App.CARD,
+                 anchor="w", justify="left", wraplength=400).pack(fill="x", pady=(4, 0))
+
+        tk.Frame(f, height=1, bg=App.BORDER).pack(fill="x", pady=(14, 10))
+
+        # settings 2-11: the coordinates, in three sub tabs
+        tk.Label(f, text="Coordinates", font=(App.FONT, 10, "bold"), fg=App.TEXT, bg=App.CARD,
+                 anchor="w").pack(fill="x")
+        tk.Label(f, text=f"Press Pick, then click on that spot on your screen. After a rejoin the "
+                         f"macro clicks them one by one, top to bottom: the first {RECONNECT_FIRST_DELAY:g}s "
+                         f"after \"Select\" shows, the rest one Click delay apart. "
+                         f"The first 4 are the same in both tabs. Every coordinate of the tab "
+                         f"your macro uses (Missions or Raids) has to be filled in before "
+                         f"Reconnect can be turned on.",
+                 font=(App.FONT, 8), fg=App.SUB, bg=App.CARD, anchor="w", justify="left",
+                 wraplength=400).pack(fill="x", pady=(2, 8))
+        self.sub = reconnect_macro_tab()     # opens on the tab the selected macro uses
+        tabs = tk.Frame(f, bg=App.CARD)
+        tabs.pack(fill="x")
+        self.sub_btns = {}
+        for tab in RECONNECT_TABS:
+            lb = tk.Label(tabs, text=tab, font=(App.FONT, 10, "bold"), padx=16, pady=5,
+                          cursor="hand2")
+            lb.pack(side="left", padx=(0, 6))
+            lb.bind("<Button-1>", lambda _e, n=tab: self.show_sub(n))
+            self.sub_btns[tab] = lb
+        self.sub_note = tk.Label(f, text="", font=(App.FONT, 8), fg=App.SUB, bg=App.CARD,
+                                 anchor="w", justify="left", wraplength=400)
+        self.sub_note.pack(fill="x", pady=(8, 0))
+        self.sub_host = tk.Frame(f, bg=App.CARD)
+        self.sub_host.pack(fill="x")
+        self.sub_frames = {}
+        for tab in RECONNECT_TABS:
+            fr = tk.Frame(self.sub_host, bg=App.CARD)
+            for key, name in RECONNECT_TAB_SPOTS[tab]:
+                self._spot_row(fr, key, name)
+            self.sub_frames[tab] = fr
+
+        self.note = tk.Label(self, text="", font=(App.FONT, 9), fg=App.SUB, bg=App.BG,
+                             anchor="w", justify="left", wraplength=400)
+        self.note.pack(side="bottom", fill="x", padx=20, pady=(0, 12))   # always visible under the scroll area
+        holder.pack(side="top", fill="both", expand=True, padx=(18, 8), pady=(16, 8))
+
+        self.show_sub(self.sub)
+        self.refresh()
+        self.update_idletasks()
+        # as tall as the content, but never taller than the screen allows
+        maxh = max(260, int(self.winfo_screenheight() * 0.80) - self.note.winfo_reqheight() - 40)
+        self.canvas.configure(width=self.inner.winfo_reqwidth(),
+                              height=min(self.inner.winfo_reqheight(), maxh))
+        self.update_idletasks()
+        x = sw.winfo_x() + 30
+        y = max(0, min(sw.winfo_y() + 30, self.winfo_screenheight() - self.winfo_reqheight() - 60))
+        self.geometry(f"+{x}+{y}")
+        style_title_bar(self, App.BG)
+        reveal_window(self)
+        self.lift()
+        self.focus_force()
+
+    def _wheel(self, e):
+        self.canvas.yview_scroll(-1 if e.delta > 0 else 1, "units")
+
+    # ----- sub tabs -----
+    def _spot_row(self, parent, key, name):
+        sw = self.sw
+        vx, vy = self.spot_vars[key]
+        row = tk.Frame(parent, bg=App.CARD)
+        row.pack(fill="x", pady=(6, 0))
+        tk.Label(row, text=name, font=(App.FONT, 10), fg=App.TEXT, bg=App.CARD, width=17,
+                 anchor="w").pack(side="left")
+        for axis, var in (("X", vx), ("Y", vy)):
+            tk.Label(row, text=axis, font=(App.FONT, 9), fg=App.SUB,
+                     bg=App.CARD).pack(side="left", padx=(0, 3))
+            e = tk.Entry(row, textvariable=var, width=5, font=(App.FONT, 10),
+                         justify="center", bg=App.LOGBG, fg=App.TEXT,
+                         insertbackground=App.TEXT, relief="flat", highlightthickness=1,
+                         highlightbackground=App.BORDER, highlightcolor=App.ACCENT)
+            e.pack(side="left", ipady=3, padx=(0, 8))
+            e.bind("<FocusOut>", lambda _e: self.commit_spots())
+        sw.flat_button(row, "Pick",
+                       lambda k=key, n=name: self.pick_spot(k, n)).pack(side="left")
+        clear = tk.Label(row, text="Clear", font=(App.FONT, 8), fg=App.SUB, bg=App.CARD,
+                         cursor="hand2")
+        clear.pack(side="left", padx=(10, 0))
+        clear.bind("<Button-1>", lambda _e, k=key, n=name: self.clear_spot(k, n))
+        clear.bind("<Enter>", lambda _e, w=clear: w.configure(fg=App.TEXT))
+        clear.bind("<Leave>", lambda _e, w=clear: w.configure(fg=App.SUB))
+
+    def _image_row(self, parent, kind):
+        sw = self.sw
+        row = tk.Frame(parent, bg=App.CARD)
+        row.pack(fill="x", pady=(8, 0))
+        tk.Label(row, text=RECONNECT_IMAGE_NAMES[kind], font=(App.FONT, 10), fg=App.TEXT,
+                 bg=App.CARD, width=10, anchor="w").pack(side="left")
+        box = tk.Frame(row, bg=App.LOGBG, highlightthickness=1, highlightbackground=App.BORDER,
+                       width=self.SMALL_W + 10, height=self.SMALL_H + 10)
+        box.pack(side="left")
+        box.pack_propagate(False)
+        lbl = tk.Label(box, text="No picture", font=(App.FONT, 8), fg=App.SUB, bg=App.LOGBG)
+        lbl.pack(expand=True)
+        self.img_lbls[kind] = lbl
+        sw.flat_button(row, "Change", lambda k=kind: self.img_change(k)).pack(side="left", padx=(8, 0))
+        sw.flat_button(row, "Paste", lambda k=kind: self.img_paste(k)).pack(side="left", padx=(4, 0))
+        rm = tk.Label(row, text="Remove", font=(App.FONT, 8), fg=App.SUB, bg=App.CARD,
+                      cursor="hand2")
+        rm.pack(side="left", padx=(10, 0))
+        rm.bind("<Button-1>", lambda _e, k=kind: self.img_remove(k))
+        rm.bind("<Enter>", lambda _e, w=rm: w.configure(fg=App.TEXT))
+        rm.bind("<Leave>", lambda _e, w=rm: w.configure(fg=App.SUB))
+
+    def _make_thumb(self, filename, w, h):
+        path = override_path(filename)
+        img = _read_image(path) if path else None
+        if img is None:
+            return None
+        ih, iw = img.shape[:2]
+        k = min(w / iw, h / ih, 3.0)
+        img = cv2.resize(img, (max(1, int(iw * k)), max(1, int(ih * k))),
+                         interpolation=cv2.INTER_AREA if k < 1 else cv2.INTER_CUBIC)
+        ok, buf = cv2.imencode(".png", img)
+        return tk.PhotoImage(data=base64.b64encode(buf.tobytes())) if ok else None
+
+    def refresh_images(self):
+        for kind, filename in RECONNECT_ALL_IMAGES.items():
+            photo = self._make_thumb(filename, self.SMALL_W, self.SMALL_H)
+            self.img_thumbs[kind] = photo            # keep the PhotoImage alive
+            lbl = self.img_lbls.get(kind)
+            if lbl is not None:
+                if photo is not None:
+                    lbl.configure(image=photo, text="")
+                else:
+                    lbl.configure(image="", text="No picture")
+
+    def img_change(self, kind):
+        name = RECONNECT_IMAGE_NAMES[kind]
+        path = filedialog.askopenfilename(
+            parent=self, title=f'Pick your "{name}" picture',
+            filetypes=[("Pictures", "*.png *.jpg *.jpeg *.bmp"), ("All files", "*.*")])
+        self.lift()
+        if not path:
+            return
+        if import_override_picture(path, RECONNECT_ALL_IMAGES[kind]):
+            self.refresh()
+            self.say(f'{name}: your picture is saved.', good=True)
+        else:
+            self.say("Could not read that picture.", error=True)
+
+    def img_paste(self, kind):
+        name = RECONNECT_IMAGE_NAMES[kind]
+        img = clipboard_image()
+        if img is None:
+            self.say("No screenshot on the clipboard. Take one first (Win+Shift+S), then press "
+                     "Paste.", error=True)
+        elif save_override_image(img, RECONNECT_ALL_IMAGES[kind]):
+            self.refresh()
+            self.say(f"{name}: pasted from the clipboard.", good=True)
+        else:
+            self.say("Could not save the picture.", error=True)
+
+    def img_remove(self, kind):
+        name = RECONNECT_IMAGE_NAMES[kind]
+        if remove_override_picture(RECONNECT_ALL_IMAGES[kind]):
+            self.refresh()
+            self.say(f"{name} picture removed.", good=True)
+        else:
+            self.say("Could not remove your picture.", error=True)
+
+    def show_sub(self, name):
+        self.sub = name
+        for tab, fr in self.sub_frames.items():
+            if tab == name:
+                fr.pack(fill="x")
+            else:
+                fr.pack_forget()
+        self.style_subtabs()
+
+    def style_subtabs(self):
+        """Tab colours + a '!' on the tab of the selected macro while it has an empty coordinate."""
+        if not hasattr(self, "sub_frames"):
+            return
+        used = reconnect_macro_tab()
+        spots = settings["reconnect"]["spots"]
+        for tab, lb in self.sub_btns.items():
+            on = tab == self.sub
+            incomplete = (tab == used
+                          and any(spots.get(k) is None for k, _n in RECONNECT_TAB_SPOTS[tab]))
+            lb.configure(text=tab + ("  !" if incomplete else ""),
+                         bg=App.ACCENT_BG if on else App.LOGBG,
+                         fg="#ffffff" if on else ("#fbbf24" if incomplete else App.SUB))
+        if self.sub == used:
+            txt = (f"Your macro ({settings['family']}) uses this tab: all 8 coordinates have "
+                   f"to be filled in. The first 4 are shared with the other tab.")
+        else:
+            txt = (f"Not used by your macro ({settings['family']}) - it uses the {used} tab. "
+                   f"The first 4 are shared with that tab.")
+        self.sub_note.configure(text=txt)
+
+    # ----- state -----
+    def say(self, msg, error=False, good=False):
+        self.note.configure(text=msg, fg="#f87171" if error else "#34d399" if good else App.SUB)
+        if self.say_job:
+            self.after_cancel(self.say_job)
+            self.say_job = None
+        if msg and not error:
+            self.say_job = self.after(6000, lambda: self.note.configure(text=""))
+
+    def refresh(self):
+        """The thumbnails, the 'still needed' line and the switch follow what is set right now."""
+        self.refresh_images()
+        self.update_requirements()
+
+    def update_requirements(self):
+        """The 'still needed' line and the switch follow what is set right now."""
+        missing = reconnect_missing()
+        if missing:
+            self.req.configure(text="Fill in before Reconnect can be turned on: "
+                                    + ", ".join(missing), fg="#fbbf24")
+            if self.v_on.get():                 # something it needs is gone: switch it off
+                self.v_on.set(False)
+                settings["reconnect"]["enabled"] = False
+                save_stats()
+        else:
+            self.req.configure(text="Everything Reconnect needs is set.", fg="#34d399")
+        self.style_subtabs()
+        self.sw.update_reconnect_status()
+
+    def on_toggle(self):
+        if self.v_on.get() and reconnect_missing():
+            self.v_on.set(False)                # can't be turned on yet
+            self.say("Fill in " + ", ".join(reconnect_missing()) + " first", error=True)
+            return
+        settings["reconnect"]["enabled"] = bool(self.v_on.get())
+        save_stats()
+        self.sw.update_reconnect_status()
+        self.say("Reconnect is on" if self.v_on.get() else "Reconnect is of", good=self.v_on.get())
+
+    # ----- the coordinates -----
+    def pick_spot(self, key, name):
+        def picked(x, y):
+            self.spot_vars[key][0].set(str(x))
+            self.spot_vars[key][1].set(str(y))
+            self.commit_spots()
+            self.say(f"{name} set to {x}, {y}", good=True)
+        pick_screen_spot(self, f"Click on: {name}   (Esc to cancel)", picked)
+
+    def clear_spot(self, key, name):
+        self.spot_vars[key][0].set("")
+        self.spot_vars[key][1].set("")
+        self.commit_spots()
+        self.say(f"{name} cleared", good=True)
+
+    def save_soon(self):
+        if self.save_job:
+            self.after_cancel(self.save_job)
+        self.save_job = self.after(500, self.commit_spots)
+
+    def commit_spots(self):
+        if self.save_job:
+            try:
+                self.after_cancel(self.save_job)
+            except tk.TclError:
+                pass
+            self.save_job = None
+        spots = settings["reconnect"]["spots"]
+        if hasattr(self, "delay_var"):
+            try:
+                d = float(self.delay_var.get().strip().replace(",", "."))
+                lo, hi = RECONNECT_CLICK_DELAY_RANGE
+                settings["reconnect"]["click_delay"] = float(min(hi, max(lo, d)))
+            except ValueError:
+                pass                            # empty / half typed: keep the last good value
+        if hasattr(self, "play_var"):
+            try:
+                d = float(self.play_var.get().strip().replace(",", "."))
+                lo, hi = RECONNECT_CLICK_DELAY_RANGE
+                settings["reconnect"]["play_delay"] = float(min(hi, max(lo, d)))
+            except ValueError:
+                pass
+        for key, (vx, vy) in self.spot_vars.items():
+            try:
+                x, y = int(vx.get()), int(vy.get())
+                if x >= 0 and y >= 0:
+                    spots[key] = [x, y]
+            except ValueError:
+                if not vx.get().strip() and not vy.get().strip():
+                    spots[key] = None           # both empty = not set
+        save_stats()
+        self.update_requirements()
+
+    def close(self):
+        self.commit_spots()
+        self.destroy()
+
+
 class ConfigEditorWindow(tk.Toplevel):
-    """Every timing of the routine, one part at a time: Movement + the three ability configs.
-    Pick the part in the dropdown at the top and change a value - it is checked and saved at once
-    (settings["timings"]); the macro reads it the next time it needs it."""
+    """Edit only the selected built-in macro and its relevant shared controls.
+
+    Values are saved atomically in config.json under the original per-family
+    sections, preserving all existing user overrides and backward compatibility.
+    """
 
     def __init__(self, settings_win):
         super().__init__(settings_win)
-        self.withdraw()
+        prepare_window(self)
         self.sw = settings_win
-        self.section = (settings["config_section"] if settings.get("config_section") in CONFIG_SECTIONS
-                        else CONFIG_SECTIONS[0])      # opens on the part picked last time
+        selected = settings_win.v_family.get()
+        self.family = selected if selected in FAMILIES else settings["family"]
+        self.available_sections = edit_config_sections(self.family)
+        self.section = self.family  # always open on the selected macro, never a stale Movement tab
         self.rows_section = self.section   # the part the boxes on screen belong to
         self.rows = {}              # key -> (spec, [StringVar], [Entry], name label)
         self.save_job = None
         self.say_job = None
-        self.title(f"{APP_NAME} - edit configs")
+        self.title(f"{APP_NAME} - edit configs - {FAMILY_LABELS.get(self.family, self.family)}")
         try:
             self.iconbitmap(asset_path(ICON_FILE))
         except (tk.TclError, OSError):
@@ -5704,16 +10890,16 @@ class ConfigEditorWindow(tk.Toplevel):
         # bottom bar first, so it always stays visible
         bottom = tk.Frame(self, bg=App.BG)
         bottom.pack(side="bottom", fill="x", padx=18, pady=(8, 14))
-        self.sw.flat_button(bottom, "Reset this config", self.reset_section).pack(side="left")
+        self.sw.flat_button(bottom, "Reset shown settings", self.reset_section).pack(side="left")
         self.note = tk.Label(bottom, text="", font=(App.FONT, 9), fg=App.SUB, bg=App.BG,
                              anchor="w", justify="left", wraplength=280)
         self.note.pack(side="left", padx=(12, 0), fill="x", expand=True)
 
         top = tk.Frame(self, bg=App.BG)
         top.pack(side="top", fill="x", padx=18, pady=(14, 0))
-        tk.Label(top, text="CONFIG", font=(App.FONT, 8, "bold"), fg=App.SUB, bg=App.BG,
-                 anchor="w").pack(fill="x")
-        items = [(sec, sec, CONFIG_BADGES[sec], None) for sec in CONFIG_SECTIONS]
+        tk.Label(top, text="SETTINGS FOR SELECTED MACRO", font=(App.FONT, 8, "bold"),
+                 fg=App.SUB, bg=App.BG, anchor="w").pack(fill="x")
+        items = edit_config_menu_items(self.family)
         self.dd = ModernDropdown(top, items, self.section, self.on_pick)
         self.dd.pack(fill="x", pady=(4, 0))
         self.info = tk.Label(self, text="", font=(App.FONT, 9), fg=App.SUB, bg=App.BG,
@@ -5740,7 +10926,7 @@ class ConfigEditorWindow(tk.Toplevel):
         x, y = settings_win.winfo_x() + 30, settings_win.winfo_y() + 30
         self.geometry(f"520x640+{x}+{y}")
         style_title_bar(self, App.BG)
-        self.deiconify()
+        reveal_window(self)
         self.lift()
         self.focus_force()
 
@@ -5754,13 +10940,16 @@ class ConfigEditorWindow(tk.Toplevel):
         for child in self.inner.winfo_children():
             child.destroy()
         self.rows_section = self.section
-        active = " (active now)" if self.section == settings["family"] else ""
-        self.info.configure(text=CONFIG_INFO[self.section] + active)
+        if self.section == "Movement":
+            description = ("Only the shared inputs used by " +
+                           FAMILY_LABELS.get(self.family, self.family) +
+                           ". Saved changes affect only this macro; legacy global values "
+                           "are preserved as fallbacks.")
+        else:
+            description = CONFIG_INFO[self.family] + "  Changes are saved automatically in config.json."
+        self.info.configure(text=description)
         group, card = None, None
-        hidden = CONFIG_HIDDEN.get(self.section, ())
-        for spec in CONFIG_FIELDS[self.section]:
-            if spec[0] in hidden:
-                continue
+        for spec in edit_config_fields(self.family, self.section):
             if spec[6] != group:
                 group = spec[6]
                 card = self._card(group)
@@ -5786,7 +10975,9 @@ class ConfigEditorWindow(tk.Toplevel):
         row.pack(fill="x", pady=(0, 10))
         line = tk.Frame(row, bg=App.CARD)
         line.pack(fill="x")
-        edited = key in settings["timings"].get(self.section, {})
+        edited = (key in settings["timings"].get(self.family, {}).get("_movement", {})
+                  if self.section == "Movement" else
+                  key in settings["timings"].get(self.section, {}))
         name = tk.Label(line, text=label, font=(App.FONT, 10), fg=App.ACCENT if edited else App.TEXT,
                         bg=App.CARD, anchor="w", cursor="hand2")
         name.pack(side="left")
@@ -5808,7 +10999,9 @@ class ConfigEditorWindow(tk.Toplevel):
         row.pack(fill="x", pady=(0, 10))
         line = tk.Frame(row, bg=App.CARD)
         line.pack(fill="x")
-        edited = key in settings["timings"].get(self.section, {})
+        edited = (key in settings["timings"].get(self.family, {}).get("_movement", {})
+                  if self.section == "Movement" else
+                  key in settings["timings"].get(self.section, {}))
         name = tk.Label(line, text=label, font=(App.FONT, 10), fg=App.ACCENT if edited else App.TEXT,
                         bg=App.CARD, anchor="w")
         name.pack(side="left")
@@ -5883,7 +11076,9 @@ class ConfigEditorWindow(tk.Toplevel):
         row.pack(fill="x", pady=(0, 10))
         line = tk.Frame(row, bg=App.CARD)
         line.pack(fill="x")
-        edited = key in settings["timings"].get(self.section, {})
+        edited = (key in settings["timings"].get(self.family, {}).get("_movement", {})
+                  if self.section == "Movement" else
+                  key in settings["timings"].get(self.section, {}))
         name = tk.Label(line, text=label, font=(App.FONT, 10), fg=App.ACCENT if edited else App.TEXT,
                         bg=App.CARD, anchor="w")
         name.pack(side="left")
@@ -5931,7 +11126,12 @@ class ConfigEditorWindow(tk.Toplevel):
         if not self.rows:
             return
         section = self.rows_section
-        store = settings["timings"].setdefault(section, {})
+        if section == "Movement":
+            family_store = settings["timings"].setdefault(self.family, {})
+            store = family_store.setdefault("_movement", {})
+        else:
+            family_store = None
+            store = settings["timings"].setdefault(section, {})
         bad = 0
         try:
             for key, (spec, vars_, entries, name) in self.rows.items():
@@ -5949,8 +11149,10 @@ class ConfigEditorWindow(tk.Toplevel):
                     continue
                 for e in entries:
                     e.configure(highlightbackground=App.BORDER, highlightcolor=App.ACCENT)
-                default = spec[3]
-                same = (tuple(val) == tuple(default)) if spec[2] == "range" else val == default   # spot: None = not set
+                default = (settings["timings"].get("Movement", {}).get(key, spec[3])
+                           if section == "Movement" else spec[3])
+                same = ((tuple(val) == tuple(default)) if spec[2] == "range"
+                        else val == default)
                 if same:
                     store.pop(key, None)
                 else:
@@ -5958,7 +11160,12 @@ class ConfigEditorWindow(tk.Toplevel):
                 name.configure(fg=App.ACCENT if key in store else App.TEXT)
         except tk.TclError:
             return                       # the window is closing
-        if not store:
+        if section == "Movement":
+            if not store:
+                family_store.pop("_movement", None)
+            if not family_store:
+                settings["timings"].pop(self.family, None)
+        elif not store:
             settings["timings"].pop(section, None)
         save_timings()
         if bad:
@@ -5966,27 +11173,49 @@ class ConfigEditorWindow(tk.Toplevel):
                      error=True)
 
     def on_pick(self, section):
-        if section == self.section:
+        if section == self.section or section not in self.available_sections:
             return
         self.commit()
         self.section = section
-        settings["config_section"] = section
-        save_stats()                    # remembered for the next time (also after a restart)
+        self.build_rows()
+
+    def set_family(self, family):
+        """Follow Settings > Configs > Abilities without losing unsaved edits."""
+        if family not in FAMILIES or family == self.family:
+            return
+        self.commit()
+        self.family = family
+        self.title(f"{APP_NAME} - edit configs - {FAMILY_LABELS.get(family, family)}")
+        self.available_sections = edit_config_sections(family)
+        self.section = family
+        self.dd.close_popup()
+        self.dd.set_items(edit_config_menu_items(family), value=family, notify=False)
         self.build_rows()
 
     def reset_section(self):
         if self.save_job:
             self.after_cancel(self.save_job)
             self.save_job = None
-        keep = {k: v for k, v in settings["timings"].get(self.section, {}).items()
-                if k in CONFIG_HIDDEN.get(self.section, ())}    # chest spots are not reset here
-        if keep:
-            settings["timings"][self.section] = keep
+        # Clear only the displayed keys for the selected family.
+        if self.section == "Movement":
+            family_store = settings["timings"].get(self.family, {})
+            store = family_store.get("_movement", {})
+            for key in self.rows:
+                store.pop(key, None)
+            if not store:
+                family_store.pop("_movement", None)
+            if not family_store:
+                settings["timings"].pop(self.family, None)
         else:
-            settings["timings"].pop(self.section, None)
+            store = settings["timings"].get(self.section, {})
+            for key in self.rows:
+                store.pop(key, None)
+            if not store:
+                settings["timings"].pop(self.section, None)
         save_timings()
         self.build_rows()
-        self.say(f"{self.section}: back to the defaults.", good=True)
+        self.say(f"{FAMILY_LABELS.get(self.section, 'Shared controls')}: shown settings reset.",
+                 good=True)
 
     def say(self, msg, error=False, good=False):
         self.note.configure(text=msg, fg="#f87171" if error else "#34d399" if good else App.SUB)
@@ -5996,11 +11225,11 @@ class ConfigEditorWindow(tk.Toplevel):
 
     def close(self):
         self.commit()
-        self.destroy()
+        fade_close(self)
 
 
 class GuideWindow(tk.Toplevel):
-    """Guide: shows guides/build_<name>.md of the picked config (Blood Awakening -> build_blood.md,
+    """Guide: shows guides/build_<name>.txt of the picked config (Blood Awakening -> build_blood.txt,
     see GUIDE_NAMES). No tabs, just the one page.
     Markdown: # headings, **bold**, *italic*, `code`, ``` blocks, - / 1. lists, > quotes, ---, [links](url),
     and pictures on their own line: ![text](images/pic.png) - the path is inside the guides folder
@@ -6008,10 +11237,10 @@ class GuideWindow(tk.Toplevel):
 
     def __init__(self, settings_win, family):
         super().__init__(settings_win)
-        self.withdraw()
+        prepare_window(self)
         self.sw = settings_win
         self.family = family
-        self.title(f"{APP_NAME} - guide - {family}")
+        self.title(f"{APP_NAME} - guide - {FAMILY_LABELS.get(family, family)}")
         try:
             self.iconbitmap(asset_path(ICON_FILE))
         except (tk.TclError, OSError):
@@ -6020,7 +11249,7 @@ class GuideWindow(tk.Toplevel):
         self.transient(settings_win)
         self.attributes("-topmost", True)
         self.minsize(460, 400)
-        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        self.protocol("WM_DELETE_WINDOW", lambda: fade_close(self))
 
         wrap = tk.Frame(self, bg=App.CARD, highlightbackground=App.BORDER,
                         highlightthickness=App.CARD_BW)
@@ -6046,7 +11275,7 @@ class GuideWindow(tk.Toplevel):
         self.geometry(f"560x640+{settings_win.winfo_x() + 40}+{settings_win.winfo_y() + 40}")
         self.load()
         style_title_bar(self, App.BG)
-        self.deiconify()
+        reveal_window(self)
         self.lift()
         self.focus_force()
 
@@ -6071,12 +11300,12 @@ class GuideWindow(tk.Toplevel):
 
     def set_family(self, family):
         self.family = family
-        self.title(f"{APP_NAME} - guide - {family}")
+        self.title(f"{APP_NAME} - guide - {FAMILY_LABELS.get(family, family)}")
         self.load()
 
     def load(self):
         name = GUIDE_NAMES.get(self.family, re.sub(r"\W+", "_", self.family.lower()))
-        fname = f"build_{name}.md"
+        fname = "custom_macro_commands.txt" if self.family == "__custom_macro__" else f"build_{name}.txt"
         try:
             with open(guide_path(fname), "r", encoding="utf-8-sig") as fh:
                 md = fh.read()
@@ -6095,9 +11324,39 @@ class GuideWindow(tk.Toplevel):
             t.insert("end", f"Nothing here yet.\n", "h3")
             t.insert("end", f"Add {GUIDE_FOLDER}/{fname} next to the macro and it shows up here.", "dim")
         else:
+            # The lightweight guide renderer supports headings, inline code and bullets,
+            # but not Markdown tables. Turn command/reference tables into readable entries.
+            if self.family == "__custom_macro__":
+                md = self._readable_command_tables(md)
             self.render(md)
         t.configure(state="disabled")
         t.yview_moveto(0)
+
+    @staticmethod
+    def _readable_command_tables(markdown):
+        """Convert two-column Markdown command tables to command + explanation bullets.
+
+        This prevents raw | and --- markers appearing in the GuideWindow renderer.
+        Preserve code formatting and every command entry from the source guide.
+        """
+        out, in_table = [], False
+        for line in markdown.splitlines():
+            strip = line.strip()
+            if strip.startswith("|") and strip.endswith("|"):
+                cells = [cell.strip() for cell in strip.strip("|").split("|")]
+                if len(cells) == 2:
+                    if all(re.fullmatch(r":?-{2,}:?", cell) for cell in cells):
+                        in_table = True
+                        continue
+                    if cells[0].casefold() == "command":
+                        in_table = True
+                        continue
+                    if in_table:
+                        out.append(f"- {cells[0]} — {cells[1]}")
+                        continue
+            in_table = False
+            out.append(line)
+        return "\n".join(out)
 
     # ----- pictures -----
     def on_resize(self):
@@ -6269,12 +11528,14 @@ ASSET_LIST = (
     ("Retry button text", TEMPLATE_FILE),
     ("Retry button (whole)", ALT_RETRY_FILE),
     ("Mission start (ability 2 icon)", START_TEMPLATE_FILE),
+    ("Attack Titan Raid: Acoustic Shells (Skill 2)", ATTACK_START_FILE),
     ("Shiki ability 4 icon", SHIKI_ABILITY4_FILE),
     ("Grabbed text", GRAB_FILE),
-    ("Female Raid: skip button", RAID_SKIP_FILE),
+    ("Female Raid / Attack Titan Fritz: skip button", RAID_SKIP_FILE),
     ("Female Raid: raid start", RAID_START_FILE),
     ("Female Raid: finish button", RAID_FINISH_FILE),
-    ("Female Raid: heatwave", RAID_HEATWAVE_FILE),
+    ("Female Raid / Attack Titan: heatwave", RAID_HEATWAVE_FILE),
+    ("Attack Titan Raid Fritz: CHESTS", ATTACK_FINISH_FILE),
     ("Result: Completed", RESULT_FILES["completed"]),
     ("Result: Failed", RESULT_FILES["failed"]),
     ("Loot: Scroll", LOOT_FILES["scroll"]),
@@ -6283,7 +11544,8 @@ ASSET_LIST = (
     ("Loot: Offence fragment", LOOT_FILES["offence"]),
     ("Loot: Support fragment", LOOT_FILES["support"]),
     ("Loot: Vessel (Female Raid)", LOOT_FILES["vessel"]),
-    ("Loot: Attack serum", LOOT_FILES["attack_serum"]),
+    ("Loot: Primordial Devil (Attack Titan Raids)", LOOT_FILES["attack_vessel"]),
+    ("Loot: Attack Serum", LOOT_FILES["attack_serum"]),
     ("Loot: Armor serum", LOOT_FILES["armor_serum"]),
     ("Loot: Female serum", LOOT_FILES["female_serum"]),
     ("Loot: Beast serum", LOOT_FILES["beast_serum"]),
@@ -6411,6 +11673,12 @@ def asset_test_entries():
                 if not override_path(name) and 0 <= x0 < x1 <= tpls[quality].shape[1]:
                     tpls[quality + " word"] = tpls[quality][:, x0:x1]
         entries.append((filename, tpls, thr, mask, kind))
+    for name, _users in macro_picture_list():          # the pictures of custom macros (Macros tab)
+        try:
+            tpls = {"normal": load_template(name)}
+        except FileNotFoundError:
+            tpls = {}
+        entries.append((name, tpls, CUSTOM_IMG_THRESHOLD, None, None))
     return entries
 
 
@@ -6461,7 +11729,7 @@ class AssetOverrideWindow(tk.Toplevel):
 
     def __init__(self, settings_win):
         super().__init__(settings_win)
-        self.withdraw()
+        prepare_window(self)
         self.sw = settings_win
         self.thumbs = []                  # keep the PhotoImages alive
         self.testing = False              # the Test button: look for the pictures on screen, live
@@ -6471,7 +11739,7 @@ class AssetOverrideWindow(tk.Toplevel):
         self.test_stop = None
         self.test_job = None
         self.indicators = {}              # file name -> the little "Seen / Not seen" label
-        self.title(f"{APP_NAME} - assets")
+        self.title(f"{APP_NAME} - fix image detection")
         try:
             self.iconbitmap(asset_path(ICON_FILE))
         except (tk.TclError, OSError):
@@ -6497,12 +11765,12 @@ class AssetOverrideWindow(tk.Toplevel):
                  font=(App.FONT, 9), fg=App.SUB, bg=App.BG,
                  anchor="w").pack(side="top", fill="x", padx=18, pady=(0, 8))
 
-        # tabs: UI (everything but the loot) | Loot (the loot pictures)
+        # tabs: UI (everything but the loot) | Loot (the loot pictures) | Macros (pictures of custom macros)
         self.tab = "UI"
         tabs = tk.Frame(self, bg=App.BG)
         tabs.pack(side="top", fill="x", padx=18, pady=(0, 8))
         self.tab_btns = {}
-        for name in ("UI", "Loot"):
+        for name in ("UI", "Loot", "Macros"):
             lb = tk.Label(tabs, text=name, font=(App.FONT, 10, "bold"), padx=18, pady=5,
                           cursor="hand2")
             lb.pack(side="left", padx=(0, 6))
@@ -6530,8 +11798,8 @@ class AssetOverrideWindow(tk.Toplevel):
         x, y = settings_win.winfo_x() + 30, settings_win.winfo_y() + 30
         self.geometry(f"560x560+{x}+{y}")
         style_title_bar(self, App.BG)
-        self.protocol("WM_DELETE_WINDOW", self.destroy)
-        self.deiconify()
+        self.protocol("WM_DELETE_WINDOW", lambda: fade_close(self))
+        reveal_window(self)
         self.lift()
         self.focus_force()
 
@@ -6544,8 +11812,8 @@ class AssetOverrideWindow(tk.Toplevel):
             lb.configure(bg=App.ACCENT_BG if on else App.CARD,
                          fg="#ffffff" if on else App.SUB)
 
-    def set_tab(self, name):
-        if name == self.tab:
+    def set_tab(self, name, force=False):
+        if name == self.tab and not force:
             return
         self.tab = name
         self._style_tabs()
@@ -6578,14 +11846,43 @@ class AssetOverrideWindow(tk.Toplevel):
         self.thumbs = []
         self.indicators = {}
         self.test_dirty = True            # (a picture may have changed: the test loads them again)
-        for label, filename in ASSET_LIST:
-            if label.startswith("Loot:") == (self.tab == "Loot"):
-                self._row(label, filename)
+        if self.tab == "Macros":
+            self._macro_head()
+            pics = macro_picture_list()
+            for name, users in pics:
+                self._row(name, name, users=users)
+            if not pics:
+                tk.Label(self.inner, text="No macro pictures yet. Use 'find' / 'imgclick' in a custom "
+                                          "macro, or press Add picture.", font=(App.FONT, 9),
+                         fg=App.SUB, bg=App.BG, anchor="w", justify="left",
+                         wraplength=440).pack(fill="x", pady=(8, 0))
+        else:
+            for label, filename in ASSET_LIST:
+                if label.startswith("Loot:") == (self.tab == "Loot"):
+                    self._row(label, filename)
         self.update_idletasks()
         self.canvas.yview_moveto(top)
 
-    def _row(self, label, filename):
+    def _macro_head(self):
+        """Top of the Macros tab: what it is for + the buttons that add a new picture."""
+        head = tk.Frame(self.inner, bg=App.BG)
+        head.pack(fill="x", pady=(0, 4))
+        tk.Label(head, text="Pictures your custom macros look for (find / imgclick). They live in "
+                            "asset_override: send them along with the .tbmacro file, and whoever "
+                            "runs the macro sees them here.",
+                 font=(App.FONT, 9), fg=App.SUB, bg=App.BG, anchor="w", justify="left",
+                 wraplength=440).pack(fill="x", pady=(0, 6))
+        btns = tk.Frame(head, bg=App.BG)
+        btns.pack(fill="x")
+        self.sw.flat_button(btns, "Add picture", self.add_image).pack(side="left")
+        self.sw.flat_button(btns, "Paste as new", self.paste_new_image).pack(side="left", padx=(6, 0))
+
+    def _row(self, label, filename, users=None):
+        """users = None for the macro's own pictures; a list (maybe empty) of macro names for a row
+        of the Macros tab."""
         photo, custom = self._thumb(filename)
+        in_macro_tab = users is not None
+        has_builtin = os.path.isfile(asset_path(filename))
         row = tk.Frame(self.inner, bg=App.CARD, highlightbackground=App.BORDER,
                        highlightthickness=App.CARD_BW)
         row.pack(fill="x", pady=3)
@@ -6609,8 +11906,18 @@ class AssetOverrideWindow(tk.Toplevel):
             ind.pack(side="left", padx=(10, 0))
             self.indicators[filename] = ind
             self._paint(filename, ind)
-        tk.Label(info, text="Your picture" if custom else "Built-in", font=(App.FONT, 8),
-                 fg=App.ACCENT if custom else App.SUB, bg=App.CARD, anchor="w").pack(fill="x")
+        if in_macro_tab:
+            state_txt = ("Your picture" if custom else "Built-in" if has_builtin
+                         else "Missing - add your picture")
+            if users:
+                state_txt += "  -  used by: " + ", ".join(users)
+            bad = not custom and not has_builtin
+            tk.Label(info, text=state_txt, font=(App.FONT, 8), wraplength=230, justify="left",
+                     fg="#f87171" if bad else App.ACCENT if custom else App.SUB,
+                     bg=App.CARD, anchor="w").pack(fill="x")
+        else:
+            tk.Label(info, text="Your picture" if custom else "Built-in", font=(App.FONT, 8),
+                     fg=App.ACCENT if custom else App.SUB, bg=App.CARD, anchor="w").pack(fill="x")
         btns = tk.Frame(row, bg=App.CARD)
         btns.pack(side="right", padx=10)
         top_btns = tk.Frame(btns, bg=App.CARD)
@@ -6621,8 +11928,8 @@ class AssetOverrideWindow(tk.Toplevel):
                             lambda f=filename, l=label: self.paste(f, l)).pack(side="left",
                                                                                padx=(4, 0))
         if custom:
-            reset = tk.Label(btns, text="Reset", font=(App.FONT, 8), fg=App.SUB, bg=App.CARD,
-                             cursor="hand2")
+            reset = tk.Label(btns, text="Reset" if (has_builtin or not in_macro_tab) else "Remove",
+                             font=(App.FONT, 8), fg=App.SUB, bg=App.CARD, cursor="hand2")
             reset.pack(pady=(4, 0))
             reset.bind("<Button-1>", lambda _e, f=filename, l=label: self.reset(f, l))
             reset.bind("<Enter>", lambda _e, w=reset: w.configure(fg=App.TEXT))
@@ -6704,7 +12011,7 @@ class AssetOverrideWindow(tk.Toplevel):
             log(f"Asset test: could not read the screen ({e})")
             return
         try:
-            mon = sct.monitors[MONITOR_INDEX]
+            mon = pick_monitor(sct.monitors)
             scale = FORCE_SCALE if FORCE_SCALE else mon["height"] / BASE_HEIGHT
             entries, was_seen = None, set()
             while not stop.is_set():
@@ -6775,95 +12082,70 @@ class AssetOverrideWindow(tk.Toplevel):
         else:
             self.note.configure(text="Could not save the picture.", fg="#f87171")
 
+    def _ask_image_name(self, default):
+        """Ask what a new macro picture is called (the name a script uses: find NAME). None = cancelled."""
+        raw = simpledialog.askstring("thebums", "Name of this picture (your macro uses it like: "
+                                             "find NAME).", initialvalue=default, parent=self)
+        self.lift()
+        if not raw:
+            return None
+        name = safe_image_name(raw)
+        if not name:
+            self.note.configure(text="That is not a usable name.", fg="#f87171")
+            return None
+        if name in {f for _l, f in ASSET_LIST}:
+            self.note.configure(text=f"{name} is one of the macro's own pictures - pick another name.",
+                                fg="#f87171")
+            return None
+        if override_path(name) and not messagebox.askyesno(
+                "thebums", f"{name} already exists. Replace it?", parent=self):
+            self.lift()
+            return None
+        self.lift()
+        return name
+
+    def add_image(self):
+        """Macros tab > Add picture: pick a file, name it, it is saved into asset_override."""
+        path = filedialog.askopenfilename(
+            parent=self, title="Pick a picture for your macro",
+            filetypes=[("Pictures", "*.png *.jpg *.jpeg *.bmp"), ("All files", "*.*")])
+        self.lift()
+        if not path:
+            return
+        name = self._ask_image_name(safe_image_name(os.path.basename(path)) or "picture.png")
+        if not name:
+            return
+        if import_override_picture(path, name):
+            self.note.configure(text=f"{name} added - use it as: find {name}", fg="#34d399")
+            self.refresh()
+        else:
+            self.note.configure(text="Could not read that picture.", fg="#f87171")
+
+    def paste_new_image(self):
+        """Macros tab > Paste as new: the screenshot on the clipboard becomes a new macro picture."""
+        img = clipboard_image()
+        if img is None:
+            self.note.configure(text="No screenshot on the clipboard. Take one first "
+                                     "(Win+Shift+S), then press Paste as new.", fg="#f87171")
+            return
+        name = self._ask_image_name("picture.png")
+        if not name:
+            return
+        if save_override_image(img, name):
+            self.note.configure(text=f"{name} added - use it as: find {name}", fg="#34d399")
+            self.refresh()
+        else:
+            self.note.configure(text="Could not save the picture.", fg="#f87171")
+
     def reset(self, filename, label):
         if remove_override_picture(filename):
-            self.note.configure(text=f"{label}: back to the built-in picture.", fg="#34d399")
+            if os.path.isfile(asset_path(filename)) or not self.tab == "Macros":
+                self.note.configure(text=f"{label}: back to the built-in picture.", fg="#34d399")
+            else:
+                self.note.configure(text=f"{label}: picture removed.", fg="#34d399")
             self.refresh()
         else:
             self.note.configure(text="Could not remove your picture.", fg="#f87171")
-
-
-class ChangelogWindow(tk.Toplevel):
-    """Settings footer > Changelog: change.md in a scrollable, read-only window (# / ## / ###
-    headings and - bullets are styled, # and ## get a ridge line under them, **bold** and `code`
-    marks are dropped)."""
-
-    def __init__(self, app):
-        super().__init__(app.root)
-        self.withdraw()
-        self.title(f"{APP_NAME} - changelog")
-        try:
-            self.iconbitmap(asset_path(ICON_FILE))
-        except (tk.TclError, OSError):
-            pass
-        self.configure(bg=App.BG)
-        self.transient(app.root)
-        self.attributes("-topmost", True)
-        self.minsize(380, 300)
-
-        tk.Label(self, text="Changelog", font=(App.FONT, 13, "bold"), fg=App.TEXT, bg=App.BG,
-                 anchor="w").pack(side="top", fill="x", padx=18, pady=(14, 8))
-        wrap = tk.Frame(self, bg=App.BG)
-        wrap.pack(side="top", fill="both", expand=True, padx=(18, 8), pady=(0, 14))
-        self.text = tk.Text(wrap, wrap="word", bg=App.LOGBG, fg=App.TEXT, relief="flat",
-                            font=(App.FONT, 10), padx=14, pady=10, bd=0, highlightthickness=1,
-                            highlightbackground=App.BORDER, cursor="arrow", spacing3=2)
-        sb = ttk.Scrollbar(wrap, command=self.text.yview)
-        self.text.configure(yscrollcommand=sb.set)
-        sb.pack(side="right", fill="y")
-        self.text.pack(side="left", fill="both", expand=True)
-        self.text.tag_configure("h1", font=(App.FONT, 15, "bold"), foreground=App.TEXT,
-                                spacing1=4, spacing3=6)
-        self.text.tag_configure("h2", font=(App.FONT, 12, "bold"), foreground=App.ACCENT_TEXT,
-                                spacing1=12, spacing3=4)
-        self.text.tag_configure("h3", font=(App.FONT, 10, "bold"), foreground=App.TEXT,
-                                spacing1=8, spacing3=2)
-        self.text.tag_configure("bullet", lmargin1=14, lmargin2=30)
-        self.text.tag_configure("rule", font=(App.FONT, 2), spacing1=0, spacing3=6)
-        self.rules = []          # the ridges under # and ## headings (resized with the window)
-        self.text.bind("<Configure>", self._fit_rules)
-        self.render(changelog_text())
-        self.text.configure(state="disabled")
-
-        x, y = app.root.winfo_x() + 30, app.root.winfo_y() + 30
-        self.geometry(f"520x560+{x}+{y}")
-        style_title_bar(self, App.BG)
-        self.deiconify()
-        self.lift()
-        self.focus_force()
-
-    def _fit_rules(self, _e=None):
-        width = max(40, self.text.winfo_width() - 2 * 14 - 8)
-        for rule in self.rules:
-            rule.configure(width=width)
-
-    def _add_rule(self, color):
-        """A thin line under a heading (like on GitHub)."""
-        rule = tk.Frame(self.text, bg=color, height=1, width=400)
-        start = self.text.index("end-1c")
-        self.text.window_create("end-1c", window=rule)
-        self.text.insert("end-1c", "\n")
-        self.text.tag_add("rule", start, "end-1c")
-        self.rules.append(rule)
-
-    def render(self, md):
-        for raw in md.replace("\r\n", "\n").split("\n"):
-            line = raw.rstrip()
-            tag = ""
-            if line.startswith("### "):
-                tag, line = "h3", line[4:]
-            elif line.startswith("## "):
-                tag, line = "h2", line[3:]
-            elif line.startswith("# "):
-                tag, line = "h1", line[2:]
-            elif line.lstrip().startswith(("- ", "* ")):
-                tag, line = "bullet", "\u2022  " + line.lstrip()[2:]
-            line = line.replace("**", "").replace("`", "")
-            self.text.insert("end", line + "\n", tag)
-            if tag == "h1":
-                self._add_rule(App.FIELD_EDGE)
-            elif tag == "h2":
-                self._add_rule(App.BORDER)
 
 
 def apply_theme(name):
@@ -6898,9 +12180,11 @@ def apply_theme(name):
 def main():
     load_stats()          # stats + settings (saved keybinds, webhook, family)
     load_timings()        # config.json: the timings changed in Edit configs
-    ensure_override_dir() # Documents\\The Bums\\asset_override: users drop their own pictures here
+    ensure_override_dir() # Documents\\thebums Macro\\asset_override: users drop their own pictures here
+    register_thebums_file_type()   # Windows: the lambda icon on .tbmacro files (no admin needed)
     apply_settings()
     register_hotkeys()
+    bot_restart()         # Discord bot mode: start listening for !commands
     root = tk.Tk()
     App(root)
     push_stats(save=False)  # show the saved numbers right away
@@ -6925,12 +12209,11 @@ def report_crash():
         except Exception:  # noqa: BLE001
             pass
 
-
 if __name__ == "__main__":
     try:
         main()
     except SystemExit:
         raise
-    except Exception:  # noqa: BLE001
+    except Exception:
         report_crash()
         raise

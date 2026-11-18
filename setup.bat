@@ -24,5 +24,5 @@ if errorlevel 1 (
     exit /b 1
 )
 echo.
-echo Done. Double-click run.bat to start The Bums.
+echo Done. Double-click run.bat to start The Bums Macro.
 pause
