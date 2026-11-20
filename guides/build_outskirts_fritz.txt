@@ -1,0 +1,43 @@
+# Outskirts Fritz Build
+
+## Skill Layouts
+
+**Before Shift**
+
+![Before Shift](images/layout_outskirts_fritz_before.png)
+
+**After Shift - Colossal Titan**
+
+![After Shift](images/layout_attack_after.png)
+
+## Family and Skill Tree
+- **Required Family: Fritz**
+- **Skill Tree: Right - Right - Left**
+
+## Perks
+- `Kengo` / `Godforged`
+- `Immortal`
+- `Founder's Blessing` / `Avatar of Ymir`
+- `Munition Masters`
+
+Note: Either `Godforged` or `Avatar of Ymir` is required.
+
+### Avoid
+- Adaptation
+- Tatsujin
+- Wings of Freedom
+
+## Artifacts
+- `Colossal Scars`: `TS Dmg%`
+- `Cloak`: `TS Dmg%`
+
+## Memories
+- `Apotheosis`
+- `Afterimages`
+
+### Optional
+- Any legendary memories
+- Any memories that help with damage
+
+### Avoid
+- Flashsteps
