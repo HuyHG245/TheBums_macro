@@ -9,7 +9,7 @@ rem Requires Administrator elevation to interact with an elevated Roblox window.
 rem Windows will show a UAC consent prompt on every new launch; this is NOT an elevation bypass.
 set "ADMIN_FLAG=--uac-admin"
 
-rem Default: ONE file, TheBums.exe. Run "build.bat onedir" to get a folder instead:
+rem Default: ONE file, TheBumsMacro.exe. Run "build.bat onedir" to get a folder instead:
 rem it starts faster and antivirus programs complain less about it.
 set "MODE=--onefile"
 if /i "%~1"=="onedir" set "MODE=--onedir"
@@ -62,7 +62,7 @@ if not errorlevel 1 (
 echo.
 echo Building - this takes a few minutes...
 "%PY%" -m PyInstaller --noconfirm --clean %MODE% --windowed --noupx %ADMIN_FLAG% ^
-    --name TheBums ^
+    --name TheBumsMacro ^
     --icon "image\thebums.ico" ^
     --version-file "version_info.txt" ^
     --add-data "image;image" ^
@@ -72,14 +72,14 @@ echo Building - this takes a few minutes...
 if errorlevel 1 goto :fail
 
 if exist "build" rmdir /s /q "build"
-if exist "TheBums.spec" del /q "TheBums.spec"
+if exist "TheBumsMacro.spec" del /q "TheBumsMacro.spec"
 
 echo.
 if /i "%~1"=="onedir" (
-    echo Done. Run dist\TheBums\TheBums.exe - keep that whole folder together.
+    echo Done. Run dist\TheBumsMacro\TheBumsMacro.exe - keep that whole folder together.
 ) else (
-    copy /y "dist\TheBums.exe" "TheBums.exe" >nul
-    echo Done. Your program is TheBums.exe in this folder, a copy is in dist\.
+    copy /y "dist\TheBumsMacro.exe" "TheBumsMacro.exe" >nul
+    echo Done. Your program is TheBumsMacro.exe in this folder, a copy is in dist\.
 )
 echo There is no console window behind it. Settings and stats are saved in Documents\The Bums.
 echo.

@@ -131,3 +131,24 @@ replace the built-in Raid routine without adding game-state checks.
 - It does **not** inject into Roblox or read game memory.
 - Keep Roblox focused while testing a new custom macro.
 - Use short waits first, then tune timings gradually.
+
+
+## Edit Macro Commands (built-in macros, Beta)
+
+Open **Settings > Configs**, choose a built-in macro, and select **Edit macro commands**.
+The preview lists executable pseudo-script commands where possible. `native ACTION`
+represents an original built-in action that depends on game-state detection.
+
+- **Check** validates the command syntax.
+- **Save commands** creates an override in your Documents data folder. It applies on the next Start.
+- **Reset to original** deletes the override and restores the original built-in Python routine.
+- Use **Edit configs** for timings inside `native` operations, such as the initial dash spam, camera
+  movement, Shift logic, chest handling, and Heatwave state machine.
+- Attack Titan Fritz and Blood Awakening Raid opening steps are editable as `dash` / `press` / `wait`.
+  Keep `native attack_raid_init` at the start and `native attack_shift_and_colossal` at the end.
+- Female Raid keeps a required native block; extra commands can be added before it.
+- All native combat blocks retain their Heatwave / chest / Retry recognition.
+- For a built-in macro, `native` commands work only inside its own command editor; they are
+  deliberately unavailable to standalone custom macros.
+- **For Outskirts Fritz:** `native look_down` is followed by `wait 1.5`, then `press ability1`,
+  then `wait 1` and `spam ability4 ...`. Increase `wait 1.5` if Skill 1 is still ignored.

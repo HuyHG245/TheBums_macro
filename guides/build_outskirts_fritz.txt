@@ -1,0 +1,53 @@
+# Outskirts Fritz Build
+
+## Skill Layout (before Shift)
+![image](images/layout_outskirts_fritz_before.png)
+
+## Macro Timing (Outskirts Fritz)
+
+The opening follows Universal up to **Skill 3**. After Skill 3:
+
+1. **Camera Down (Universal animation wait)**: Ctrl, drag the camera downward for **2 seconds** by default, then Ctrl again. This preserves Universal's wait for Skill 3 to finish.
+2. **Skill 1**: press once after the camera-down wait.
+3. **Wait 1 second** (editable in Outskirts Fritz > Edit Configs).
+4. **Skill 4**: use Universal's Ability 4 spam duration and interval.
+5. Continue with Universal's existing **Shift and post-Shift** routine.
+
+To change camera timing, open **Settings > Configs > Outskirts Fritz > Edit Configs** and edit **Skill 3 animation / Camera down time** or **Camera down pixels per step**. These values are independent of the Universal macro settings.
+
+## After Shift
+- Use **Colossal Titan**.
+- After Shift, the combat flow is the **same idea as Universal**.
+
+## Family and Skill Tree
+- Fritz > Reiss > All
+- right - right - left
+- Do not unlock the Fritz family skill tree.
+
+## Perks
+- `Kengo` / `Godforged`
+- `Immortal`
+- `Founder's Blessing` / `Avatar of Ymir`
+- `Munition Masters`
+
+Note: Either `Godforged` or `Avatar of Ymir` is required.
+
+### Avoid
+- Adaptation
+- Tatsujin
+- Wings of Freedom
+
+## Artifacts
+- `Colossal Scars`: `TS Dmg%`
+- `Cloak`: `TS Dmg%`
+
+## Memories
+- `Apotheosis`
+- `Afterimages`
+
+### Optional
+- Any legendary memories
+- Any memories that help with damage
+
+### Avoid
+- Flashsteps
