@@ -1,6 +1,6 @@
 # The Bums Macro
 
-**Release:** `TheBumsMacro_v1.1`  
+**Release:** `TheBumsMacro_v1.2`  
 **Game:** Roblox — Attack on Titan: Revolution  
 **Repository:** https://github.com/HuyHG245/TheBums_macro
 
@@ -14,6 +14,7 @@ The Bums Macro is a community-made **keyboard/mouse automation** application. It
 | --- | --- |
 | Shiki | Mission automation with Shiki-specific ability handling. |
 | Universal | General mission routine with directional actions, camera movement and Shift handling. |
+| Outskirts Fritz | Universal-style mission, with Fritz's skill layout and additional Skill 1 after Skill 3's animation. |
 | Blood Awakening | Mission routine with Blood Awakening and improved Colossal Shift confirmation. |
 | Female Raid | Raid automation with cutscene handling, chest positions and Retry support. |
 | Attack Titan Raid Fritz (Not Recommended) | Fritz-based raid opening, directional dashes, automatic cutscene skip and Colossal combat. |
@@ -26,6 +27,7 @@ The two Attack Titan modes require **Colossal Titan** and use on-screen skill te
 - Create, record, edit, validate and run user-defined `.tbmacro` scripts.
 - Commands include `press ability1`–`ability5`, `wait`, `hold`, `spam`, `dash`, `backdash`, `strafe`, mouse movement/clicks, image checks, loops, conditions and Retry/loot actions.
 - The **Guide** button in the Custom Macro Editor opens a command reference with timing examples.
+- **Edit Macro Commands (Beta)** allows per-mode script overrides for built-in macros, with Check, Save and Reset to Original. Native image/state-driven steps remain protected.
 - Built-in mode Guides and skill-layout images are included; guide content is stored in `guides/*.txt` and formatted by the app.
 
 ### Automation, detection and recovery
@@ -34,6 +36,7 @@ The two Attack Titan modes require **Colossal Titan** and use on-screen skill te
 - Persistent Retry monitoring designed to avoid a stalled result screen and avoid double counting.
 - Raid chest Pick Spot configuration, Auto Skip and image-detection overrides.
 - Loot reporting for Scrolls, Vessels, Fragments and Serums, including Attack Titan-specific **Primordial Devil** and **Attack Serum**.
+- Alternative Scroll recognition using `loot_scroll.png` and `loot_scroll2.png`; matching either or both counts as **one Scroll per result**, never two from the two templates.
 - Saved session/statistics counters and detailed activity logs.
 - Reconnect and failsafe options for supported flows.
 
@@ -45,6 +48,7 @@ The two Attack Titan modes require **Colossal Titan** and use on-screen skill te
 - Roblox monitor selection/automatic monitor detection.
 - **Adaptive Resolution (Beta)** is **OFF by default**. When enabled on Windows, it prefers capturing Roblox's client area and remaps template-match coordinates; the legacy full-monitor detector is used when disabled.
 - GitHub update checks (Releases and repository commits), Discord webhook/bot options and result reports.
+- The installed version **v1.2** is shown beside **Updates** in the main window, and the updater compares published release versions.
 
 ## Requirements
 
@@ -64,7 +68,7 @@ User-specific settings and history are stored under **Documents\The Bums**, outs
 
 ## Build an EXE
 
-Run `build.bat` to build a single `TheBums.exe`. `build.bat onedir` makes a directory-based build instead. The build uses PyInstaller with `--uac-admin`; Windows shows a normal UAC consent prompt at launch. Administrator rights can help with input to an elevated Roblox window, but do not guarantee compatibility or immunity to detection errors.
+Run `build.bat` to build a single `TheBumsMacro.exe`. `build.bat onedir` makes a directory-based build instead. The build uses PyInstaller with `--uac-admin`; Windows shows a normal UAC consent prompt at launch. Administrator rights can help with input to an elevated Roblox window, but do not guarantee compatibility or immunity to detection errors.
 
 Build outputs, installed Python environments, local configuration, logs, screenshots, user macros and credentials are excluded from Git by `.gitignore`.
 
@@ -81,15 +85,28 @@ Known limitations: different Roblox HUD scales, DPI settings, nonstandard window
 - If a credential was ever committed, revoke/rotate it and clean Git history before publishing; a later `.gitignore` entry alone is not enough.
 - Only run EXE files built from source you trust. Be careful with administrator prompts.
 
-## Changelog — TheBumsMacro_v1.1
+## Changelog — TheBumsMacro_v1.2
+
+### New in v1.2 (compared with v1.1)
+
+- Added **Outskirts Fritz** with its own Skill Layout and Guide. The opening follows Universal except that Skill 1 is triggered after Skill 3, the Universal camera action and an extra adjustable animation wait, before Skill 4.
+- Added **Edit Macro Commands (Beta)** for built-in modes, with saved overrides, syntax checking and Reset to Original. Complex native state-detection stages remain protected.
+- Added alternative **`loot_scroll2.png`** Scroll detection; both Scroll icon templates share one counter and cannot double-count a single loot result.
+- Added a visible **v1.2** label beside **Updates**, updated release comparisons and synchronized EXE metadata to 1.2.
+- Updated the Custom Macro Guide and per-mode configuration support, including Outskirts timing adjustments.
+- Cleaned the GitHub source package, removed old beta changelogs/test artifacts and moved in-app guides into `.txt` files while keeping their Markdown formatting.
+
+## Changes since the original The Bums ZIP
+
 
 The following is a comparison with the **original The Bums ZIP supplied for this project**, not a claim that every item is new compared with every historical GitHub release.
 
 ### New features since that original ZIP
 
 - Added **Attack Titan Raid Fritz (Not Recommended)** and **Attack Titan Raid Blood Awakening**, including distinct opening sequences and a shared Colossal combat state machine.
+- Added **Outskirts Fritz**, based on Universal with an additional Skill 1 after Skill 3's animation and configurable timing.
 - Added Shift confirmation using `heatwave.png`, Heatwave's two-cycle behavior, phase cutscene handling, raid chest processing and Attack Titan-specific loot templates.
-- Added **Custom Macro Editor**, recorder, script validation, configurable command language and a formatted in-app command reference.
+- Added **Custom Macro Editor**, recorder, script validation, configurable command language and a formatted in-app command reference, plus built-in Edit Macro Commands (Beta).
 - Added **Recovery / Reconnect** options and stronger Retry monitoring/retry-screen handling.
 - Added **Adaptive Resolution (Beta)**, disabled by default, with a nearby explanatory **?** tooltip.
 - Added GitHub **Updates** checks and optional Discord bot workflow alongside the existing webhook functionality.

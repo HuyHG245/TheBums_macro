@@ -167,7 +167,7 @@ if IS_WIN:
 
 # ----------------------------- SETTINGS ---------------------------------
 APP_NAME = "The Bums Macro"
-VERSION = "TheBumsMacro_v1.1"        # internal development version (not displayed in footer)
+VERSION = "TheBumsMacro_v1.2"  # public release label used by footer and GitHub update comparison
 
 # --- Update checker (footer > Updates) ---
 UPDATE_REPO = "HuyHG245/TheBums_macro"   # <-- your GitHub "owner/repo" (public). Releases are read from it
@@ -229,6 +229,12 @@ LOOT_FILES = {                       # kind -> template file (the icon only, no 
     "female_serum": "loot_female_serum.png",       # blue
     "beast_serum": "loot_beast_serum.png",         # brown
     "colossal_serum": "loot_colossal_serum.png",   # red
+}
+# Additional pictures that still count as the SAME loot kind.
+# Example: if either loot_scroll.png OR loot_scroll2.png is seen on the same result screen,
+# it still records exactly one Scroll.
+EXTRA_LOOT_FILES = {
+    "scroll": ("loot_scroll2.png",),
 }
 FRAGMENT_KINDS = ("body", "defence", "offence", "support")
 SERUM_KINDS = ("attack_serum", "armor_serum", "female_serum", "beast_serum", "colossal_serum")
@@ -387,12 +393,14 @@ MOVE_SHIFTED_BADGES = {
 }
 ATTACK_FRITZ_KEY = "Attack Titan Raid"
 ATTACK_BLOOD_KEY = "Attack Titan Raid Blood Awakening"
+OUTSKIRTS_FRITZ_KEY = "Outskirts Fritz"
 ATTACK_FAMILIES = (ATTACK_FRITZ_KEY, ATTACK_BLOOD_KEY)
-FAMILIES = ("Shiki", "Universal", "Blood Awakening", "Female Raid", *ATTACK_FAMILIES)
+FAMILIES = ("Shiki", "Universal", "Blood Awakening", "Female Raid", OUTSKIRTS_FRITZ_KEY, *ATTACK_FAMILIES)
 DEFAULT_FAMILY = "Shiki"
 FAMILY_LABELS = {f: f for f in FAMILIES}   # what the dropdown shows
 FAMILY_LABELS[ATTACK_FRITZ_KEY] = "Attack Titan Raid Fritz (Not Recommended)"
 FAMILY_LABELS[ATTACK_BLOOD_KEY] = "Attack Titan Raid Blood Awakening"
+FAMILY_LABELS[OUTSKIRTS_FRITZ_KEY] = "Outskirts Fritz"
 FAMILY_LABELS["__custom_macro__"] = "Custom Macro Guide"
 ATTACK_DISPLAY_NAME = FAMILY_LABELS[ATTACK_FRITZ_KEY]
 FAMILY_TAGS = {}   # entry -> tag text in the dropdown ("WIP" yellow, "Beta" blue), e.g. {"Universal": "Beta"}
@@ -402,6 +410,7 @@ FAMILY_BADGES = {
     "Universal":       ("U", "#facc15", "#1a1500"),   # yellow U
     "Blood Awakening": ("B", "#ef4444", "#ffffff"),   # red B
     "Female Raid":     ("F", "#ef4444", "#ffffff"),   # red F
+    "Outskirts Fritz": ("O", "#06b6d4", "#06232a"),
     "Attack Titan Raid": ("A", "#f59e0b", "#1a1500"),
     "Attack Titan Raid Blood Awakening": ("B", "#a855f7", "#ffffff"),
 }
@@ -417,6 +426,7 @@ ATTACK_START_FILE = "acoustic_shells.png"  # Attack Titan only: Skill 2 acoustic
 ATTACK_START_THRESHOLD = 0.78
 ATTACK_FINISH_FILE = "finish.png"
 ATTACK_FINISH_THRESHOLD = 0.80
+OUTSKIRTS_PRE_ABILITY4_DELAY = 1.0   # Outskirts Fritz: after Skill 3, use Skill 1 then wait this long before Skill 4
 KEY_RAID_SKIP = "e"              # pressed over and over while the skip button is on screen
 RAID_SKIP_THRESHOLD = 0.67       # (skip button lowered from 0.80 - it was detected late) lower them if the buttons aren't being detected
 RAID_FINISH_THRESHOLD = 0.80
@@ -558,6 +568,27 @@ CONFIG_FIELDS = {
            "Pixels the mouse moves down every 0.01 s."),
         _f("ability4_time", "Ability 4 spam time", "sec", UNIVERSAL_ABILITY4_SPAM_TIME, 0, 30, "Ability 4",
            "How long ability 4 is spammed after looking down."),
+        _f("ability4_interval", "Ability 4 spam interval", "sec", UNIVERSAL_ABILITY4_SPAM_INTERVAL, 0.02, 5,
+           "Ability 4", "Pause between those presses."),
+        _f("after_ability", "Wait after ability 4", "sec", AFTER_ABILITY_DELAY, 0, 10, "Ability 4",
+           "Pause before the shift sequence starts."),
+    ] + _shift_fields(),
+    "Outskirts Fritz": [
+        _skip_ability2_field(),
+        _fast_mode_field(),
+        _f("after_strafe", "Wait after strafe", "sec", AFTER_STRAFE_DELAY_FAST, 0, 10, "Ability 3",
+           "Pause between the strafe and ability 3."),
+        _f("look_time", "Skill 3 animation / Camera down time", "sec", LOOK_DOWN_TIME, 0, 20, "After Skill 3",
+           "Same wait as Universal: Ctrl, move camera down over this duration, Ctrl; then cast Skill 1."),
+        _f("look_pixels", "Camera down pixels per step", "pix", LOOK_DOWN_PIXELS, 1, 200, "After Skill 3",
+           "Same downward camera movement as Universal (pixels per 0.01 second)."),
+        _f("skill3_settle", "Extra Skill 3 animation wait", "sec", 1.5, 0, 10, "After Skill 3",
+           "Extra wait AFTER the Universal-style camera-down action, BEFORE tapping Skill 1. "
+           "Default adds 1.5 seconds because Skill 1 is tapped only once and may be ignored during the animation."),
+        _f("before_ability4", "Wait after Skill 1", "sec", OUTSKIRTS_PRE_ABILITY4_DELAY, 0, 10, "Ability 4",
+           "After Skill 3 and the Universal camera-down wait, press Skill 1, then wait before Skill 4."),
+        _f("ability4_time", "Ability 4 spam time", "sec", UNIVERSAL_ABILITY4_SPAM_TIME, 0, 30, "Ability 4",
+           "How long ability 4 is spammed before the shift sequence starts."),
         _f("ability4_interval", "Ability 4 spam interval", "sec", UNIVERSAL_ABILITY4_SPAM_INTERVAL, 0.02, 5,
            "Ability 4", "Pause between those presses."),
         _f("after_ability", "Wait after ability 4", "sec", AFTER_ABILITY_DELAY, 0, 10, "Ability 4",
@@ -709,6 +740,7 @@ CONFIG_INFO = {
     "Movement": "Used by every config: the wait after ability 2, the dashing and the strafe.",
     "Shiki": "Used while the Shiki abilities are selected.",
     "Universal": "Used while the Universal abilities are selected.",
+    OUTSKIRTS_FRITZ_KEY: "Fritz skills with Universal movement. Extra Skill 3 animation wait is editable here.",
     "Blood Awakening": "Used while the Blood Awakening abilities are selected.",
     "Female Raid": "Used while Female Raid is selected. (The chest locations are set in Settings > Configs.)",
     "Attack Titan Raid": "Attack Titan Raid Fritz (Not Recommended). Colossal chest spots are set in Settings > Configs.",
@@ -728,6 +760,7 @@ _SHARED_MISSION_KEYS = (
 CONFIG_SHARED_KEYS = {
     "Shiki": _SHARED_MISSION_KEYS,
     "Universal": _SHARED_MISSION_KEYS,
+    OUTSKIRTS_FRITZ_KEY: _SHARED_MISSION_KEYS,
     "Blood Awakening": _SHARED_MISSION_KEYS,
     "Female Raid": ("retry_click_time", "retry_click_interval", "fix_shift_lock"),
     "Attack Titan Raid": ("tap_gap", "retry_click_time", "retry_click_interval",
@@ -991,10 +1024,10 @@ def asset_path(filename):
     return os.path.join(getattr(sys, "_MEIPASS", app_dir()), IMAGE_FOLDER, filename)
 
 
-GUIDE_FOLDER = "guides"     # the Guide window reads build_<name>.txt from here (Markdown syntax is supported).
+GUIDE_FOLDER = "guides"     # the Guide window reads build_<name>.txt from here
 GUIDE_NAMES = {"Shiki": "shiki", "Universal": "universal", "Blood Awakening": "blood",
-               "Female Raid": "female", "Attack Titan Raid": "attack_titan",
-               ATTACK_BLOOD_KEY: "attack_titan_blood", "__custom_macro__": "custom_macro_commands"}      # family -> the <name> part of the guide text file names
+               "Female Raid": "female", OUTSKIRTS_FRITZ_KEY: "outskirts_fritz", "Attack Titan Raid": "attack_titan",
+               ATTACK_BLOOD_KEY: "attack_titan_blood", "__custom_macro__": "custom_macro_commands"}      # family -> the <name> part of the md file names
 
 
 def guide_path(filename):
@@ -1947,6 +1980,232 @@ def macro_picture_list():
     return [(n, used.get(n, [])) for n in sorted(names, key=str.lower)]
 
 
+# ---------------- built-in command editor (opt-in, beta) ----------------
+# Original native routines remain the default. Saving an edited template creates
+# a per-family override. Resetting deletes that override and restores the routine.
+BUILTIN_NATIVE_ALLOWED = {
+    "Shiki": {"prepare", "dash_spam", "strafe", "shiki_ability4", "shift"},
+    "Universal": {"prepare", "dash_spam", "strafe", "look_down", "shift"},
+    OUTSKIRTS_FRITZ_KEY: {"prepare", "dash_spam", "strafe", "look_down", "shift"},
+    "Blood Awakening": {"prepare", "dash_spam", "blood_strafe", "shift"},
+    "Female Raid": {"female_raid"},
+    ATTACK_FRITZ_KEY: {"attack_raid_init", "attack_camera_down", "attack_shift_and_colossal"},
+    ATTACK_BLOOD_KEY: {"attack_raid_init", "attack_shift_and_colossal"},
+}
+BUILTIN_NATIVE_REQUIRED = {
+    "Shiki": "shift", "Universal": "shift", OUTSKIRTS_FRITZ_KEY: "shift",
+    "Blood Awakening": "shift", "Female Raid": "female_raid",
+    ATTACK_FRITZ_KEY: "attack_shift_and_colossal", ATTACK_BLOOD_KEY: "attack_shift_and_colossal",
+}
+BUILTIN_NATIVE_ALL = set().union(*BUILTIN_NATIVE_ALLOWED.values())
+_builtin_editor_thread = threading.local()
+
+
+def builtin_commands_dir():
+    return os.path.join(data_dir(), "BuiltIn-Commands")
+
+
+def builtin_commands_path(family):
+    if family not in FAMILIES:
+        raise ValueError("Not a built-in macro")
+    safe_name = re.sub(r"[^a-z0-9]+", "_", family.lower()).strip("_")
+    return os.path.join(builtin_commands_dir(), safe_name + ".tbmacro")
+
+
+def default_builtin_commands(family):
+    """Editable representation of the normal actions with stateful work in native blocks.
+
+    Saving this template opts in to custom ordering. The native routines are never
+    replaced unless a valid override is present; raid loops remain image-driven.
+    """
+    prefix = "# Built-in command override (Beta): " + FAMILY_LABELS[family] + "\n"
+    prefix += "# No override file = the exact original Python routine.\n"
+    prefix += "# Native = original game-state-aware action; Edit Configs tunes its internal timing.\n"
+    prefix += "# Press / wait / spam / dash commands can be changed or reordered.\n"
+    if family in ("Shiki", "Universal", "Blood Awakening", OUTSKIRTS_FRITZ_KEY):
+        prefix += "# Saving these commands overrides the normal opening on NEXT Start.\n"
+        body = ["native prepare", "native dash_spam"]
+        if family == "Blood Awakening":
+            body += ["native blood_strafe", "native shift"]
+        else:
+            body += ["native strafe", "press ability3"]
+            if family == "Shiki":
+                body += ["native shiki_ability4"]
+            else:
+                body += ["native look_down"]
+                if family == OUTSKIRTS_FRITZ_KEY:
+                    body += ["wait " + format(float(tv(family, "skill3_settle")), "g"),
+                             "press ability1",
+                             "wait " + format(float(tv(family, "before_ability4")), "g")]
+                body += ["spam ability4 " + format(float(tv(family, "ability4_time")), "g")
+                         + " " + format(float(tv(family, "ability4_interval")), "g")]
+            body += ["wait " + format(float(tv(family, "after_ability")), "g"), "native shift"]
+    elif family == ATTACK_FRITZ_KEY:
+        prefix += "# Opening steps are editable; post-Shift combat and chests stay native.\n"
+        d = lambda key: format(float(tv(family, key)), "g")
+        body = ["native attack_raid_init", "dash right 2 " + d("right_dash_cooldown"),
+                "press ability1", "native attack_camera_down", "dash back", "press ability3",
+                "wait " + d("skill3_animation"), "dash left", "wait " + d("after_left_dash"),
+                "press ability2", "wait " + d("after_skill2"), "dash right",
+                "wait " + d("after_right_dash"), "dash left", "wait " + d("after_last_left_dash"),
+                "wait " + d("before_skill4"), "press ability4", "wait " + d("after_skill4"),
+                "press ability1", "native attack_shift_and_colossal"]
+    elif family == ATTACK_BLOOD_KEY:
+        prefix += "# Opening is editable; Shift, Heatwave and chest handling stay native.\n"
+        body = ["native attack_raid_init", "press ability2", "dash forward",
+                "native attack_shift_and_colossal"]
+    else:
+        # Female Raid stays native: animation-driven transitions can't safely be
+        # flattened into a blind sequence of keyboard presses.
+        prefix += "# Female Raid combat, cutscenes and chests stay native for safety.\n"
+        prefix += "# You may add regular commands above the REQUIRED native line.\n"
+        body = ["native female_raid"]
+    return prefix + "\n".join(body) + "\n"
+
+
+def _builtin_native_nodes(nodes):
+    for node in nodes:
+        if node[0] == "native":
+            yield node[1]
+        elif node[0] == "repeat":
+            yield from _builtin_native_nodes(node[2])
+        elif node[0] == "if":
+            yield from _builtin_native_nodes(node[2])
+            yield from _builtin_native_nodes(node[3])
+
+
+def validate_builtin_commands(family, source):
+    if family not in FAMILIES:
+        return [(0, "Choose a built-in macro")]
+    if len(source.encode("utf-8")) > 64000:
+        return [(0, "Script must be smaller than 64 KB")]
+    _, nodes, errors = parse_macro(source, allow_native=True)
+    allowed = BUILTIN_NATIVE_ALLOWED[family]
+    found = list(_builtin_native_nodes(nodes))
+    for n in found:
+        if n not in allowed:
+            errors.append((0, f"Native action '{n}' is not available for {FAMILY_LABELS[family]}"))
+    required = BUILTIN_NATIVE_REQUIRED[family]
+    top_level_required = [node for node in nodes if node[0] == "native" and node[1] == required]
+    if found.count(required) != 1 or len(top_level_required) != 1:
+        errors.append((0, f"Keep exactly one top-level 'native {required}' line for the built-in routine"))
+    if family in ("Female Raid", ATTACK_FRITZ_KEY, ATTACK_BLOOD_KEY):
+        if not nodes or nodes[-1][0] != "native" or nodes[-1][1] != required:
+            errors.append((0, "The required native raid routine must be the LAST command"))
+        if family in ATTACK_FAMILIES and (not nodes or nodes[0][:2] != ("native", "attack_raid_init")):
+            errors.append((0, "Attack Titan opening must start with 'native attack_raid_init'"))
+    return errors
+
+
+def load_builtin_commands(family):
+    path = builtin_commands_path(family)
+    try:
+        with open(path, "r", encoding="utf-8-sig") as fh:
+            source = fh.read()
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        log(f"Cannot read built-in command override for {family}: {e}; original preserved")
+        return None
+    errors = validate_builtin_commands(family, source)
+    if errors:
+        log(f"Invalid built-in commands for {family}: {errors[0][1]}; original preserved")
+        return None
+    return source
+
+
+def _run_builtin_native(name):
+    family = getattr(_builtin_editor_thread, "family", None)
+    if family not in BUILTIN_NATIVE_ALLOWED or name not in BUILTIN_NATIVE_ALLOWED[family]:
+        raise RuntimeError("Native actions work only inside their own built-in macro override")
+    if name == "prepare":
+        if tv("Movement", "look_up"):
+            show("Looking up", "Original camera up")
+            look_up(lambda: tick(scan_retry=False), tv("Movement", "look_up_time"),
+                    tv("Movement", "look_up_pixels"))
+        set_step(0)
+        if tv(family, "skip_ability2"):
+            log("Ability 2 skipped")
+        else:
+            show("Ability 2", "Built-in opening")
+            tap(KEY_ABILITY_1ST)
+            wait(tv("Movement", "after_ability2"))
+    elif name == "dash_spam":
+        set_step(1)
+        spam_recorded_dash(KEY_DASH, tv("Movement", "dash_time"))
+    elif name == "strafe":
+        set_step(2)
+        double_tap(KEY_STRAFE)
+        wait(tv(family, "after_strafe"), scan=False)
+    elif name == "blood_strafe":
+        set_step(2)
+        left_time = float(tv(family, "strafe_left_time"))
+        deadline = time.monotonic() + left_time
+        gap = tv(family, "strafe_gap")
+        while time.monotonic() < deadline:
+            double_tap(KEY_STRAFE)
+            wait(min(random.uniform(*gap), max(0, deadline - time.monotonic())), scan=False)
+    elif name == "look_down":
+        set_step(4)
+        look_down(lambda: tick(scan_retry=False),
+                  tv(family, "look_time"), tv(family, "look_pixels"), settle=0)
+    elif name == "shiki_ability4":
+        set_step(4)
+        icon_seen = buy_time_until_ability4_ready()
+        set_step(5)
+        if icon_seen:
+            spam_key_for(KEY_ABILITY_3RD, tv("Shiki", "ability4_time"),
+                         tv("Shiki", "ability4_interval"), "ability 4")
+        else:
+            tap(KEY_ABILITY_3RD)
+    elif name == "shift":
+        shift_sequence(family)
+    elif name == "female_raid":
+        raid_routine()
+    elif name == "attack_raid_init":
+        _attack_skip.update(next_scan=0.0, last_press=0.0, streak=0, busy=False)
+        _raid.update(step=-1, title=FAMILY_LABELS[family], detail="Editable opening")
+        show(FAMILY_LABELS[family], "Editable Attack Titan Raid opening")
+        log(f"{FAMILY_LABELS[family]}: executing saved opening commands")
+    elif name == "attack_camera_down":
+        show("Looking down", "CTRL -> mouse down -> CTRL")
+        look_down(lambda: tick(scan_retry=False),
+                  seconds=tv(family, "camera_down_time"),
+                  pixels=tv(family, "camera_down_pixels"), settle=0.15)
+    elif name == "attack_shift_and_colossal":
+        raid_phase(3, "Colossal Shift", "Skill 5 until Heatwave confirms Colossal")
+        attack_titan_shift_until_confirmed()
+        raid_phase(3, "Colossal Titan", "Heatwave and independent Skills 5, 3, 1")
+        attack_titan_colossal()
+
+
+def run_builtin_commands(family, source):
+    errors = validate_builtin_commands(family, source)
+    if errors:
+        raise RuntimeError(f"Invalid built-in commands for {family}: {errors[0][1]}")
+    _, program, _ = parse_macro(source, allow_native=True)
+    _builtin_editor_thread.family = family
+    try:
+        log(f"Built-in command override enabled: {FAMILY_LABELS[family]}")
+        try:
+            run_macro_nodes(program)
+        except AttackTitanChestFound:
+            if family not in ATTACK_FAMILIES:
+                raise
+            attack_titan_chests()
+        show("Waiting for retry", "Built-in commands finished")
+        while True:
+            wait(0.1)
+    finally:
+        _builtin_editor_thread.family = None
+        for key in list(_custom_held):
+            try:
+                pydirectinput.keyUp(key)
+            except Exception:
+                pass
+        _custom_held.clear()
+
+
 def _macro_num(word, what, lo=0.0, hi=MACRO_MAX_SECONDS):
     try:
         v = float(word)
@@ -1999,8 +2258,15 @@ def _strip_macro_comment(s):
     return re.split(r"\s+(?:#|//)", s, maxsplit=1)[0].strip()
 
 
-def _parse_macro_command(cmd, args, line):
+def _parse_macro_command(cmd, args, line, allow_native=False):
     """One line -> a node tuple (op, ...)."""
+    if cmd == "native":
+        if not allow_native:
+            raise MacroSyntaxError("native is reserved for Edit Macro Commands on built-in modes")
+        _macro_args(cmd, args, 1, 1, "native ACTION")
+        if args[0].lower() not in BUILTIN_NATIVE_ALL:
+            raise MacroSyntaxError("unknown built-in native action; see Edit Macro Commands")
+        return ("native", args[0].lower())
     if cmd in ("press", "tap"):
         _macro_args(cmd, args, 1, 1, "press KEY")
         return ("press", _macro_key(args[0]))
@@ -2094,7 +2360,7 @@ def _parse_macro_command(cmd, args, line):
     raise MacroSyntaxError(f"unknown command '{cmd}'")
 
 
-def parse_macro(text):
+def parse_macro(text, allow_native=False):
     """Pseudo-script text -> (meta dict, program, errors).
     program = list of nodes. A repeat node is ("repeat", count or None, [nodes], line); an if node is
     ("if", condition, [nodes when true], [nodes when false], line).
@@ -2160,7 +2426,7 @@ def parse_macro(text):
                     raise MacroSyntaxError("'end' without an 'if' or 'repeat' above it")
                 stack.pop()
             else:
-                stack[-1][0].append(_parse_macro_command(cmd, args, line) + (no,))
+                stack[-1][0].append(_parse_macro_command(cmd, args, line, allow_native=allow_native) + (no,))
         except MacroSyntaxError as e:
             errors.append((no, str(e)))
     for _body, opened, kind, _node in stack[1:]:
@@ -2360,8 +2626,16 @@ def macro_add_count(raid):
 
 def run_macro_nodes(nodes):
     for node in nodes:
+        # Edited Attack Titan openings retain the original finish/chest state guard.
+        script_family = getattr(_builtin_editor_thread, "family", None)
+        if script_family in ATTACK_FAMILIES:
+            tick()
+            if attack_titan_picture("attack_finish"):
+                raise AttackTitanChestFound
         op = node[0]
-        if op == "press":
+        if op == "native":
+            _run_builtin_native(node[1])
+        elif op == "press":
             tap(node[1])
         elif op == "doubletap":
             double_tap(node[1])
@@ -2390,9 +2664,12 @@ def run_macro_nodes(nodes):
             for i in range(count):
                 tick()
                 detail(f"{direction.capitalize()} Dash {i+1}/{count}")
-                double_tap(key)                # each Dash = exactly two taps of its direction
+                if getattr(_builtin_editor_thread, "family", None) in ATTACK_FAMILIES:
+                    attack_titan_directional_dash(key, f"{direction.capitalize()} Dash {i+1}/{count}")
+                else:
+                    double_tap(key)           # one dash = two taps of the direction key
                 if i + 1 < count:
-                    wait(cooldown)              # cooldown BETWEEN dashes, not between the two taps
+                    wait(cooldown)             # cooldown between dashes, never between taps
         elif op == "click":
             _macro_click(node[1], node[2], node[3])
         elif op == "imgclick":
@@ -3408,6 +3685,7 @@ _attack_start_template = None    # only loaded when Attack Titan Raid is selecte
 _shiki_ability4_icon = None      # Shiki: ability 4 icon, seen = ability 4 is ready
 _raid_templates = {}             # Female Raid: {"skip": {...}, "finish": {...}} (see load_quality_templates)
 _loot_templates = {}
+_loot_extra_templates = {}
 _result_templates = {}
 _grab_template = None
 _disconnect_template = None       # Reconnect: the Disconnect Image (None = reconnect off)
@@ -4716,7 +4994,9 @@ def scan_end_screen(quality="normal", want_loot=True, want_result=True,
     if frame is not None:
         threshold = max(threshold, LOOT_SAFE_SINGLE_THRESHOLD)
     wanted = active_loot_kinds()
-    loot_tpls = ({k: t for k, t in _loot_templates.get(quality, {}).items() if k in wanted}
+    loot_tpls = ({k: [_loot_templates.get(quality, {}).get(k)]
+                     + list(_loot_extra_templates.get(quality, {}).get(k, []))
+                  for k in wanted if _loot_templates.get(quality, {}).get(k) is not None}
                  if want_loot else {})
     end = time.time() + (LOOT_SCAN_TIME if scan_time is None else scan_time)
     frames = 0
@@ -4735,11 +5015,18 @@ def scan_end_screen(quality="normal", want_loot=True, want_result=True,
         x1 = min(width, int(center + pad))
         y0, y1 = int(height * 0.16), int(height * 0.90)
         crop = screen[y0:y1, x0:x1]
-        for kind, tpl in loot_tpls.items():
-            if fix:
-                best, size = best_match_any_size(crop, tpl, LOOT_FIX_SCALES)
-            else:
-                best, size = best_match(crop, tpl), 1.0
+        for kind, templates in loot_tpls.items():
+            best = None
+            size = 1.0
+            for tpl in templates:
+                if tpl is None:
+                    continue
+                if fix:
+                    cand, cand_size = best_match_any_size(crop, tpl, LOOT_FIX_SCALES)
+                else:
+                    cand, cand_size = best_match(crop, tpl), 1.0
+                if cand and cand[2] >= threshold and (best is None or cand[2] > best[2]):
+                    best, size = cand, cand_size
             if best and best[2] >= threshold:
                 cx, cy, score, tw, th = best
                 hit = (cx + x0, cy + y0, score, tw, th)
@@ -5902,6 +6189,12 @@ def run_mission():
         log("Fix shift lock: ctrl pressed once")
         fix_shift_lock(lambda: tick(scan_retry=False))
 
+    if fam in FAMILIES:
+        command_override = load_builtin_commands(fam)
+        if command_override is not None:
+            run_builtin_commands(fam, command_override)
+            return
+
     if fam == "Female Raid":
         raid_routine()          # never returns: ends with RetryFound / stop
     if fam in ATTACK_FAMILIES:
@@ -5932,6 +6225,7 @@ def run_mission():
         wait(tv("Movement", "after_ability2"))  # nothing else happens until the dash sequence
 
     universal = fam == "Universal"   # ability 3, wait, look down, ability 4, shift
+    outskirts = fam == OUTSKIRTS_FRITZ_KEY
     blood = fam == "Blood Awakening"
 
     set_step(1)
@@ -5985,6 +6279,29 @@ def run_mission():
             spam_key_for(KEY_ABILITY_3RD, u4_time,
                          tv("Universal", "ability4_interval"), "ability 4")
             wait(tv("Universal", "after_ability"))
+        elif outskirts:
+            # Keep Universal's Skill 3 animation wait (Ctrl -> look down -> Ctrl),
+            # THEN Skill 1, a separate 1s wait, and Skill 4. Everything afterward is Universal.
+            set_step(4)
+            show("Looking down", "Universal camera-down animation wait")
+            log("Outskirts Fritz: waiting for Skill 3 animation via Universal camera-down movement")
+            look_down(lambda: tick(scan_retry=False),
+                      tv(OUTSKIRTS_FRITZ_KEY, "look_time"),
+                      tv(OUTSKIRTS_FRITZ_KEY, "look_pixels"), settle=0)
+            show("Skill 1", "Pressing Skill 1 after Skill 3 animation")
+            extra_settle = float(tv(OUTSKIRTS_FRITZ_KEY, "skill3_settle"))
+            log(f"Outskirts Fritz: extra {extra_settle:g}s for Skill 3 animation before Skill 1")
+            wait(extra_settle, scan=True)
+            log("Outskirts Fritz: animation settle ended -> Skill 1")
+            tap(KEY_GRAB)
+            wait(tv(OUTSKIRTS_FRITZ_KEY, "before_ability4"), scan=False)
+            set_step(5)
+            u4_time = tv(OUTSKIRTS_FRITZ_KEY, "ability4_time")
+            show("Ability 4", f"Spamming ability 4 for {u4_time:g}s")
+            log(f"Outskirts Fritz: ability 4 spam for {u4_time:g}s")
+            spam_key_for(KEY_ABILITY_3RD, u4_time,
+                         tv(OUTSKIRTS_FRITZ_KEY, "ability4_interval"), "ability 4")
+            wait(tv(OUTSKIRTS_FRITZ_KEY, "after_ability"))
         else:
             set_step(4)
             show("Buying time", f"Strafing {KEY_STRAFE.upper()} until ability 4 is off cooldown")
@@ -6137,9 +6454,11 @@ def macro_main():
             except FileNotFoundError:
                 pass            # a missing picture is not logged
         _loot_templates.clear()
+        _loot_extra_templates.clear()
         if LOOT_ENABLED:
             for quality, folder in (("normal", ""), ("low", LOW_FOLDER)):
                 _loot_templates[quality] = {}
+                _loot_extra_templates[quality] = {}
                 for kind, filename in LOOT_FILES.items():
                     try:
                         _loot_templates[quality][kind] = load_template(
@@ -6150,6 +6469,12 @@ def macro_main():
                                 for f in LOOT_FILES.values()):
                             tag = "" if quality == "normal" else " (low quality)"
                             pass            # a missing picture is not logged
+                    for extra_name in EXTRA_LOOT_FILES.get(kind, ()): 
+                        try:
+                            _loot_extra_templates[quality].setdefault(kind, []).append(
+                                load_template(os.path.join(folder, extra_name)))
+                        except FileNotFoundError:
+                            pass            # optional alternate loot icon
         if LOOT_ENABLED and settings.get("fix_loot"):
             log("Fix loot tracking (Beta) is ON: loot icons are looked for at any size")
         log("Started. Click into Roblox; the routine starts when the mission begins.")
@@ -7609,6 +7934,9 @@ class App:
         upd.bind("<Button-1>", lambda _e: start_update_check(manual=True))
         upd.bind("<Enter>", lambda _e: upd.configure(fg=self.TEXT))
         upd.bind("<Leave>", lambda _e: upd.configure(fg=self.SUB))
+        # Show the installed release immediately beside Updates (not the newest GitHub release).
+        tk.Label(left, text="v1.2", font=(App.FONT, 8), fg=self.SUB,
+                 bg=self.BG).pack(side="left", padx=(7, 0))
 
         self.reset_btn = tk.Label(foot, text="Reset stats", font=(App.FONT, 9),
                                   fg=self.SUB, bg=self.BG, cursor="hand2")
@@ -7863,7 +8191,7 @@ class App:
                 messagebox.showinfo("GitHub updates", "No update information was returned.",
                                     parent=self.root)
             return
-        lines = ["The Bums Macro — GitHub"]
+        lines = ["The Bums Macro — GitHub", f"Installed version: {VERSION}"]
         if release:
             lines.append(f"Latest release: {release['tag']}  ({release['title']})")
         else:
@@ -7872,6 +8200,17 @@ class App:
             lines.append(f"Latest commit: {commit['sha'][:10]}")
             lines.append(f"Date: {commit['date']}")
             lines.append(f"Change: {commit['message']}")
+        # Compare published release versions independently from Git commit revisions.
+        # A source ZIP can have a valid public version even without an embedded Git SHA.
+        if release and re.search(r"v?\d+\.\d+", release.get("tag", ""), re.I):
+            published = parse_version(release["tag"])
+            installed = parse_version(VERSION)
+            if published > installed:
+                lines.append("A newer published release is available on GitHub.")
+            elif published == installed:
+                lines.append("This version matches the latest published release.")
+            else:
+                lines.append("This installed version is newer than the latest published release.")
         local = (info or {}).get("local_sha")
         if local and commit:
             if local == commit["sha"].lower():
@@ -7879,7 +8218,7 @@ class App:
             else:
                 lines.append("The repository commit differs from this build's embedded revision.")
         else:
-            lines.append("This local test build has no verifiable Git revision; update status is unknown.")
+            lines.append("Git commit revision unavailable; release-version comparison is shown above.")
         log("GitHub checked: " + (commit["sha"][:10] if commit else release["tag"]))
         if manual and messagebox.askyesno(
                 "GitHub updates", "\n".join(lines) + "\n\nOpen the repository in your browser?",
@@ -8812,6 +9151,8 @@ class SettingsWindow(tk.Toplevel):
         btn_row = tk.Frame(c, bg=App.CARD)
         btn_row.pack(anchor="w", pady=(10, 0))
         self.flat_button(btn_row, "Edit configs", self.open_config_window).pack(side="left")
+        self.flat_button(btn_row, "Edit macro commands", self.open_builtin_commands).pack(
+            side="left", padx=(8, 0))
         self.book_img = book_icon(App.ACCENT_TEXT, max(14, round(15 * max(1.0, self.winfo_fpixels("1i") / 96))))
         guide_btn = self.flat_button(btn_row, " Guide" if self.book_img else "Guide",
                                      self.open_guide_window)
@@ -9181,6 +9522,24 @@ class SettingsWindow(tk.Toplevel):
         except tk.TclError:
             pass
         self.guide_win = GuideWindow(self, fam)
+
+    def open_builtin_commands(self):
+        family = self.v_family.get()
+        if is_custom(family):
+            self.open_macro_editor(family)
+            return
+        if family not in FAMILIES:
+            return
+        win = getattr(self, "builtin_cmd_win", None)
+        try:
+            if win is not None and win.winfo_exists():
+                win.set_family(family)
+                win.lift()
+                win.focus_force()
+                return
+        except tk.TclError:
+            pass
+        self.builtin_cmd_win = BuiltInMacroCommandsWindow(self, family)
 
     def open_config_window(self):
         family = self.v_family.get()
@@ -10857,6 +11216,128 @@ class ReconnectConfigWindow(tk.Toplevel):
         self.destroy()
 
 
+class BuiltInMacroCommandsWindow(tk.Toplevel):
+    """Editable commands for each built-in mode. Defaults are not written until Save."""
+
+    def __init__(self, settings_win, family):
+        super().__init__(settings_win)
+        prepare_window(self)
+        self.sw = settings_win
+        self.family = family
+        self.configure(bg=App.BG)
+        self.geometry(f"720x660+{settings_win.winfo_x()+35}+{settings_win.winfo_y()+30}")
+        self.minsize(580, 430)
+        self.transient(settings_win)
+        self.attributes("-topmost", True)
+        self.title(f"{APP_NAME} - Edit Macro Commands")
+        self.header = tk.Label(self, text="", bg=App.BG, fg=App.TEXT,
+                               font=(App.FONT, 13, "bold"), anchor="w")
+        self.header.pack(fill="x", padx=18, pady=(16, 6))
+        self.help = tk.Label(self, font=(App.FONT, 9), bg=App.BG, fg=App.SUB,
+                             text=("One command per line. Press Check before Save. Changes apply next Start.\n"
+                                   "'native' runs original image-aware logic; Edit Configs controls its timing.\n"
+                                   "Raid combat must keep its native action to preserve Finish/Retry/Heatwave."),
+                             justify="left", anchor="w")
+        self.help.pack(fill="x", padx=18, pady=(0, 12))
+        wrapper = tk.Frame(self, bg=App.BG)
+        wrapper.pack(fill="both", expand=True, padx=18)
+        self.text = tk.Text(wrapper, font=(App.MONO, 10), bg=App.LOGBG, fg=App.TEXT,
+                            insertbackground=App.TEXT, wrap="none", undo=True, relief="flat",
+                            padx=12, pady=10, highlightthickness=1,
+                            highlightbackground=App.BORDER, highlightcolor=App.ACCENT)
+        sc = ttk.Scrollbar(wrapper, orient="vertical", command=self.text.yview)
+        sc.pack(side="right", fill="y")
+        self.text.configure(yscrollcommand=sc.set)
+        self.text.pack(side="left", fill="both", expand=True)
+        buttons = tk.Frame(self, bg=App.BG)
+        buttons.pack(fill="x", padx=18, pady=(12, 8))
+        self.sw.flat_button(buttons, "Check", self.check).pack(side="left")
+        self.sw.flat_button(buttons, "Save commands", self.save).pack(side="left", padx=(8, 0))
+        self.sw.flat_button(buttons, "Reset to original", self.reset).pack(side="left", padx=(8, 0))
+        self.sw.flat_button(buttons, "Command Guide", self.open_guide).pack(side="right")
+        self.status = tk.Label(self, text="", font=(App.FONT, 9), fg=App.SUB,
+                               bg=App.BG, anchor="w", justify="left")
+        self.status.pack(fill="x", padx=18, pady=(0, 14))
+        self.protocol("WM_DELETE_WINDOW", lambda: fade_close(self))
+        self.set_family(family)
+        style_title_bar(self, App.BG)
+        reveal_window(self)
+
+    def set_family(self, family):
+        if family not in FAMILIES:
+            return
+        if getattr(self, "family", None) != family and self.text.edit_modified():
+            if not messagebox.askyesno("Discard unsaved edits?",
+                                       "Switching macros discards unsaved command changes.", parent=self):
+                return
+        self.family = family
+        self.title(f"{APP_NAME} - Edit Macro Commands - {FAMILY_LABELS[family]}")
+        self.header.configure(text=FAMILY_LABELS[family])
+        script = load_builtin_commands(family)
+        self.text.delete("1.0", "end")
+        self.text.insert("1.0", script if script is not None else default_builtin_commands(family))
+        self.text.edit_modified(False)
+        self.status.configure(text="Custom override enabled" if script else
+                              "Original macro is active; this is an editable preview")
+
+    def check(self):
+        errors = validate_builtin_commands(self.family, self.text.get("1.0", "end-1c"))
+        if errors:
+            no, msg = errors[0]
+            self.status.configure(text=f"Line {no}: {msg}", fg="#f87171")
+            return False
+        self.status.configure(text="Syntax OK. Save to enable this command sequence on next Start.",
+                              fg="#34d399")
+        return True
+
+    def save(self):
+        if running():
+            messagebox.showwarning("Stop macro first", "Stop the macro before changing commands.", parent=self)
+            return
+        if not self.check():
+            return
+        dest = builtin_commands_path(self.family)
+        try:
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            tmp = dest + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write(self.text.get("1.0", "end-1c"))
+            os.replace(tmp, dest)
+        except OSError as e:
+            self.status.configure(text=f"Could not save: {e}", fg="#f87171")
+            return
+        self.text.edit_modified(False)
+        self.status.configure(text="Saved. Your script will run instead of the original next Start.",
+                              fg="#34d399")
+
+    def reset(self):
+        if running():
+            messagebox.showwarning("Stop macro first", "Stop the macro before resetting commands.", parent=self)
+            return
+        if not messagebox.askyesno("Restore original macro?",
+                                   f"Delete command overrides for {FAMILY_LABELS[self.family]}?\n"
+                                   "The original Python routine will be restored.", parent=self):
+            return
+        try:
+            os.remove(builtin_commands_path(self.family))
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            self.status.configure(text=f"Reset failed: {e}", fg="#f87171")
+            return
+        self.text.delete("1.0", "end")
+        self.text.insert("1.0", default_builtin_commands(self.family))
+        self.text.edit_modified(False)
+        self.status.configure(text="Original built-in routine restored (next Start).", fg="#34d399")
+
+    def open_guide(self):
+        win = getattr(self, "command_guide", None)
+        if win is not None and win.winfo_exists():
+            win.lift()
+        else:
+            self.command_guide = GuideWindow(self, "__custom_macro__")
+
+
 class ConfigEditorWindow(tk.Toplevel):
     """Edit only the selected built-in macro and its relevant shared controls.
 
@@ -11229,7 +11710,7 @@ class ConfigEditorWindow(tk.Toplevel):
 
 
 class GuideWindow(tk.Toplevel):
-    """Guide: shows guides/build_<name>.txt of the picked config (Blood Awakening -> build_blood.txt,
+    """Guide: shows guides/build_<name>.txt of the picked config (Blood Awakening -> build_blood.md,
     see GUIDE_NAMES). No tabs, just the one page.
     Markdown: # headings, **bold**, *italic*, `code`, ``` blocks, - / 1. lists, > quotes, ---, [links](url),
     and pictures on their own line: ![text](images/pic.png) - the path is inside the guides folder
@@ -11539,6 +12020,7 @@ ASSET_LIST = (
     ("Result: Completed", RESULT_FILES["completed"]),
     ("Result: Failed", RESULT_FILES["failed"]),
     ("Loot: Scroll", LOOT_FILES["scroll"]),
+    ("Loot: Scroll (alt)", EXTRA_LOOT_FILES["scroll"][0]),
     ("Loot: Body fragment", LOOT_FILES["body"]),
     ("Loot: Defence fragment", LOOT_FILES["defence"]),
     ("Loot: Offence fragment", LOOT_FILES["offence"]),

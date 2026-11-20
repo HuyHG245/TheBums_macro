@@ -103,6 +103,28 @@ token*.json
 Thumbs.db
 desktop.ini
 
-# Keep the root README as the only tracked Markdown document
+# README.md is the only Markdown file in the source distribution.
+# In-app guides ship as guides/*.txt so the application can still show them.
 *.md
 !/README.md
+
+# Local app backups and private exports
+config*.json
+*aotr_stats*.json
+session_data/
+private/
+secrets/
+*.env.local
+*.token
+*.session
+*.csv
+*.xlsx
+*.xls
+*.har
+*.pcap
+*token*.txt
+*secret*.txt
+*.mp4
+*.mkv
+*.mov
+*.webm
