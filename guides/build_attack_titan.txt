@@ -19,7 +19,7 @@
 **Colossal Titan is mandatory** for this Raid macro. Equip the Colossal Titan shifting form before starting; the after-Shift abilities and `heatwave.png` detection depend on this form.
 
 ## Auto Skip Cutscenes
-In **Settings > Configs > Attack Titan Raid Fritz > Edit configs**, enable or disable **Auto skip cutscenes**.
+In **Settings > Macros > Attack Titan Raid Fritz > Edit configs**, enable or disable **Auto skip cutscenes**.
 When enabled, the macro detects `skip.png` and presses **E** (the same Skip input used by Female Raid).
 The detector runs while waiting for the raid to start and during the Phase 1 cutscene after Colossal Shift. Disable it to let cutscenes play out normally.
 
@@ -83,11 +83,11 @@ re-clicks without counting the same mission or loot twice if the result panel is
 ## Attack Titan Raid Loot
 - **Primordial Evil**: recognized using `loot_attack_vessel.png`; counted as an Attack Titan Vessel.
 - **Attack Serum**: recognized using `loot_attack_serum.png`; counted as an Attack Serum.
-- Both images are included in **Settings > Asset override** for image detection calibration.
+- Both images are included in **Settings > Detection > Fix Image Detection** for image detection calibration.
 - Loot recognition is performed at the results screen; it uses confidence checks and does not infer an item from an unsuccessful Shift.
 
 ## Edit Configs and Saving
-Open **Settings > Configs**, select the macro you want, then click **Edit configs**.
+Open **Settings > Macros**, select the macro you want, then click **Edit configs**.
 The editor opens the selected macro's own settings, not the last mode you edited.
 Use the dropdown to switch between **that macro** and its **Shared controls**.
 Shared controls include only the movement/retry settings that the chosen macro actually uses.

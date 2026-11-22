@@ -28,7 +28,7 @@ After Shift, use the **same Colossal Titan skill layout** as the Fritz Raid guid
 This opening does not require Fritz's Flashbang, camera or directional positioning combo.
 
 ## Auto Skip Cutscenes
-In **Settings > Configs > Attack Titan Raid Blood Awakening > Edit configs**,
+In **Settings > Macros > Attack Titan Raid Blood Awakening > Edit configs**,
 **Auto skip cutscenes** can be turned ON or OFF. When enabled, the macro finds `skip.png`
 and presses E at the start of the Raid or during phase transitions.
 
@@ -43,7 +43,7 @@ The macro starts when `acoustic_shells.png` is detected on the Skill 2 HUD slot.
 5. During Colossal combat, Skill 4 **Heatwave** uses the same two-cycle icon detection
    as Fritz; **Skills 5, 3 and 1** run on independent timers until the CHESTS screen.
 6. Raider's Chest is ON by default; Emperor's Trove is OFF by default.
-   Use the Chest 1/Chest 2 **Pick spot** controls in Settings > Configs.
+   Use the Chest 1/Chest 2 **Pick spot** controls in Settings > Macros.
 7. After the real Retry button is detected, the existing results, loot and Retry system
    handles the end of the Raid. Missing Heatwave by itself never means the Raid failed.
 
@@ -81,7 +81,7 @@ The Retry watchdog continues monitoring while Skill 5 is being spammed.
 The program does not enter Recovery just because Shift was not confirmed.
 
 ## Edit Configs and Saving
-Select this macro under **Settings > Configs > Abilities**, then click **Edit configs**.
+Select this macro under **Settings > Macros > Abilities**, then click **Edit configs**.
 The editor opens this mode's own cutscene/chest/Shift/Colossal settings and only its
 applicable shared inputs. Your changes are stored separately in `config.json` and
 restored when you reopen the app. Other macros' settings are not overwritten.

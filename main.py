@@ -1,5 +1,9 @@
 import atexit
+from collections import deque
 import base64
+import copy
+import datetime as dt
+import zlib
 import ctypes
 import json
 import os
@@ -26,9 +30,22 @@ from tkinter import font as tkfont
 import cv2
 import mss
 import numpy as np
+import thebums_reconnect as image_rc
+from thebums_hybrid_ai import CpuOnnxBackend, HybridAdvisor
+from thebums_features import ConfigPresetStore, SessionHistory, ErrorSnapshotStore, UpdateHistory, _atomic_json
 
 IS_WIN = sys.platform == "win32"
 IS_MAC = sys.platform == "darwin"
+
+# Windows-only, local graphics capture. Standard Mode never needs this dependency.
+# A native capture API is preferred over PrintWindow for occluded DirectX windows.
+try:
+    if IS_WIN:
+        import windows_capture
+    else:
+        windows_capture = None
+except (ImportError, OSError):
+    windows_capture = None
 
 
 class _MacKeyboard:
@@ -167,7 +184,7 @@ if IS_WIN:
 
 # ----------------------------- SETTINGS ---------------------------------
 APP_NAME = "The Bums Macro"
-VERSION = "TheBumsMacro_v1.2"  # public release label used by footer and GitHub update comparison
+VERSION = "TheBumsMacro_v1.3-beta"  # development build; do not publish as stable until Windows tests
 
 # --- Update checker (footer > Updates) ---
 UPDATE_REPO = "HuyHG245/TheBums_macro"   # <-- your GitHub "owner/repo" (public). Releases are read from it
@@ -182,10 +199,10 @@ FILE_ICON_FILE = "thebums.ico"   # icon of the .tbmacro files in Explorer (only 
 
 # --- Retry button detection ---
 TEMPLATE_FILE = "retry_text.png"     # just the word RETRY (keep next to this script)
-THRESHOLD = 0.90          # strict on purpose, so the Leave button can't match
+THRESHOLD = 0.92          # NEVER relaxed: conservative Retry confirmation
 ALT_RETRY_FILE = "alt_retry_button.png"   # optional: a picture of the WHOLE retry button, "RETRY (0/1)".
                                           # Only used as an extra check when retry_text.png finds nothing.
-ALT_RETRY_THRESHOLD = 0.85   # the alt picture has the button colour around the word, so it is a bit looser
+ALT_RETRY_THRESHOLD = 0.92   # never lower the absolute Retry confidence threshold
 ALT_RETRY_WORD_COLS = (24, 100)   # the RETRY word only (x range inside the alt picture), because the
                                   # "(0/1)" counter changes; it is tried as well as the whole picture
 SCAN_INTERVAL = 0.5       # seconds between screen checks for the retry button
@@ -205,7 +222,7 @@ FORCE_SCALE = None        # None = automatic (screen height / 1080). Set e.g. 1.
 SCALE_THRESHOLD_RELAX = 0.05   # on a non-1080p screen every match threshold is lowered by this much
                                # (scaling the picture blurs it a little, so scores come out lower)
 AFTER_CLICK_DELAY = 7     # seconds of doing NOTHING right after clicking retry
-RETRY_CLICK_TIME = 0.8     # the retry button is clicked over and over this long (not just once)
+RETRY_CLICK_TIME = 0.0     # one verified click; no uncontrolled repeated presses
 RETRY_CLICK_INTERVAL = 0.1  # pause between those clicks
 RETRY_CONFIRM_DELAY = 0.4 # re-check this long after first sighting (buttons fade in)
 SAVE_CLICK_DEBUG = False   # saves last_retry_click.png showing exactly where it clicked
@@ -253,14 +270,14 @@ def active_loot_kinds():
             if (k != "attack_vessel" or is_attack)
             and (k != "vessel" or (is_raid and not is_attack))]
 LOOT_THRESHOLD = 0.75     # lower it if loot is missed, raise it if you get false hits
-LOOT_SCAN_TIME = 1.0      # seconds spent looking (items can fade in) before clicking retry
+LOOT_SCAN_TIME = 2.3      # allow loot icons to fade in before clicking Retry
 LOOT_SCAN_STEP = 0.25     # seconds between looks during that time
 LOOT_FIX_SCALES = [0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95, 1.0, 1.05, 1.1, 1.15,
                    1.2, 1.3, 1.4, 1.5, 1.65, 1.8, 2.0]   # "Fix loot tracking": icon sizes tried
 LOOT_FIX_RELAX = 0.05     # "Fix loot tracking": loot threshold is this much lower (resized icons are blurrier)
 LOOT_SAFE_THRESHOLD = 0.82  # stricter than the old 0.75; reduce HUD and similar-icon false hits
 LOOT_SAFE_SINGLE_THRESHOLD = 0.88  # fast mode has only one captured frame, so require more confidence
-SAVE_LOOT_DEBUG = True     # save last_end_scan.png for troubleshooting on each end-screen detection
+SAVE_LOOT_DEBUG = False    # opt-in; automated error snapshots handle failures
 LOW_LOOT_SCAN_TIME = 3.0  # low quality only: the loot is looked for ONLY during this many seconds
                           # right after the retry click (nothing is looked for before the click)
 # SAVE_LOOT_DEBUG is enabled above for testing; last_end_scan.png is saved locally.
@@ -282,7 +299,7 @@ ABILITY4_COOLDOWN = 15.0           # seconds of buying time after ability 3
 ABILITY4_COOLDOWN_MARGIN = 0.3     # tiny extra, so ability 4 is surely off cooldown
 
 # --- Stuck-mission rescue (a very rare obscure bug after the shift can leave the macro stuck) ---
-MISSION_TIMEOUT = 120.0     # DEFAULT failsafe time (2 min); the live value is in Settings > Configs > Failsafe
+MISSION_TIMEOUT = 120.0     # DEFAULT failsafe time (2 min); the live value is in Settings > Recovery > Failsafe
 MIN_FAILSAFE_SECONDS = 10   # the failsafe time can't be set lower than this
 MAX_FAILSAFE_MINUTES = 60
 RESCUE_CLICK_DELAY = 0.5    # seconds between the failsafe clicks
@@ -458,7 +475,7 @@ RAID_LOOP_DELAY = 0.02           # seconds between two checks while waiting duri
 RAID_LOOK_INTERVAL = 0.05        # seconds between two looks for the skip / finish button (not editable)
 
 
-# --- Edit configs (Settings > Configs > Abilities > Edit configs) ---
+# --- Edit configs (Settings > Macros > Abilities > Edit configs) ---
 # Every timing of the routine can be changed there, per part: Movement (shared by all) and the three
 # ability configs. The constants above are the DEFAULTS; only values the user changed are saved
 # (settings["timings"]). field = (key, label, kind, default, low, high, group, hint)
@@ -668,7 +685,7 @@ CONFIG_FIELDS = {
         _f("skip_press_interval", "Repeat Skip every", "sec", 0.9, 0.4, 5, "Cutscenes",
            "Retry E only while the skip button remains on screen. No inputs if disabled."),
         _f("chest1", "Raider's Chest", "spot", None, 0, 20000, "Chests",
-           "Left chest position. Use Pick spot in Settings > Configs."),
+           "Left chest position. Use Pick spot in Settings > Macros."),
         _f("chest2", "Emperor's Trove", "spot", None, 0, 20000, "Chests",
            "Optional right chest position. Uses an Emperor's Key when enabled."),
         _f("open_chest2", "Open Emperor's Trove", "bool", False, 0, 1, "Chests",
@@ -731,7 +748,7 @@ CONFIG_FIELDS[ATTACK_BLOOD_KEY] = [
     spec for spec in CONFIG_FIELDS[ATTACK_FRITZ_KEY] if spec[0] in _ATTACK_SHARED_FIELDS
 ]
 CONFIG_INDEX = {sec: {f[0]: f for f in fields} for sec, fields in CONFIG_FIELDS.items()}
-# fields that live in Settings > Configs instead of the Edit configs window (still saved in the same place)
+# fields that live in Settings > Macros instead of the Edit configs window (still saved in the same place)
 CONFIG_HIDDEN = {"Female Raid": ("chest1", "chest2"),
                  "Attack Titan Raid": ("chest1", "chest2"),
                  ATTACK_BLOOD_KEY: ("chest1", "chest2")}
@@ -742,8 +759,8 @@ CONFIG_INFO = {
     "Universal": "Used while the Universal abilities are selected.",
     OUTSKIRTS_FRITZ_KEY: "Fritz skills with Universal movement. Extra Skill 3 animation wait is editable here.",
     "Blood Awakening": "Used while the Blood Awakening abilities are selected.",
-    "Female Raid": "Used while Female Raid is selected. (The chest locations are set in Settings > Configs.)",
-    "Attack Titan Raid": "Attack Titan Raid Fritz (Not Recommended). Colossal chest spots are set in Settings > Configs.",
+    "Female Raid": "Used while Female Raid is selected. (The chest locations are set in Settings > Macros.)",
+    "Attack Titan Raid": "Attack Titan Raid Fritz (Not Recommended). Colossal chest spots are set in Settings > Macros.",
     ATTACK_BLOOD_KEY: "Acoustic Shells (Skill 2), forward Space-Space Dash, Shift (Skill 5), and Colossal combat.",
 }
 
@@ -1141,6 +1158,7 @@ DEFAULT_KEYBINDS = {k: v[1] for k, v in {**HOTKEY_BINDS, **GAME_BINDS}.items()}
 DEFAULT_WEBHOOK = {
     "url": "",              # empty = Discord is off
     "mention": False,       # ping the user in error messages
+    "notify_disconnect_ping": True,  # ping User ID once per real disconnect (default ON)
     "user_id": "",          # the Discord user ID that gets pinged
     "hourly_graph": False,  # send a stats graph every graph_hours hours
     "graph_hours": 1,       # that interval, in hours
@@ -1174,7 +1192,8 @@ RECONNECT_CLICK_DELAY_RANGE = (0.0, 60.0)    # what the Click delay boxes accept
 RECONNECT_PLAY_DELAY = 0.5                   # the wait between Create and Play (default; tweakable like the click delay)
 RECONNECT_PLAY_KEYS = ("m_play", "r_play")   # the Play spots of the Missions / Raids tab (they use that wait)
 DEFAULT_RECONNECT = {"enabled": False, "spots": {}, "click_delay": RECONNECT_CLICK_DELAY,
-                     "play_delay": RECONNECT_PLAY_DELAY}   # Recovery > Reconnect > Configure: off until it is set up
+                     "play_delay": RECONNECT_PLAY_DELAY, "method": "coordinates",
+                     "server_mode": "public", "ps_code": ""}   # Recovery > Reconnect > Configure: off until it is set up
 RECONNECT_FIRST_DELAY = 2.0                  # the first click happens this long after the Select picture is seen
 RECONNECT_RESCUE_LIMIT = 120.0               # a failsafe rescue still running after this long forces a rejoin
 # The two pictures under the coordinates (saved in asset_override, like the Disconnect Image). They are the
@@ -1217,21 +1236,26 @@ settings = {
     "timings": {},          # Edit configs: {section: {key: value}} - only what the user changed
     "failsafe": dict(DEFAULT_FAILSAFE),     # stuck-mission rescue: time before it triggers + click spot
     "reconnect": {"enabled": False, "spots": {}, "click_delay": RECONNECT_CLICK_DELAY,
-                  "play_delay": RECONNECT_PLAY_DELAY},   # Recovery tab: the reconnect feature (off by default)
+                  "play_delay": RECONNECT_PLAY_DELAY, "method": "coordinates",
+                  "server_mode": "public", "ps_code": ""},   # Recovery tab (off by default)
     "retry_scale": None,    # template size that last found the retry button on a non-1080p screen
                             # (None = not found yet). Tried first; updated when another size matches
     "config_section": CONFIG_SECTIONS[0],   # Edit configs: the part that was open last (kept between runs)
     "opacity": 100,         # The Bums: saved window transparency setting
     "always_on_top": False, # footer switch "Always on top" (kept between runs)
-    "compact_ui": False,    # Settings > UI > "Compact mode": while the macro runs, hide the main
+    "compact_ui": False,    # Settings > App > "Compact mode": while the macro runs, hide the main
                             # window and show the small stats bar instead (off = keep the window)
-    "mini_pos": DEFAULT_MINI_POS,   # Settings > UI: Left / Middle / Right edge of Roblox
-    "animations": False,    # Settings > UI > "GUI animations": slide / fade effects (off = the plain look)
-    "fix_loot": False,      # Settings > Configs > Fix image detection > "Fix loot tracking" (Beta): look for
+    "mini_pos": DEFAULT_MINI_POS,   # Settings > App: Left / Middle / Right edge of Roblox
+    "animations": False,    # Settings > App > "GUI animations": slide / fade effects (off = the plain look)
+    "recognition_mode": "standard",  # Standard default; optional local Hybrid AI (Beta)
+    "fix_loot": False,      # Settings > Detection > Fix image detection > "Fix loot tracking" (Beta): look for
                             # the loot icons at many sizes, for UIs where the drops are resized
     "auto_monitor": True,     # The Bums: prefer the Roblox window monitor when found
     "adaptive_resolution": False,  # opt-in Beta: crop the Roblox client and remap clicks; OFF is legacy
-    "monitor": 1,           # Settings > Keybinds > Monitor: 1 = first monitor, 2 = second, ...
+    "background_mode": False,   # experimental window-scoped Win32 I/O; Standard is always default
+    "update_prefs": {"automatic":False,"download":True,"install_mode":"automatic"},
+    "performance_mode": "balanced",  # Eco/Balanced/Fast recognition scheduling
+    "monitor": 1,           # Settings > Roblox > Monitor: 1 = first monitor, 2 = second, ...
     "window": None,         # {"x", "y", "w", "h"} of the main window (None = never moved/resized)
 }
 
@@ -1321,6 +1345,12 @@ def load_settings(saved):
                                              else float(min(hi, max(lo, v))))
     rc = saved.get("reconnect")
     if isinstance(rc, dict):
+        if rc.get('method') in ('coordinates','image'):
+            settings['reconnect']['method'] = rc['method']
+        if rc.get('server_mode') in ('public','ps_code','gamepass'):
+            settings['reconnect']['server_mode'] = rc['server_mode']
+        if isinstance(rc.get('ps_code'), str) and len(rc['ps_code']) <= 128:
+            settings['reconnect']['ps_code'] = rc['ps_code']
         spots = rc.get("spots")
         if isinstance(spots, dict):
             for key, _name in RECONNECT_SPOTS:
@@ -1348,6 +1378,8 @@ def load_settings(saved):
         settings["compact_ui"] = saved["compact_ui"]
     elif isinstance(saved.get("legacy_ui"), bool):       # the first name of this switch (inverted)
         settings["compact_ui"] = not saved["legacy_ui"]
+    if saved.get("recognition_mode") in ("standard", "hybrid_beta"):
+        settings["recognition_mode"] = saved["recognition_mode"]
     if isinstance(saved.get("fix_loot"), bool):
         settings["fix_loot"] = saved["fix_loot"]
     if isinstance(saved.get("animations"), bool):
@@ -1356,6 +1388,16 @@ def load_settings(saved):
         settings["auto_monitor"] = saved["auto_monitor"]
     if isinstance(saved.get("adaptive_resolution"), bool):
         settings["adaptive_resolution"] = saved["adaptive_resolution"]
+    # Background Mode is In Development and cannot be enabled by old settings or presets.
+    settings["background_mode"] = False
+    if saved.get('performance_mode') in ('eco','balanced','fast'):
+        settings['performance_mode']=saved['performance_mode']
+    up=saved.get('update_prefs')
+    if isinstance(up,dict):
+        for key in ('automatic','download'):
+            if isinstance(up.get(key),bool):settings['update_prefs'][key]=up[key]
+        if up.get('install_mode') in ('automatic','ask'):
+            settings['update_prefs']['install_mode']=up['install_mode']
     mon = saved.get("monitor")
     if isinstance(mon, int) and not isinstance(mon, bool) and 1 <= mon <= 16:
         settings["monitor"] = mon
@@ -1416,7 +1458,7 @@ def list_monitors():
 
 def pick_monitor(monitors):
     """`monitors` = an mss .monitors list (entry 0 = all screens together). The monitor chosen in
-    Settings > Keybinds > Monitor, or the first one when that monitor isn't connected any more."""
+    Settings > Roblox > Monitor, or the first one when that monitor isn't connected any more."""
     idx = MONITOR_INDEX if 1 <= MONITOR_INDEX < len(monitors) else 1
     return monitors[idx] if idx < len(monitors) else monitors[0]
 
@@ -1447,6 +1489,22 @@ def reconnect_missing():
     and Play pictures and all 8 coordinates of the tab (Missions or Raids) of the macro that is selected - the 4 shared ones
     plus that tab's own 4."""
     missing = []
+    if settings['reconnect'].get('method') == 'image':
+        if settings['family'] not in ('Universal', 'Blood Awakening', OUTSKIRTS_FRITZ_KEY):
+            missing.append('Image Reconnect supports Outskirts mission macros only')
+        mode = settings['reconnect'].get('server_mode', 'public')
+        if mode not in ('public', 'ps_code', 'gamepass'):
+            missing.append('Server Mode')
+        if mode == 'ps_code' and not settings['reconnect'].get('ps_code', '').strip():
+            missing.append('Private Server Code')
+        for filename in ('rc_reconnect.png', 'rc_slot_a.png', 'rc_select.png',
+                         'rc_codes.png', 'rc_play_small.png', 'rc_ps_input.png',
+                         'rc_generate.png', 'rc_lobby.png', 'rc_play_large.png',
+                         'rc_missions.png', 'rc_outskirts.png', 'rc_create.png',
+                         'rc_start.png', 'rc_outskirts_selected.png'):
+            if not os.path.isfile(asset_path(filename)):
+                missing.append(filename)
+        return missing
     if not override_path(RECONNECT_IMAGE_FILE):
         missing.append("Disconnect Image")
     for kind, filename in RECONNECT_IMAGE_FILES.items():
@@ -1579,7 +1637,7 @@ def to_game_key(name, keypad=False):
 
 
 # --------------------------- custom macros (.tbmacro) -------------------------
-# Settings > Configs > "+" : your own macro, written as a pseudo-script or recorded. Every macro is
+# Settings > Macros > "+" : your own macro, written as a pseudo-script or recorded. Every macro is
 # ONE plain text file in Documents\thebums Macro\Custom-Macros, so sharing it = sending the file
 # (drop a received .tbmacro into that folder and it shows up in the dropdown).
 CUSTOM_FOLDER = "Custom-Macros"
@@ -1779,7 +1837,7 @@ _macro_chest_cache = {}      # path -> (mtime, uses openchest)
 
 
 def custom_uses_chest(key):
-    """Does that custom macro call openchest()? (Then Settings > Configs shows the chest spots.)"""
+    """Does that custom macro call openchest()? (Then Settings > Macros shows the chest spots.)"""
     path = custom_path(key)
     try:
         stamp = os.path.getmtime(path)
@@ -2447,6 +2505,8 @@ def count_macro_nodes(nodes):
 
 # ----- the pseudo-script: running (inside the macro thread, so stop / pause / retry just work) -----
 def _macro_mouse_rel(dx, dy):
+    if _background_unfocused():
+        return _background_backend.move_relative(dx, dy)
     if IS_WIN:
         ctypes.windll.user32.mouse_event(0x0001, int(dx), int(dy), 0, 0)   # MOUSEEVENTF_MOVE
     else:
@@ -2486,7 +2546,7 @@ def _macro_image(name):
     _macro_img_cache[name] = (stamp, tpl)
     if tpl is None and name not in _macro_img_warned:
         _macro_img_warned.add(name)
-        log(f"Macro picture '{name}' not found - add it in Settings > Fix image detection > Macros "
+        log(f"Macro picture '{name}' not found - add it in Settings > Detection > Fix image detection > Macros "
             "(until then 'find' says not seen)")
     return tpl
 
@@ -2575,7 +2635,7 @@ def macro_trackloot():
     """trackloot(): look for the loot pictures on screen now and add what is seen to the loot
     counters. The retry handling then doesn't count the same loot a second time."""
     if not any(_loot_templates.values()):
-        log("trackloot(): no loot pictures loaded - nothing to look for (Settings > Fix image detection)")
+        log("trackloot(): no loot pictures loaded - nothing to look for (Settings > Detection > Fix image detection)")
         return
     show("Tracking loot", "Looking for the loot pictures")
     found = {}
@@ -2595,9 +2655,9 @@ def macro_trackloot():
 def macro_openchest():
     """openchest(): the raid's chest part. Waits for the finish button, then opens chest 1 (and chest
     2 when it is on) and clicks finish - the spots and click times are the Female Raid ones
-    (Settings > Configs > Chest locations / Edit configs)."""
+    (Settings > Macros > Chest locations / Edit configs)."""
     if not _raid_templates.get("finish"):
-        log("openchest(): finish_button.png not found - add it in Settings > Configs > "
+        log("openchest(): finish_button.png not found - add it in Settings > Macros > "
             "Fix image detection")
         return
     log("openchest(): waiting for the finish button")
@@ -2724,7 +2784,7 @@ def custom_routine():
         for no, msg in errors[:8]:
             log(f"{title}: line {no}: {msg}")
         raise RuntimeError(f"custom macro '{title}' has {len(errors)} error(s) - fix it in "
-                           "Settings > Configs (the Edit button next to the dropdown)")
+                           "Settings > Macros (the Edit button next to the dropdown)")
     _macro_img_cache.clear()
     _macro_img_warned.clear()
     set_step(0)
@@ -2946,14 +3006,19 @@ def mention_id():
     return uid if wh["mention"] and uid.isdigit() else ""
 
 
-def post_webhook(text, png=None, ping=True, title="thebums", embed=None):
+def post_webhook(text, png=None, ping=True, title="thebums", embed=None, disconnect_ping=False):
     """Send one message (optionally with a PNG picture). Blocks; returns (ok, message)."""
     url = webhook_url()
     if not url:
         if settings["webhook"]["use_bot"]:
             return False, "The bot token or the channel ID is missing / not valid"
         return False, "No valid webhook URL (it starts with https://discord.com/api/webhooks/)"
-    uid = mention_id() if ping else ""
+    # Disconnect alerts have their own opt-in switch, independent of error mentions.
+    # An explicit allowlist prevents accidental @everyone/@here or role pings.
+    wh = settings["webhook"]
+    disconnect_id = wh["user_id"].strip()
+    uid = (disconnect_id if disconnect_ping and wh.get("notify_disconnect_ping", True)
+           and disconnect_id.isdigit() else mention_id() if ping else "")
     payload = {"content": f"<@{uid}> {text}" if uid else text,
                "allowed_mentions": {"users": [uid]} if uid else {"parse": []}}
     if embed is not None:
@@ -3004,6 +3069,35 @@ def notify_async(text):
         ok, msg = post_webhook(text)
         if not ok:
             log(f"Discord: {msg}")
+    threading.Thread(target=work, daemon=True).start()
+
+
+def is_game_disconnect(reason):
+    """Only genuine on-screen disconnections, never manual !reconnect or a failsafe."""
+    reason = str(reason).lower()
+    return ('disconnect image' in reason or 'reconnect button detected' in reason
+            or 'leave dialog' in reason or 'leave-only disconnect' in reason)
+
+
+def notify_disconnect_once(reason):
+    """Notify once per detected disconnect episode, on both reconnect routes.
+
+    The latch is reset only after a successful recovery (or a new run), not
+    after a failed retry. A missing Discord connection never blocks recovery.
+    """
+    if not is_game_disconnect(reason) or state.get('disconnect_alert_sent'):
+        return
+    state['disconnect_alert_sent'] = True
+    if not webhook_url():
+        return
+    message = ('Roblox disconnected. Auto Reconnect is attempting to restore the game.'
+               if settings['reconnect'].get('enabled') else
+               'Roblox disconnected. Auto Reconnect is turned off.')
+
+    def work():
+        ok, msg = post_webhook(message, ping=False, disconnect_ping=True)
+        if not ok:
+            log('Discord disconnect alert: ' + msg)
     threading.Thread(target=work, daemon=True).start()
 
 
@@ -3375,6 +3469,564 @@ def mission_embed(result, found, mission_seconds=None):
     }
 
 
+# ---------------- Background Mode (Windows, opt-in Beta) ------------------
+# This is deliberately a separate backend. Standard Mode never uses GDI/window
+# messages, and a failed Beta operation must NEVER send input to another app.
+# Windows messages are experimental with Roblox raw input; a successful queue
+# operation does not prove that Roblox consumed the game action.
+class BackgroundModeUnavailable(RuntimeError):
+    pass
+
+
+def _bg_win_vk(name):
+    """Convert configured game keys to Win32 virtual keys; unknown keys fail closed."""
+    key = str(name).strip().lower().replace(' ', '')
+    names = {'space': 0x20, 'enter': 0x0d, 'return': 0x0d,
+             'tab': 0x09, 'esc': 0x1b, 'escape': 0x1b,
+             'ctrl': 0x11, 'control': 0x11, 'ctrlleft': 0xa2, 'ctrlright': 0xa3,
+             'shift': 0x10, 'shiftleft': 0xa0, 'shiftright': 0xa1,
+             'alt': 0x12, 'altleft': 0xa4, 'altright': 0xa5,
+             'up': 0x26, 'down': 0x28, 'left': 0x25, 'right': 0x27,
+             'backspace': 0x08, 'delete': 0x2e}
+    if key in names:
+        return names[key]
+    if len(key) == 1 and key in 'abcdefghijklmnopqrstuvwxyz0123456789':
+        return ord(key.upper())
+    if key.startswith('f') and key[1:].isdigit() and 1 <= int(key[1:]) <= 24:
+        return 0x6f + int(key[1:])
+    if key.startswith('num') and len(key) == 4 and key[3:].isdigit():
+        return 0x60 + int(key[3:])
+    raise BackgroundModeUnavailable('Background Beta cannot map game key: ' + key)
+
+
+def _bg_mouse_lparam(x, y):
+    return (int(x) & 0xffff) | ((int(y) & 0xffff) << 16)
+
+
+class _BackgroundWgcFrames:
+    """Read-only, window-scoped WGC frames. No disk writes or game input.
+
+    The callback runs on the capture library's thread and owns the copy of the
+    pixel data. We never expose the native frame buffer beyond its callback.
+    """
+    def __init__(self, hwnd):
+        if windows_capture is None:
+            raise BackgroundModeUnavailable('Windows Graphics Capture library is not installed')
+        self._lock = threading.Lock()
+        self._ready = threading.Event()
+        self._frame = None
+        self._updated = 0.0
+        self._closed = False
+        self._error = None
+        self._control = None
+        capture = windows_capture.WindowsCapture(
+            window_hwnd=int(hwnd), cursor_capture=False, draw_border=False,
+            minimum_update_interval=100)
+
+        @capture.event
+        def on_frame_arrived(frame, _control):
+            try:
+                pixels = frame.frame_buffer
+                if pixels.ndim != 3 or pixels.shape[2] < 3:
+                    raise ValueError('WGC returned an unsupported pixel format')
+                bgr = np.ascontiguousarray(pixels[:, :, :3])
+                with self._lock:
+                    self._frame = bgr
+                    self._updated = time.monotonic()
+                self._ready.set()
+            except Exception as exc:
+                with self._lock:
+                    self._error = f'{type(exc).__name__}: {exc}'
+                self._ready.set()
+
+        @capture.event
+        def on_closed():
+            with self._lock:
+                self._closed = True
+            self._ready.set()
+
+        self._control = capture.start_free_threaded()
+
+    def latest(self, timeout=2.0, max_age=5.0):
+        self._ready.wait(timeout)
+        with self._lock:
+            if self._error:
+                raise BackgroundModeUnavailable('WGC capture failed: ' + self._error)
+            if self._closed:
+                raise BackgroundModeUnavailable('WGC window capture session closed')
+            if self._frame is None:
+                raise BackgroundModeUnavailable('No WGC frame received from Roblox')
+            if time.monotonic() - self._updated > max_age:
+                raise BackgroundModeUnavailable('WGC Roblox frames stopped updating')
+            return self._frame
+
+    def stop(self):
+        control, self._control = self._control, None
+        if control is not None:
+            try:
+                control.stop()
+            except Exception:
+                pass
+
+
+class _BackgroundRobloxWindow:
+    """Pinned Win32 Roblox target, client-only capture and client-scoped messages.
+
+    PrintWindow is best-effort for DirectX games. Invalid/black captures and
+    unsupported inputs raise instead of degrading to desktop input.
+    """
+    def __init__(self):
+        if not IS_WIN:
+            raise BackgroundModeUnavailable('Background Beta is Windows-only')
+        from ctypes import wintypes as wt
+        self.wt = wt
+        self.u = ctypes.WinDLL('user32', use_last_error=True)
+        self.gdi = ctypes.WinDLL('gdi32', use_last_error=True)
+        self.kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+        self.hwnd = None
+        self.pointer = None      # client-relative location; never read other apps' cursor
+        self.last_capture_at = 0.0
+        self.lock = threading.RLock()
+        self._wgc = None
+        self._wgc_hwnd = None
+        self._pw_signature = None
+        self._pw_unchanged_since = None
+        self.capture_engine_name = 'WGC' if windows_capture is not None else 'PrintWindow (fallback)'
+        ptr = ctypes.c_void_p
+        self.u.FindWindowW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p]
+        self.u.FindWindowW.restype = ptr
+        for name in ('IsWindow', 'IsIconic'):
+            getattr(self.u, name).argtypes = [ptr]
+            getattr(self.u, name).restype = ctypes.c_int
+        self.u.GetForegroundWindow.restype = ptr
+        self.u.GetWindowRect.argtypes = [ptr, ctypes.POINTER(wt.RECT)]
+        self.u.GetWindowRect.restype = ctypes.c_int
+        self.u.GetClientRect.argtypes = [ptr, ctypes.POINTER(wt.RECT)]
+        self.u.GetClientRect.restype = ctypes.c_int
+        self.u.ClientToScreen.argtypes = [ptr, ctypes.POINTER(wt.POINT)]
+        self.u.ClientToScreen.restype = ctypes.c_int
+        self.u.ScreenToClient.argtypes = [ptr, ctypes.POINTER(wt.POINT)]
+        self.u.ScreenToClient.restype = ctypes.c_int
+        self.u.PostMessageW.argtypes = [ptr, ctypes.c_uint, ctypes.c_size_t, ctypes.c_ssize_t]
+        self.u.PostMessageW.restype = ctypes.c_int
+        self.u.GetWindowThreadProcessId.argtypes = [ptr, ctypes.POINTER(wt.DWORD)]
+        self.u.GetWindowThreadProcessId.restype = wt.DWORD
+        self.kernel.OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
+        self.kernel.OpenProcess.restype = ptr
+        self.kernel.QueryFullProcessImageNameW.argtypes = [ptr, wt.DWORD, wt.LPWSTR, ctypes.POINTER(wt.DWORD)]
+        self.kernel.QueryFullProcessImageNameW.restype = wt.BOOL
+        self.kernel.CloseHandle.argtypes = [ptr]
+        self.kernel.CloseHandle.restype = wt.BOOL
+        self.u.PrintWindow.argtypes = [ptr, ptr, ctypes.c_uint]
+        self.u.PrintWindow.restype = ctypes.c_int
+        self.gdi.CreateCompatibleDC.argtypes = [ptr]
+        self.gdi.CreateCompatibleDC.restype = ptr
+        self.gdi.CreateDIBSection.argtypes = [ptr, ptr, ctypes.c_uint, ctypes.POINTER(ptr), ptr, ctypes.c_uint]
+        self.gdi.CreateDIBSection.restype = ptr
+        self.gdi.SelectObject.argtypes = [ptr, ptr]
+        self.gdi.SelectObject.restype = ptr
+        self.gdi.DeleteObject.argtypes = [ptr]
+        self.gdi.DeleteObject.restype = ctypes.c_int
+        self.gdi.DeleteDC.argtypes = [ptr]
+        self.gdi.DeleteDC.restype = ctypes.c_int
+
+    def _is_roblox_process(self, hwnd):
+        pid = self.wt.DWORD()
+        if not self.u.GetWindowThreadProcessId(hwnd, ctypes.byref(pid)) or not pid.value:
+            return False
+        process = self.kernel.OpenProcess(0x1000, False, pid.value)  # QUERY_LIMITED_INFORMATION
+        if not process:
+            return False
+        try:
+            buf = ctypes.create_unicode_buffer(32768)
+            size = self.wt.DWORD(len(buf))
+            if not self.kernel.QueryFullProcessImageNameW(process, 0, buf, ctypes.byref(size)):
+                return False
+            return os.path.basename(buf.value).lower() == 'robloxplayerbeta.exe'
+        finally:
+            self.kernel.CloseHandle(process)
+
+    def bind(self):
+        with self.lock:
+            if self.hwnd and self.u.IsWindow(self.hwnd) and self._is_roblox_process(self.hwnd):
+                return self.hwnd
+            candidate = self.u.FindWindowW(None, 'Roblox')
+            if not candidate or not self._is_roblox_process(candidate):
+                self.hwnd = None
+                self.pointer = None
+                raise BackgroundModeUnavailable('RobloxPlayerBeta.exe window is not available')
+            self.close()
+            self.hwnd = candidate
+            self.pointer = None
+            self.last_capture_at = 0.0
+            self._pw_signature = None
+            self._pw_unchanged_since = None
+            return candidate
+
+    def geometry(self):
+        hwnd = self.bind()
+        if self.u.IsIconic(hwnd):
+            raise BackgroundModeUnavailable('Minimized Roblox cannot be controlled reliably')
+        rect = self.wt.RECT()
+        pos = self.wt.POINT(0, 0)
+        if not self.u.GetClientRect(hwnd, ctypes.byref(rect)) or not self.u.ClientToScreen(hwnd, ctypes.byref(pos)):
+            raise BackgroundModeUnavailable('Could not read Roblox client geometry')
+        width, height = int(rect.right), int(rect.bottom)
+        if width < 200 or height < 200:
+            raise BackgroundModeUnavailable('Roblox client is too small for template detection')
+        return {'left': int(pos.x), 'top': int(pos.y), 'width': width, 'height': height}
+
+    def unfocused(self):
+        return self.bind() != self.u.GetForegroundWindow()
+
+    def _post(self, message, wparam, lparam):
+        self.geometry()       # revalidate HWND/process/minimized before EVERY action
+        # Queueing WM_* is not proof of delivery. Require an actual, recent
+        # client-only capture before attempting any unfocused game action.
+        if self.unfocused() and time.monotonic() - self.last_capture_at > 2.0:
+            self.capture()
+        if not self.u.PostMessageW(self.hwnd, message, wparam, lparam):
+            raise BackgroundModeUnavailable('Roblox did not accept a window message')
+
+    def key(self, name, down):
+        with self.lock:
+            vk = _bg_win_vk(name)
+            # WM_KEYDOWN / WM_KEYUP; scan code and previous-state flag where applicable
+            scan = int(self.u.MapVirtualKeyW(vk, 0)) & 0xff
+            lparam = 1 | (scan << 16) | (0 if down else (3 << 30))
+            self._post(0x0100 if down else 0x0101, vk, lparam)
+
+    def move_to_screen(self, x, y):
+        with self.lock:
+            self.geometry()
+            pt = self.wt.POINT(int(x), int(y))
+            if not self.u.ScreenToClient(self.hwnd, ctypes.byref(pt)):
+                raise BackgroundModeUnavailable('Screen-to-client mapping failed')
+            area = self.geometry()
+            # Never reuse a screen-coordinate match from an earlier capture if
+            # the user moved/resized Roblox before the click. Capturing again
+            # lets the existing detector recompute a fresh position.
+            captured = _capture_rect if _adaptive_run_enabled else None
+            if (_background_run_enabled and self.unfocused() and captured and
+                    any(int(captured[k]) != int(area[k]) for k in
+                        ('left', 'top', 'width', 'height'))):
+                raise BackgroundModeUnavailable('Roblox window moved/resized after recognition')
+            if not (0 <= pt.x < area['width'] and 0 <= pt.y < area['height']):
+                raise BackgroundModeUnavailable('Background click falls outside Roblox client')
+            self.pointer = (int(pt.x), int(pt.y))
+            self._post(0x0200, 0, _bg_mouse_lparam(*self.pointer))
+
+    def move_relative(self, dx, dy):
+        # Two-pixel mouse nudge before a UI click is supported; camera turning
+        # through raw/relative mouse input is NOT supported by window messages.
+        with self.lock:
+            if abs(int(dx)) > 2 or abs(int(dy)) > 2:
+                raise BackgroundModeUnavailable('Relative camera movement needs Roblox focus')
+            if self.pointer is None:
+                raise BackgroundModeUnavailable('Background mouse position has not been set')
+            area = self.geometry()
+            x = max(0, min(area['width'] - 1, self.pointer[0] + int(dx)))
+            y = max(0, min(area['height'] - 1, self.pointer[1] + int(dy)))
+            self.pointer = (x, y)
+            self._post(0x0200, 0, _bg_mouse_lparam(x, y))
+
+    def click(self, button='left'):
+        with self.lock:
+            if self.pointer is None:
+                raise BackgroundModeUnavailable('Background click has no validated target point')
+            which = str(button).lower()
+            if which not in ('left', 'right'):
+                raise BackgroundModeUnavailable('Unsupported background mouse button: ' + which)
+            lparam = _bg_mouse_lparam(*self.pointer)
+            self._post(0x0201 if which == 'left' else 0x0204,
+                       1 if which == 'left' else 2, lparam)
+            self._post(0x0202 if which == 'left' else 0x0205, 0, lparam)
+
+    def close(self):
+        """Release optional native capture resources on Stop/window change."""
+        session, self._wgc = self._wgc, None
+        self._wgc_hwnd = None
+        if session is not None:
+            session.stop()
+
+    def _wgc_client_frame(self, frame, area):
+        """Crop a window-wide WGC image to the actual game *client* pixels.
+
+        Cropping based on an unverified title-bar offset is unsafe: recognition
+        would silently shift click coordinates. Accept only matched Win32/DWM
+        window dimensions (or an already-client-sized frame).
+        """
+        height, width = area['height'], area['width']
+        fh, fw = frame.shape[:2]
+        if (fh, fw) == (height, width):
+            return frame
+        bounds = []
+        rect = self.wt.RECT()
+        if self.u.GetWindowRect(self.hwnd, ctypes.byref(rect)):
+            bounds.append((int(rect.left), int(rect.top),
+                           int(rect.right), int(rect.bottom)))
+        try:
+            dwm = ctypes.WinDLL('dwmapi', use_last_error=True)
+            dwm.DwmGetWindowAttribute.argtypes = [ctypes.c_void_p, ctypes.c_uint,
+                                                  ctypes.c_void_p, ctypes.c_uint]
+            dwm.DwmGetWindowAttribute.restype = ctypes.c_int
+            r = self.wt.RECT()
+            # DWMWA_EXTENDED_FRAME_BOUNDS (9) removes invisible resize borders.
+            if dwm.DwmGetWindowAttribute(self.hwnd, 9, ctypes.byref(r),
+                                         ctypes.sizeof(r)) == 0:
+                bounds.append((int(r.left), int(r.top), int(r.right), int(r.bottom)))
+        except (AttributeError, OSError):
+            pass
+        for left, top, right, bottom in bounds:
+            if abs((right-left)-fw) > 2 or abs((bottom-top)-fh) > 2:
+                continue
+            x, y = area['left']-left, area['top']-top
+            if 0 <= x <= fw-width and 0 <= y <= fh-height:
+                return frame[y:y+height, x:x+width]
+        raise BackgroundModeUnavailable(
+            f'WGC image {fw}x{fh} cannot be aligned to Roblox client '
+            f'{width}x{height}; refusing inaccurate recognition')
+
+    def _capture_wgc(self, area):
+        if self._wgc is None or self._wgc_hwnd != self.hwnd:
+            self.close()
+            try:
+                self._wgc = _BackgroundWgcFrames(self.hwnd)
+            except Exception as exc:
+                raise BackgroundModeUnavailable('Cannot start WGC Roblox capture: '
+                                                + str(exc)) from exc
+            self._wgc_hwnd = self.hwnd
+        frame = self._wgc_client_frame(self._wgc.latest(), area)
+        sample = frame[::max(1, frame.shape[0]//80),
+                       ::max(1, frame.shape[1]//80)]
+        if sample.max() < 8 or float(sample.std()) < 2.0:
+            raise BackgroundModeUnavailable('WGC Roblox frame is blank or uniform')
+        self.last_capture_at = time.monotonic()
+        return frame
+
+    def capture(self):
+        """Read Roblox client pixels via WGC, or legacy PrintWindow if absent.
+
+        Never fall back to screenshots of other windows when Roblox is occluded.
+        """
+        if windows_capture is not None:
+            with self.lock:
+                return self._capture_wgc(self.geometry())
+        return self._capture_printwindow()
+
+    def _capture_printwindow(self):
+        """Legacy client-only PrintWindow; reject blank and frozen renders."""
+        with self.lock:
+            area = self.geometry()
+            width, height = area['width'], area['height']
+            class Header(ctypes.Structure):
+                _fields_ = [('size', ctypes.c_uint32), ('width', ctypes.c_int32),
+                            ('height', ctypes.c_int32), ('planes', ctypes.c_uint16),
+                            ('bitcount', ctypes.c_uint16), ('compression', ctypes.c_uint32),
+                            ('image_size', ctypes.c_uint32), ('xppm', ctypes.c_int32),
+                            ('yppm', ctypes.c_int32), ('used', ctypes.c_uint32),
+                            ('important', ctypes.c_uint32)]
+            class Info(ctypes.Structure):
+                _fields_ = [('header', Header), ('colors', ctypes.c_uint32 * 1)]
+            info = Info()
+            info.header.size = ctypes.sizeof(Header)
+            info.header.width = width
+            info.header.height = -height         # top-down BGR(A)
+            info.header.planes = 1
+            info.header.bitcount = 32
+            bits = ctypes.c_void_p()
+            dc = self.gdi.CreateCompatibleDC(None)
+            if not dc:
+                raise BackgroundModeUnavailable('Cannot allocate background capture DC')
+            bitmap = None
+            old = None
+            try:
+                bitmap = self.gdi.CreateDIBSection(dc, ctypes.byref(info), 0,
+                                                   ctypes.byref(bits), None, 0)
+                if not bitmap or not bits.value:
+                    raise BackgroundModeUnavailable('Cannot allocate background capture bitmap')
+                old = self.gdi.SelectObject(dc, bitmap)
+                # PW_CLIENTONLY | PW_RENDERFULLCONTENT; GPU games may ignore these.
+                if not self.u.PrintWindow(self.hwnd, dc, 0x00000003):
+                    raise BackgroundModeUnavailable('Roblox does not support PrintWindow capture')
+                buf = (ctypes.c_ubyte * (width * height * 4)).from_address(bits.value)
+                frame = np.ctypeslib.as_array(buf).reshape(height, width, 4)[:, :, :3].copy()
+                sample = frame[::max(1, height // 80), ::max(1, width // 80)]
+                if sample.max() < 8 or float(sample.std()) < 2.0:
+                    raise BackgroundModeUnavailable('Roblox background capture is blank or uniform')
+                # PrintWindow can succeed while returning a frozen GPU frame.
+                # Treat prolonged byte-identical samples as unusable rather
+                # than letting the macro wait forever for a mission icon.
+                thumb = cv2.resize(sample, (32, 18), interpolation=cv2.INTER_AREA)
+                now = time.monotonic()
+                if self._pw_signature is not None and np.array_equal(thumb, self._pw_signature):
+                    if self._pw_unchanged_since is not None and now - self._pw_unchanged_since > 8.0:
+                        raise BackgroundModeUnavailable('PrintWindow Roblox image has not changed for 8s')
+                else:
+                    self._pw_signature = thumb
+                    self._pw_unchanged_since = now
+                self.last_capture_at = now
+                return frame
+            finally:
+                if old:
+                    self.gdi.SelectObject(dc, old)
+                if bitmap:
+                    self.gdi.DeleteObject(bitmap)
+                self.gdi.DeleteDC(dc)
+
+
+_background_run_enabled = False
+_background_backend = None
+
+
+def _background_unfocused():
+    if not (IS_WIN and _background_run_enabled):
+        return False
+    # An uninitialized/failed Beta backend must never send desktop input.
+    if _background_backend is None:
+        raise BackgroundModeUnavailable('Background Beta target is not initialized')
+    return _background_backend.unfocused()
+
+
+def await_standard_ps_input():
+    """Pause the reconnect worker until the user explicitly chooses Standard.
+
+    No keyboard or mouse input is emitted while waiting. Resume is accepted
+    only after the pinned Roblox window has focus and the Background switch
+    has been disabled in Settings. The switch remains off for the rest of
+    this run; it is not silently re-enabled after reconnecting.
+    """
+    global _background_run_enabled, _adaptive_run_enabled
+    if not _background_run_enabled:
+        return
+    state['background_ps_code_waiting'] = True
+    state['paused'] = True
+    ev.put(('status', 'paused'))
+    notice = ('Auto Reconnect needs Standard Mode to enter your PS Code safely. '
+              'In Settings > Roblox, turn off Background Mode, focus Roblox, '
+              'then press Resume (F6).')
+    log(notice)
+    show('Auto Reconnect paused', notice)
+    try:
+        last_warning = ''
+        while True:
+            if state['quit']:
+                raise SystemExit
+            standard_selected = not settings.get('background_mode', False)
+            if not standard_selected and not state['paused']:
+                state['paused'] = True
+                ev.put(('status', 'paused'))
+            if standard_selected and not state['paused']:
+                try:
+                    roblox_focused = (_background_backend is not None
+                                      and not _background_backend.unfocused())
+                except BackgroundModeUnavailable:
+                    roblox_focused = False
+                if roblox_focused:
+                    # All active keys were released upon entering reconnect.
+                    _background_run_enabled = False
+                    # Keep this run's client-area capture mode: the templates
+                    # were normalized to that geometry at macro startup.
+                    # Switching to full-monitor capture here could invalidate
+                    # _scale and every remaining recognition/click coordinate.
+                    log('Auto Reconnect: Standard input confirmed; client-area recognition preserved')
+                    return
+                state['paused'] = True
+                ev.put(('status', 'paused'))
+                warning = 'Bring Roblox to the foreground, then press Resume (F6).'
+                if warning != last_warning:
+                    log(warning)
+                    last_warning = warning
+            time.sleep(.15)
+    finally:
+        state['background_ps_code_waiting'] = False
+
+
+class _BackgroundInputProxy:
+    """Preserve original pydirectinput exactly unless an opt-in run is unfocused."""
+    def __init__(self, original):
+        self.original = original
+        self._held = {}  # (thread id, key) -> delivery path for paired keyUp
+        self._lock = threading.RLock()
+
+    # These methods bypass the explicit key/click routing above. In Beta they
+    # must NEVER fall through to desktop-wide input by way of __getattr__.
+    _UNROUTED_INPUT = frozenset({
+        'press', 'write', 'typewrite', 'hotkey', 'mouseDown', 'mouseUp',
+        'doubleClick', 'tripleClick', 'scroll', 'hscroll', 'vscroll',
+        'dragTo', 'dragRel', 'keyHold', 'mouseDrag',
+    })
+
+    def __getattr__(self, name):
+        original = getattr(self.original, name)
+        if name not in self._UNROUTED_INPUT or not callable(original):
+            return original
+
+        def checked(*args, **kwargs):
+            if _background_run_enabled:
+                raise BackgroundModeUnavailable(
+                    'Background Beta blocks desktop-only input method: ' + name)
+            return original(*args, **kwargs)
+        return checked
+
+    def keyDown(self, key, *args, **kwargs):
+        path = 'window' if _background_unfocused() else 'desktop'
+        if path == 'window':
+            result = _background_backend.key(key, True)
+        else:
+            result = self.original.keyDown(key, *args, **kwargs)
+        with self._lock:
+            self._held[(threading.get_ident(), str(key))] = path
+        return result
+
+    def keyUp(self, key, *args, **kwargs):
+        token = (threading.get_ident(), str(key))
+        with self._lock:
+            path = self._held.pop(token, None)
+            if path is None:  # cleanup may come from a different macro worker
+                aliases = [k for k in self._held if k[1] == str(key)]
+                if aliases:
+                    path = self._held.pop(aliases[0])
+        if path == 'window':
+            # Matching the keyDown path avoids a stuck key when focus changes.
+            if _background_backend is not None:
+                return _background_backend.key(key, False)
+            return None
+        if path == 'desktop':
+            # A previously-held desktop key must be released even when focus
+            # changes; unlike a new keyDown, a keyUp clears the global hold.
+            return self.original.keyUp(key, *args, **kwargs)
+        if _background_run_enabled:
+            # There was no tracked keyDown. Do not emit stray keyUp events to
+            # whatever app is currently in front, especially on startup error.
+            return None
+        return self.original.keyUp(key, *args, **kwargs)
+
+    def moveTo(self, x=None, y=None, *args, **kwargs):
+        if _background_unfocused():
+            if x is None or y is None:
+                raise BackgroundModeUnavailable('Background mouse requires explicit coordinates')
+            return _background_backend.move_to_screen(x, y)
+        return self.original.moveTo(x, y, *args, **kwargs)
+
+    def moveRel(self, dx=0, dy=0, *args, **kwargs):
+        if _background_unfocused():
+            return _background_backend.move_relative(dx, dy)
+        return self.original.moveRel(dx, dy, *args, **kwargs)
+
+    def click(self, *args, **kwargs):
+        if _background_unfocused():
+            if args:
+                raise BackgroundModeUnavailable('Background click requires a named button')
+            return _background_backend.click(kwargs.get('button', 'left'))
+        return self.original.click(*args, **kwargs)
+
+
+# The adapter is transparent in Standard Mode. Unlike global SendInput, its
+# experimental background path never steals focus or moves the user's cursor.
+pydirectinput = _BackgroundInputProxy(pydirectinput)
+
+
 def roblox_area():
     """Screen area inside the Roblox window (below its title bar) as an mss-style dict,
     or None if Roblox isn't open or is minimized."""
@@ -3388,6 +4040,12 @@ def roblox_area():
     return {"left": rect[0], "top": rect[1], "width": w, "height": h}
 
 
+def _background_area():
+    if _background_run_enabled and _background_backend:
+        return _background_backend.geometry()
+    return None
+
+
 def adaptive_capture_area():
     """The Roblox client rectangle if Beta is active, or None for legacy monitor capture.
 
@@ -3396,6 +4054,9 @@ def adaptive_capture_area():
     """
     if not (_adaptive_run_enabled and IS_WIN):
         return None
+    # No fallback to a desktop monitor while Background Beta is active.
+    if _background_run_enabled:
+        return _background_area()
     try:
         area = roblox_area()
         if area and area["width"] >= 200 and area["height"] >= 200:
@@ -3422,9 +4083,19 @@ def grab_roblox():
     """BGR screenshot of the inside of the Roblox window (no title bar, no taskbar); the whole
     monitor if Roblox isn't open or is minimized. At most 1080 tall (Discord upload limit).
     Uses its own mss instance, so it works from any thread and when the macro isn't running."""
-    with mss.mss() as sct:
-        area = roblox_area() or pick_monitor(sct.monitors)
-        shot = cv2.cvtColor(np.array(sct.grab(area)), cv2.COLOR_BGRA2BGR)
+    if _background_run_enabled:
+        if _background_backend is None:
+            raise BackgroundModeUnavailable('Background Beta target is not initialized')
+        if _background_backend.unfocused():
+            shot = _background_backend.capture()
+        else:
+            with mss.mss() as sct:
+                shot = cv2.cvtColor(np.array(sct.grab(_background_backend.geometry())),
+                                    cv2.COLOR_BGRA2BGR)
+    else:
+        with mss.mss() as sct:
+            area = adaptive_capture_area() or pick_monitor(sct.monitors)
+            shot = cv2.cvtColor(np.array(sct.grab(area)), cv2.COLOR_BGRA2BGR)
     if shot.shape[0] > 1080:
         f = 1080 / shot.shape[0]
         shot = cv2.resize(shot, None, fx=f, fy=f, interpolation=cv2.INTER_AREA)
@@ -3700,7 +4371,137 @@ _retry_watch_thread = None
 RETRY_WATCH_POLL = 0.50
 RETRY_WATCH_TTL = 1.8
 RETRY_GUARD_EXTRA = 1.2       # extra time after each Retry click before inspecting another one
-RETRY_WATCH_CONFIRM = 2       # two consecutive matching frames to filter visual noise
+RETRY_WATCH_CONFIRM = 3       # three stable frames before foreground handling
+
+# The passive observer already captures Retry + Disconnect in one frame. Share
+# only very recent, geometry-matched frames with NON-decisive foreground scans.
+# Never serve a cached frame to click/reconnect verification or skill detection.
+_SHARED_SCAN_TTL = 0.18
+_shared_scan_lock = threading.Lock()
+_shared_scan_frame = None       # (read-only BGR, monotonic time, geometry, scale)
+_shared_scan_counts = {'published': 0, 'reused': 0}
+
+
+def _publish_shared_scan(frame, area, scale):
+    global _shared_scan_frame
+    if frame is None or area is None or frame.size == 0:
+        return
+    # The watchdog owns this array. Making it read-only prevents later accidental
+    # writes from altering a frame another thread is using to detect UI elements.
+    frame.setflags(write=False)
+    coords = tuple(int(area[k]) for k in ('left', 'top', 'width', 'height'))
+    with _shared_scan_lock:
+        _shared_scan_frame = (frame, time.monotonic(), coords, scale)
+        _shared_scan_counts['published'] += 1
+
+
+def _latest_shared_scan():
+    """Return a safe recent observer frame, or None. Never return a stale crop."""
+    with _shared_scan_lock:
+        cached = _shared_scan_frame
+    if cached is None or time.monotonic() - cached[1] > _SHARED_SCAN_TTL:
+        return None
+    frame, _stamp, coords, scale = cached
+    try:
+        if _background_unfocused():
+            area = _background_backend.geometry()
+        else:
+            area = adaptive_capture_area() or _monitor
+        if area is None:
+            return None
+        expected = tuple(int(area[k]) for k in ('left', 'top', 'width', 'height'))
+        expected_scale = FORCE_SCALE if FORCE_SCALE else area['height'] / BASE_HEIGHT
+    except Exception:
+        return None
+    if coords != expected or abs(scale - expected_scale) > .001:
+        return None
+    with _shared_scan_lock:
+        _shared_scan_counts['reused'] += 1
+    return frame, dict(zip(('left', 'top', 'width', 'height'), coords)), scale
+
+
+def passive_scan_screen():
+    """Reuse an ultra-fresh watchdog image for non-decisive scans only."""
+    global _scale, _capture_rect
+    cached = _latest_shared_scan()
+    if cached is not None:
+        frame, area, scale = cached
+        _scale, _capture_rect = scale, area
+        return frame
+    return grab_screen()  # original direct capture / monitor-off recovery
+
+
+def _reset_shared_scan():
+    global _shared_scan_frame
+    with _shared_scan_lock:
+        _shared_scan_frame = None
+
+
+def _watchdog_scan_interval():
+    """Prioritize live missions; save CPU when paused or reconnecting."""
+    interval = {'eco': .75, 'balanced': .42, 'fast': .22}.get(
+        settings.get('performance_mode', 'balanced'), .42)
+    if state.get('paused'):
+        return max(interval, .85)
+    if state.get('reconnecting'):
+        return max(interval, .65)
+    if state.get('phase_status') == 'waiting':
+        return max(interval, .40)
+    return interval
+
+
+def _watchdog_scan_retry(frame_number):
+    if state.get('reconnecting') or state.get('retry_processing'):
+        return False
+    if time.monotonic() < state.get('retry_guard_until', 0.0):
+        return False
+    if state.get('mission_t0') is None:
+        return True
+    return frame_number % 2 == 0
+
+# Loaded lazily, only in opt-in Beta. Neither model nor onnxruntime is required
+# for the standard macro. All model failures fall back to STANDARD recognition.
+_hybrid_advisor = None
+_hybrid_init_done = False
+_hybrid_init_error = ''
+_hybrid_init_lock = threading.Lock()
+
+
+def reset_hybrid_advisor():
+    global _hybrid_advisor, _hybrid_init_done, _hybrid_init_error
+    with _hybrid_init_lock:
+        _hybrid_advisor = None
+        _hybrid_init_done = False
+        _hybrid_init_error = ''
+
+
+def get_hybrid_advisor():
+    """Return a CPU-only local advisor, or None. Never fail a macro run."""
+    global _hybrid_advisor, _hybrid_init_done, _hybrid_init_error
+    if settings.get('recognition_mode') != 'hybrid_beta':
+        return None
+    with _hybrid_init_lock:
+        if not _hybrid_init_done:
+            _hybrid_init_done = True
+            try:
+                # Prefer a user-supplied model beside the EXE/source, like
+                # asset_path(): no EXE rebuild required just to update weights.
+                local_models = os.path.join(app_dir(), 'models')
+                packaged_models = os.path.join(getattr(sys, '_MEIPASS', app_dir()), 'models')
+                models = (local_models if os.path.isfile(os.path.join(local_models,
+                                           'hybrid_manifest.json')) else packaged_models)
+                _hybrid_advisor = HybridAdvisor(CpuOnnxBackend(models))
+            except Exception as exc:
+                _hybrid_init_error = f'{type(exc).__name__}: {exc}'
+                settings['recognition_mode'] = 'standard'
+                log('Hybrid AI unavailable; Standard Mode retained (' + type(exc).__name__ + ')')
+        return _hybrid_advisor
+
+
+def hybrid_confirm(frame, label, candidate, threshold, roi=None):
+    """Keep the old OpenCV match; ask AI only about near misses."""
+    advisor = get_hybrid_advisor()
+    return bool(advisor and advisor.verify(frame, label, candidate, threshold, roi).accepted)
 
 
 class RetryFound(Exception):
@@ -3720,11 +4521,77 @@ class Disconnected(Exception):
         self.reason = reason
 
 
+_recent_logs = deque(maxlen=60)
+_recent_logs_lock = threading.Lock()
+
 def log(msg):
+    # Ring buffer reuses existing activity messages; no background disk writes.
+    with _recent_logs_lock:
+        _recent_logs.append(str(msg)[:600])
     ev.put(("log", msg))
 
 
+# No network access, automation or input is performed by this observer.
+_health_lock = threading.Lock()
+
+
+def _health_stage(title, description):
+    """Ignore countdown changes; count only actual UI states/steps as progress."""
+    title = str(title)[:80]
+    if title.casefold().startswith('reconnect'):
+        match = re.search(r'\b(?:Step\s+\d+/\d+|attempt\s+\d+/\d+)\b',
+                          str(description), flags=re.I)
+        if match:
+            return title, match.group(0).casefold()
+    return title, state.get('last_step', -1)
+
+
+def _health_progress(stage):
+    now = time.monotonic()
+    with _health_lock:
+        if state.get('_health_stage') != stage:
+            state['_health_stage'] = stage
+            state['last_progress_at'] = now
+            state['health_warned'] = False
+            state['_health_alert_stage'] = None
+
+
+def check_macro_health(now=None):
+    """Passive stall diagnostics; NEVER guess clicks or restart combat."""
+    if state.get('quit') or state.get('paused') or not state.get('session_active'):
+        return False
+    reconnecting = bool(state.get('reconnecting'))
+    active_mission = state.get('mission_t0') is not None
+    if not (reconnecting or active_mission):
+        return False  # idle mission waiting can legitimately last hours
+    now = time.monotonic() if now is None else now
+    limit = 130.0 if reconnecting else 210.0
+    with _health_lock:
+        last = state.get('last_progress_at')
+        if last is None:
+            state['last_progress_at'] = now
+            return False
+        stage = ('reconnect' if reconnecting else 'mission', state.get('_health_stage'))
+        if (now - last < limit or state.get('_health_alert_stage') == stage
+                or state.get('health_warned')):
+            return False
+        state['health_warned'] = True
+        state['_health_alert_stage'] = stage
+    label = 'Reconnect' if reconnecting else 'Mission'
+    log(f'Health Monitor: {label.lower()} has had no confirmed step change '
+        f'for {int(now-last)} seconds (passive alert; no unverified inputs).')
+    capture_error_snapshot('reconnect_stall' if reconnecting else 'mission_no_progress')
+    try:
+        session_history().record('health_warning', phase=label.lower(),
+                                 seconds=int(now-last))
+    except (OSError, ValueError):
+        pass
+    return True
+
+
 def show(title, detail_text=""):
+    _health_progress(_health_stage(title, detail_text))
+    state['last_screen_state'] = str(title)[:80]
     ev.put(("now", title, detail_text))
 
 
@@ -3733,7 +4600,232 @@ def detail(text):
 
 
 def set_step(i):
+    if i != state.get('last_step'):
+        _health_progress(('step', i, state.get('phase_status')))
+    state['last_step'] = i
     ev.put(("step", i))
+
+
+# Full local snapshots + self-contained offline share codes.  Legacy 7-field
+# presets are still readable; no external server, API key, or account is needed.
+class CompletePresetStore(ConfigPresetStore):
+    SHARE_PREFIX = 'TBP1'
+    MAX_UNPACKED = 65536
+    SHARE_OMIT_ROOT = frozenset(('window', 'retry_scale'))
+    SHARE_PRIVATE_FIELDS = frozenset((
+        'ps_code', 'bot_token', 'token', 'access_token', 'refresh_token',
+        'api_key', 'password', 'passwd', 'secret', 'cookie', 'authorization',
+        'user_id', 'channel_id', 'guild_id', 'session_id',
+    ))
+
+    @classmethod
+    def shareable(cls, values):
+        """Remove credentials/personal identifiers; preserve all portable options.
+
+        Even a forged share code cannot import a credential or unexpected root
+        setting. The local saved preset retains all settings verbatim.
+        """
+        if not isinstance(values, dict):
+            raise ValueError('Preset has no settings')
+        allowed = set(settings) - cls.SHARE_OMIT_ROOT
+        result = {}
+        for key, value in values.items():
+            if key not in allowed:
+                continue
+            if key == 'webhook' and isinstance(value, dict):
+                result[key] = {k: copy.deepcopy(v) for k, v in value.items()
+                               if k not in cls.SHARE_PRIVATE_FIELDS and k != 'url'}
+            elif key == 'reconnect' and isinstance(value, dict):
+                safe = {k: copy.deepcopy(v) for k, v in value.items()
+                        if k not in cls.SHARE_PRIVATE_FIELDS}
+                # A received preset must not silently start a private-server
+                # recovery with the recipient's existing local PS Code.
+                safe['enabled'] = False
+                result[key] = safe
+            elif key not in cls.SHARE_PRIVATE_FIELDS:
+                result[key] = copy.deepcopy(value)
+        return result
+
+    def save(self, name, current):
+        key = self._valid_name(name)
+        values = copy.deepcopy(current)  # ALL settings, including all macro timings
+        # Catch unserializable fields before changing the preset store.
+        json.dumps(values, allow_nan=False)
+        with self.lock:
+            entries = self.list()
+            if key not in entries and len(entries) >= 100:
+                raise ValueError('Maximum of 100 presets')
+            entries[key] = {
+                'created': dt.datetime.now(dt.timezone.utc).isoformat(),
+                'schema': 2, 'family': str(values.get('family', '')),
+                'values': values, 'shared': False,
+            }
+            _atomic_json(self.path, {'schema': 2, 'presets': entries})
+        return key
+
+    def load(self, name, current_family=None):
+        record = self.list().get(name)
+        if not record:
+            raise KeyError('Preset not found')
+        if record.get('schema') != 2:
+            return super().load(name, current_family)  # old macro-only preset
+        values = copy.deepcopy(record.get('values', {}))
+        if not isinstance(values, dict):
+            raise ValueError('Preset data is invalid')
+        if record.get('shared'):
+            values = self.shareable(values)  # safety even if storage was edited
+        return values
+
+    def export_code(self, name):
+        entry = self.list().get(name)
+        if not entry:
+            raise KeyError('Select a preset to share')
+        values = self.shareable(entry.get('values', {}))
+        payload = {
+            'format': 'TheBumsPreset', 'version': 1,
+            'id': uuid.uuid4().hex,  # independent of any account/server/preset ID
+            'name': name, 'values': values,
+        }
+        raw = json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                         separators=(',', ':'), allow_nan=False).encode('utf-8')
+        if len(raw) > self.MAX_UNPACKED:
+            raise ValueError('Preset is too large to share as a code')
+        compressed = zlib.compress(raw, 9)
+        code = base64.urlsafe_b64encode(compressed).rstrip(b'=').decode('ascii')
+        digest = hashlib.sha256(compressed).hexdigest()[:16]
+        return f'{self.SHARE_PREFIX}.{code}.{digest}'
+
+    @classmethod
+    def parse_code(cls, code):
+        if not isinstance(code, str):
+            raise ValueError('Paste a preset share code')
+        code = ''.join(code.split())  # accept wrapped/multiline pasted codes
+        if len(code) > 30000:
+            raise ValueError('Share code is too long')
+        parts = code.split('.')
+        if len(parts) != 3 or parts[0] != cls.SHARE_PREFIX:
+            raise ValueError('Invalid preset code (expected TBP1)')
+        try:
+            chunk = parts[1].encode('ascii')
+            digest = parts[2]
+            compressed = base64.b64decode(
+                chunk + b'=' * (-len(chunk) % 4), altchars=b'-_', validate=True)
+        except (ValueError, UnicodeError, base64.binascii.Error) as exc:
+            raise ValueError('Preset code contains invalid characters') from exc
+        if len(compressed) > 24576 or len(digest) != 16:
+            raise ValueError('Preset code is too large or incomplete')
+        if hashlib.sha256(compressed).hexdigest()[:16] != digest:
+            raise ValueError('Preset code was altered or truncated')
+        try:
+            decoder = zlib.decompressobj()
+            raw = decoder.decompress(compressed, cls.MAX_UNPACKED + 1)
+            if (len(raw) > cls.MAX_UNPACKED or not decoder.eof or
+                    decoder.unused_data or decoder.unconsumed_tail):
+                raise ValueError('Preset code has an invalid payload size')
+            def reject_nonfinite(_value):
+                raise ValueError('Non-finite values are not allowed in share codes')
+            payload = json.loads(raw.decode('utf-8'), parse_constant=reject_nonfinite)
+        except (zlib.error, UnicodeError, json.JSONDecodeError) as exc:
+            raise ValueError('Preset code data could not be decoded') from exc
+        if (not isinstance(payload, dict) or
+                payload.get('format') != 'TheBumsPreset' or
+                payload.get('version') != 1 or
+                not isinstance(payload.get('values'), dict) or
+                not isinstance(payload.get('name'), str) or
+                not isinstance(payload.get('id'), str)):
+            raise ValueError('Unsupported or invalid preset code')
+        if not (1 <= len(payload['name']) <= 48):
+            raise ValueError('Invalid preset name in share code')
+        return payload['name'], cls.shareable(payload['values'])
+
+    def import_code(self, code):
+        supplied_name, values = self.parse_code(code)
+        name = self._valid_name(supplied_name)
+        with self.lock:
+            entries = self.list()
+            if len(entries) >= 100:
+                raise ValueError('Maximum of 100 presets')
+            base = name[:42]
+            i = 1
+            while name in entries:
+                suffix = f' ({i})'
+                name = base[:48 - len(suffix)] + suffix
+                i += 1
+            entries[name] = {
+                'created': dt.datetime.now(dt.timezone.utc).isoformat(),
+                'schema': 2, 'family': str(values.get('family', '')),
+                'values': values, 'shared': True,
+            }
+            _atomic_json(self.path, {'schema': 2, 'presets': entries})
+        return name
+
+
+# Small persistent facilities, lazily initialized after data_dir() is available.
+_session_history = None
+_error_snapshots = None
+_preset_store = None
+_update_history = None
+
+def session_history():
+    global _session_history
+    if _session_history is None:_session_history=SessionHistory(data_dir())
+    return _session_history
+
+def error_snapshots():
+    global _error_snapshots
+    if _error_snapshots is None:_error_snapshots=ErrorSnapshotStore(data_dir())
+    return _error_snapshots
+
+def preset_store():
+    global _preset_store
+    if _preset_store is None:_preset_store=CompletePresetStore(data_dir())
+    return _preset_store
+
+def update_history():
+    global _update_history
+    if _update_history is None:_update_history=UpdateHistory(data_dir())
+    return _update_history
+
+
+def capture_error_snapshot(reason):
+    """Save once per unique error; never save private-server code entry screens."""
+    def work():
+        try:
+            frame=None
+            sensitive=bool(state.get('reconnecting') and
+                           settings['reconnect'].get('server_mode')=='ps_code')
+            if not sensitive:
+                if _background_run_enabled:
+                    # Error reporting must not screenshot another app when the
+                    # Beta backend is missing, unfocused, or failed to capture.
+                    if _background_backend is not None:
+                        try:
+                            frame = _background_backend.capture()
+                        except BackgroundModeUnavailable:
+                            frame = None
+                else:
+                    with mss.mss() as capture:
+                        area=adaptive_capture_area() or pick_monitor(capture.monitors)
+                        frame=cv2.cvtColor(np.asarray(capture.grab(area)),cv2.COLOR_BGRA2BGR)
+            with _recent_logs_lock:
+                lines=list(_recent_logs)
+            # PS codes and Discord credentials must never end up in diagnostic files.
+            privacy=[settings['reconnect'].get('ps_code','')]
+            privacy.extend(str(value) for key,value in settings.get('webhook',{}).items()
+                           if isinstance(value,str) and len(value)>6 and
+                           any(mark in key.lower() for mark in ('token','url','secret')))
+            path=error_snapshots().save(
+                str(reason), {'macro':settings['family'],
+                              'phase':state.get('phase_status',''),
+                              'step':state.get('last_step',-1),
+                              'reconnecting':state.get('reconnecting',False),
+                              'retry_processing':state.get('retry_processing',False)},
+                frame=frame, sensitive_screen=sensitive,
+                secrets=tuple(privacy), log_lines=lines)
+            if path:log(f'Error Snapshot saved to {path}')
+        except Exception as exc:
+            log(f'Error Snapshot could not be saved: {type(exc).__name__}')
+    threading.Thread(target=work,daemon=True,name='ErrorSnapshot').start()
 
 
 def stats_path():
@@ -3756,6 +4848,7 @@ _save_lock = threading.Lock()
 
 def save_stats():
     """Writes stats AND settings (same json). Resetting stats never touches settings."""
+    settings["background_mode"] = False  # persist the disabled In Development state
     data = {"missions": stats["missions"], "retries": stats["retries"],
             "completed": results["completed"], "failed": results["failed"],
             "loot": dict(loot),
@@ -3899,11 +4992,18 @@ def toggle_pause():
         ev.put(("status", "paused"))
         log("Paused")
     else:
+        # User-driven Pause must not count as a stalled macro.
+        with _health_lock:
+            state['last_progress_at'] = time.monotonic()
+            state['health_warned'] = False
+            state['_health_alert_stage'] = None
         ev.put(("status", state["phase_status"]))
         log("Resumed")
 
 
 def request_stop():
+    # A Stop is an explicit user choice; never infer it from Pause/Retry/Idle.
+    state['user_stopped']=True
     if running():
         state["quit"] = True
         state["paused"] = False
@@ -3924,11 +5024,39 @@ def debug_trigger_rescue():
 
 def start_macro(manual=False):
     global worker
-    if running():
-        return
-    state.update(paused=False, quit=False, manual_start=manual,
-                 phase_status="waiting", mission_t0=None, rescuing=False,
-                 debug_rescue=False, retry_processing=False, retry_guard_until=0.0)
+    # Atomic against the updater's last Stop check, including hotkey callbacks
+    # invoked from a non-Tk thread. Never start mid-installation.
+    with _update_install_guard:
+        if running():
+            return
+        if _update.get('install_launched'):
+            log('Macro start refused: application update is already installing')
+            return
+        if settings.get('background_mode', False):
+            # Defense in depth for a changed runtime setting: never run a mission
+            # using an unverified background input backend.
+            msg = ('Background Mode is In Development and disabled in v1.3. '
+                   'Use Standard Mode to run macros.')
+            log(msg)
+            ev.put(('now', 'Background Mode: In Development', msg))
+            return
+        state.update(paused=False, quit=False, manual_start=manual,
+                     phase_status="waiting", mission_t0=None, rescuing=False,
+                     debug_rescue=False, retry_processing=False, retry_guard_until=0.0)
+        state['session_active']=True
+        state['user_stopped']=False
+        state['disconnect_alert_sent']=False
+        state['background_ps_code_waiting']=False
+        with _health_lock:
+            state['_health_stage'] = None
+            state['_health_alert_stage'] = None
+            state['last_progress_at'] = time.monotonic()
+            state['health_warned'] = False
+        _reset_shared_scan()
+        with _shared_scan_lock:
+            _shared_scan_counts.update(published=0, reused=0)
+    try:session_history().begin(settings['family'])
+    except OSError:pass
     worker = threading.Thread(target=macro_main, daemon=True)
     worker.start()
     start_reporter()
@@ -4166,6 +5294,13 @@ def _to_points(img):
     return img
 
 
+def _background_capture_if_needed():
+    if _background_unfocused():
+        area = _background_backend.geometry()
+        return _background_backend.capture(), area
+    return None, None
+
+
 def grab_screen():
     """The screen as a BGR image, always scaled to 1080p size so the template images (which are
     1080p) match on any resolution. Positions in this image are 1080p positions: multiply by
@@ -4176,12 +5311,19 @@ def grab_screen():
     continues transparently so the macro never crashes or stops. Stop (F7) still works
     while it waits."""
     global _monitor_was_off, _scale, _capture_rect
+    background_failure_since = None
     while True:
         try:
             client = adaptive_capture_area()
             area = client or _monitor
-            shot = np.array(_sct.grab(area))
-            img = cv2.cvtColor(shot, cv2.COLOR_BGRA2BGR)
+            bg_frame, bg_area = _background_capture_if_needed()
+            if bg_frame is not None:
+                img = bg_frame
+                area = bg_area
+                client = bg_area
+            else:
+                shot = np.array(_sct.grab(area))
+                img = cv2.cvtColor(shot, cv2.COLOR_BGRA2BGR)
             if not client:
                 img = _to_points(img)  # unchanged Retina/monitor behavior in Legacy mode
             scale = (FORCE_SCALE if FORCE_SCALE else area["height"] / BASE_HEIGHT)
@@ -4197,10 +5339,41 @@ def grab_screen():
             # Publish the geometry only after a successful frame capture.
             _scale = scale
             _capture_rect = dict(area)
+            if _background_run_enabled:
+                state.pop('_background_capture_warning', None)
             return img
         except SystemExit:
             raise
-        except Exception:  # noqa: BLE001
+        except BackgroundModeUnavailable as err:
+            # Never fall back to the foreground desktop. A persistent fault
+            # must stop the run rather than leave held keys/waits running forever.
+            if state['quit']:
+                raise SystemExit
+            if not _background_run_enabled:
+                raise
+            msg = str(err)
+            if state.get('_background_capture_warning') != msg:
+                state['_background_capture_warning'] = msg
+                log('Background Beta capture warning: ' + msg)
+            if background_failure_since is None:
+                background_failure_since = time.monotonic()
+            if time.monotonic() - background_failure_since >= 12.0:
+                raise BackgroundModeUnavailable('Background Beta stopped after 12s capture failure: ' + msg) from err
+            time.sleep(0.25)
+        except Exception as exc:  # noqa: BLE001
+            if _background_run_enabled:
+                if state['quit']:
+                    raise SystemExit
+                msg = type(exc).__name__
+                if state.get('_background_capture_warning') != msg:
+                    state['_background_capture_warning'] = msg
+                    log('Background Beta capture unavailable: ' + msg)
+                if background_failure_since is None:
+                    background_failure_since = time.monotonic()
+                if time.monotonic() - background_failure_since >= 12.0:
+                    raise BackgroundModeUnavailable('Background Beta stopped after 12s capture failure: ' + msg) from exc
+                time.sleep(0.25)
+                continue
             if not _monitor_was_off:
                 _monitor_was_off = True
                 log("Monitor appears to be off - waiting for it to come back (screen detection paused)")
@@ -4236,7 +5409,18 @@ def check_grabbed(screen):
 
 
 def icon_visible():
-    return find_quality_template(grab_screen(), _start_template, START_THRESHOLD) is not None
+    frame = grab_screen()
+    hit = find_quality_template(frame, _start_template, START_THRESHOLD)
+    if not hit and _background_run_enabled:
+        # Client-area (rather than whole-monitor) capture can alter HUD size.
+        # Throttle the extra multi-scale pass to avoid 20 expensive full-frame
+        # scans/second with FAST_START_POLL, and do not lower old thresholds.
+        now = time.monotonic()
+        if now - state.get('bg_start_extra_at', 0.0) >= 0.65:
+            state['bg_start_extra_at'] = now
+            hit = find_quality_template(frame, _start_template, START_THRESHOLD,
+                                        scales=[0.85, 0.93, 1.0, 1.07, 1.15])
+    return hit is not None
 
 
 # --------------------- tick / wait (stay responsive) --------------------
@@ -4298,16 +5482,51 @@ def _match_retry(screen, scales):
     """retry_text.png first, then alt_retry_button.png, at the given template sizes.
     Returns (match, quality, size) or None. size = how much bigger/smaller than the picture."""
     found = find_quality_template(screen, _retry_template, THRESHOLD, scales)
+    if found and found[0][2] < THRESHOLD:
+        found = None
     if found:
         match, quality = found
         return match, quality, match[3] / _retry_template[quality].shape[1]
     for templates, dx in _alt_retry_templates:
         alt = find_quality_template(screen, templates, ALT_RETRY_THRESHOLD, scales)
-        if alt:
+        if alt and alt[0][2] >= ALT_RETRY_THRESHOLD:
             (cx, cy, score, w, h), quality = alt
             size = w / templates[quality].shape[1]
             # centre of the whole button (dx is in picture pixels, so it grows with the size)
             return (cx + dx * size, cy, score, w, h), quality, size
+    return None
+
+
+def _hybrid_retry_candidate(screen, scales=None):
+    """Opt-in: check near misses ONLY inside the existing Retry panel.
+
+    Original retry_text and alt_retry_button checks always run first.
+    Does not click: the watchdog/foreground must still verify fresh frames.
+    """
+    if settings.get('recognition_mode') != 'hybrid_beta' or get_hybrid_advisor() is None:
+        return None
+    h, w = screen.shape[:2]
+    roi = (int(.40*w), int(.56*h), int(.79*w), int(.94*h))
+    # The original scanner already covered the full frame. Only recheck the
+    # smaller valid results panel (~15% of the screen) for borderline misses.
+    panel = screen[roi[1]:roi[3], roi[0]:roi[2]]
+    for templates, label, threshold, offset in (
+            (_retry_template or {}, 'retry_text', THRESHOLD, 0),
+            *((t, 'alt_retry_button', ALT_RETRY_THRESHOLD, dx)
+              for t, dx in _alt_retry_templates)):
+        candidates = []
+        for quality, tpl in templates.items():
+            cand = best_match(panel, tpl, scales)
+            if cand is not None and cand[2] < threshold:
+                px, py, score, tw, th = cand
+                full_cand = (px + roi[0], py + roi[1], score, tw, th)
+                candidates.append((score, full_cand, quality, tpl))
+        for _score, cand, quality, tpl in sorted(candidates, reverse=True, key=lambda v:v[0]):
+            if hybrid_confirm(screen, label, cand, threshold, roi):
+                cx, cy, score, cw, ch = cand
+                ratio = cw / tpl.shape[1]
+                # Legacy alt button has an offset to center the clickable target.
+                return (cx + offset * ratio, cy, score, cw, ch), quality, ratio
     return None
 
 
@@ -4321,6 +5540,8 @@ def find_retry(screen):
     global _retry_scans
     if abs(_scale - 1.0) <= 0.01:
         found = _match_retry(screen, None)
+        if not found:
+            found = _hybrid_retry_candidate(screen)
         return found[:2] if found else None
     if RETRY_DEBUG:
         _log_retry_score(screen, RETRY_SCALES)
@@ -4338,6 +5559,8 @@ def find_retry(screen):
                     save_stats()
                     log(f"Retry button matched at size x{size:.2f} (score {found[0][2]:.2f}) "
                         "- saved, it is tried first from now on")
+    if not found:
+        found = _hybrid_retry_candidate(screen, [saved] if saved else RETRY_SCALES)
     return found[:2] if found else None
 
 
@@ -4345,8 +5568,14 @@ def _retry_watch_capture(sct):
     """Read one screen in this thread's own MSS context; never touch the macro's MSS handle."""
     client = adaptive_capture_area()
     area = client or _monitor
-    shot = np.asarray(sct.grab(area))
-    frame = cv2.cvtColor(shot, cv2.COLOR_BGRA2BGR)
+    bg_frame, bg_area = _background_capture_if_needed()
+    if bg_frame is not None:
+        frame = bg_frame
+        area = bg_area
+        client = bg_area
+    else:
+        shot = np.asarray(sct.grab(area))
+        frame = cv2.cvtColor(shot, cv2.COLOR_BGRA2BGR)
     if not client and IS_MAC and frame.shape[1] != _monitor["width"]:
         frame = cv2.resize(frame, (_monitor["width"], _monitor["height"]), interpolation=cv2.INTER_AREA)
     if frame.max() == 0:
@@ -4355,7 +5584,14 @@ def _retry_watch_capture(sct):
     if abs(scale - 1.0) > .01:
         interp = cv2.INTER_AREA if scale > 1 else cv2.INTER_CUBIC
         frame = cv2.resize(frame, None, fx=1 / scale, fy=1 / scale, interpolation=interp)
+    _publish_shared_scan(frame, area, scale)
     return frame
+
+
+def _retry_inside_panel(match, frame):
+    cx, cy = match[0], match[1]
+    h, w = frame.shape[:2]
+    return (0.40*w < cx < 0.79*w and 0.56*h < cy < 0.94*h)
 
 
 def _retry_watch_match(frame, count):
@@ -4368,29 +5604,62 @@ def _retry_watch_match(frame, count):
         if not found and (not saved or count % 4 == 0):
             found = _match_retry(frame, RETRY_SCALES)
     if not found:
+        saved = settings.get("retry_scale")
+        found = _hybrid_retry_candidate(frame, None if abs(_scale - 1.0) <= .01
+                                         else ([saved] if saved else RETRY_SCALES))
+    if not found:
         return None
     (cx, cy, score, tw, th), quality, _scale_of_match = found
     h, w = frame.shape[:2]
     # Retry is in the game's central bottom results panel, not in macro logs / HUD labels.
-    if not (0.20*w < cx < 0.82*w and 0.48*h < cy < 0.96*h):
+    if not _retry_inside_panel(found[0], frame):
         return None
     return found
 
 
 def _retry_watch_worker(stop):
-    global _retry_watch_hit
+    global _retry_watch_hit, _rc_watch_hit
     seen, consecutive, n = None, 0, 0
     try:
         with mss.mss() as scout:
-            while not stop.wait(RETRY_WATCH_POLL):
+            while not stop.wait(_watchdog_scan_interval()):
                 if state["quit"]:
                     break
-                if state["paused"] or _monitor is None:
+                check_macro_health()
+                # Reconnect must still be OBSERVED while paused (never clicked).
+                # The foreground tick blocks input until the user resumes.
+                if _monitor is None:
                     continue
                 try:
                     frame = _retry_watch_capture(scout)
                     n += 1
-                    found = _retry_watch_match(frame, n) if frame is not None else None
+                    # A single capture feeds both passive observers.
+                    if _disconnect_template is not None and frame is not None:
+                        if settings['reconnect'].get('method')=='image':
+                            tpl=_disconnect_template.get('normal')
+                            hit=bool(tpl is not None and
+                                     (lambda m: m is not None and m[2]>=.90)(best_match(frame,tpl)))
+                        else:
+                            dm=find_quality_template(frame,_disconnect_template,RECONNECT_THRESHOLD)
+                            hit=bool(dm and dm[0][2]>=RECONNECT_THRESHOLD)
+                        # Roblox also has a Leave-only disconnect dialog (e.g.
+                        # Error 282). The old rc_reconnect.png cannot see it.
+                        # Keep OpenCV and confirm twice on shared frames.
+                        leave_hit=image_rc.find_leave_disconnect(frame) is not None
+                        kind='leave' if leave_hit else 'reconnect' if hit else None
+                        previous=state.get('_rc_watch_kind')
+                        rc_count=(state.get('_rc_watch_count',0)+1
+                                  if kind is not None and kind==previous else
+                                  1 if kind else 0)
+                        state['_rc_watch_kind']=kind
+                        state['_rc_watch_count']=rc_count
+                        with _rc_watch_lock:
+                            _rc_watch_hit=time.monotonic() if rc_count>=2 else 0.0
+                    # Keep Retry verification prioritized near results; slower
+                    # while combat animation is active to reduce CPU.
+                    retry_scan = _watchdog_scan_retry(n)
+                    found = (_retry_watch_match(frame, n) if frame is not None and retry_scan
+                             else None)
                 except Exception as e:  # screenshot interruptions should never stop the real macro
                     if n % 20 == 0:
                         log(f"Retry watchdog temporarily unable to read screen: {type(e).__name__}")
@@ -4420,6 +5689,7 @@ def start_retry_watchdog():
     stop_retry_watchdog()
     with _retry_watch_lock:
         _retry_watch_hit = None
+    _reset_shared_scan()
     _retry_watch_stop = threading.Event()
     _retry_watch_thread = threading.Thread(target=_retry_watch_worker, args=(_retry_watch_stop,), daemon=True,
                                            name="RetryWatchdog")
@@ -4435,6 +5705,7 @@ def stop_retry_watchdog():
     _retry_watch_thread = None
     with _retry_watch_lock:
         _retry_watch_hit = None
+    _reset_shared_scan()
 
 
 def cached_retry_hit():
@@ -4453,23 +5724,25 @@ def scan_for_retry():
     The end of the mission is the retry button."""
     global _last_scan
     _last_scan = time.time()
-    screen = grab_screen()
+    screen = passive_scan_screen()
     check_grabbed(screen)
     found = find_retry(screen)
-    if found:
+    if found and _retry_inside_panel(found[0], screen):
+        # Fast Mode may shorten scan intervals but NEVER bypass confirmation.
         match = found[0]
-        if tv(settings["family"], "fast_mode"):
-            raise RetryFound(match, found[1], screen)   # fast mode: click at once, no confirmation look
-        # screens often fade/animate in: look again and click only if it's
-        # still there, at the same spot
         time.sleep(RETRY_CONFIRM_DELAY)
-        again = find_retry(grab_screen())
-        if again and abs(again[0][0] - match[0]) <= 15 and abs(again[0][1] - match[1]) <= 15:
-            raise RetryFound(again[0], again[1])
+        fresh = grab_screen()
+        again = find_retry(fresh)
+        if (again and _retry_inside_panel(again[0], fresh)
+                and abs(again[0][0] - match[0]) <= 15
+                and abs(again[0][1] - match[1]) <= 15):
+            raise RetryFound(again[0], again[1], fresh if tv(settings["family"], "fast_mode") else None)
 
 
 def _mouse_move_down(pixels):
     """Relative mouse movement (what a locked mouse in Roblox needs to turn the camera)."""
+    if _background_unfocused():
+        return _background_backend.move_relative(0, pixels)
     if IS_WIN:
         ctypes.windll.user32.mouse_event(0x0001, 0, int(pixels), 0, 0)   # MOUSEEVENTF_MOVE
     else:
@@ -4589,7 +5862,7 @@ def rescue_clicks(debug=False, reason=None):
         notify_rescue_async(False, counters()[0]["missions"])  # Discord: stuck, trying to eliminate
     cx, cy = failsafe_click_point(*failsafe_default_point())
     where = "the picked spot" if (cx, cy) != failsafe_default_point() else "bottom-centre (50% X, 80% Y)"
-    look = bool(settings["failsafe"]["look_down"])      # Settings > Configs > Failsafe > Look down
+    look = bool(settings["failsafe"]["look_down"])      # Settings > Recovery > Failsafe > Look down
     ground = "looking at the ground, " if look else ""
     if reason:      # raid failsafe
         log(f"Raid failsafe ({reason}) - ejecting, {ground}"
@@ -4823,16 +6096,201 @@ def reconnect_launch(reason):
         wait(min(0.5, remaining), scan=False)
 
 
+def _image_reconnect_progress(i, total, label, stage, attempt):
+    # Never include PS codes or credentials in this event or log.
+    ev.put(('reconnect_progress', i, total, label, stage, attempt))
+    show('Auto Reconnect', f'Step {i}/{total} · {label} · {stage} · Attempt {attempt}/3')
+    if stage in ('Confirmed','Retrying'):
+        log(f'Reconnect step {i}/{total}: {label} — {stage}')
+
+
+def _type_private_server_code(code, key_api, guard_focus, pause=time.sleep, capslock_on=None):
+    """Enter a mixed-case PS Code as paced physical key-down/key-up events.
+
+    The previous keyboard.write(char) loop with 25 ms between calls could
+    outpace Roblox's text field. Keep the code intact, never use the clipboard,
+    and never print/log its characters. guard_focus runs before EVERY key-down.
+    Other printable symbols retain the previous keyboard.write fallback.
+    """
+    if (not isinstance(code, str) or not code or len(code) > 128 or
+            any(ord(c) < 32 for c in code)):
+        raise ValueError('PS Code must be 1–128 printable characters')
+
+    if capslock_on is None:
+        def capslock_on():
+            return bool(IS_WIN and (ctypes.windll.user32.GetKeyState(0x14) & 1))
+
+    def held_key(key, modifier=None):
+        guard_focus()
+        if modifier:
+            key_api.press(modifier)
+        try:
+            guard_focus()
+            key_api.press(key)
+            try:
+                pause(.075)  # allow Roblox to poll a complete key-down
+            finally:
+                key_api.release(key)
+        finally:
+            if modifier:
+                key_api.release(modifier)
+        pause(.085)  # let the text input process the key-up before the next key
+
+    # Explicit Ctrl+A with a held key; a single fast combo can be missed too.
+    held_key('a', 'ctrl')
+    pause(.10)
+    for char in code:
+        if char.isascii() and char.isalpha():
+            shift = char.isupper() != bool(capslock_on())
+            held_key(char.lower(), 'shift' if shift else None)
+        elif char.isascii() and char.isdigit():
+            held_key(char)
+        elif char in ('-', '_'):
+            held_key('-', 'shift' if char == '_' else None)
+        elif char == ' ':
+            held_key('space')
+        else:
+            # Preserve rather than discard legacy printable characters.
+            guard_focus()
+            key_api.write(char, delay=.10)
+            pause(.085)
+    guard_focus()
+
+
+def image_reconnect_rejoin(reason):
+    """Reconnect button -> Slot A -> chosen server -> Outskirts -> verified HUD.
+    The whole state route is restarted if another disconnect appears.
+    """
+    state['reconnecting'] = True
+    state['mission_t0'] = None
+    state['retry_processing'] = False
+    release_all_keys()
+    matcher = image_rc.ImageMatcher(
+        os.path.join(getattr(sys,'_MEIPASS',app_dir()), 'image')
+        if getattr(sys,'frozen',False) else os.path.join(app_dir(),'image'),
+        advisor=get_hybrid_advisor())
+    def capture():
+        return grab_screen()
+    def check():
+        tick(scan_retry=False) # handles Pause/Stop; Retry watchdog is disabled while reconnecting
+    def disconnect(frame):
+        return (matcher.find(frame, 'reconnect') is not None or
+                image_rc.find_leave_disconnect(frame) is not None)
+    def click(match):
+        px, py=frame_to_screen(match.x,match.y)
+        click_middle(px,py)
+    def enter_code(code):
+        # In Background Beta, pause AT the unsafe input step, not at Settings.
+        if _background_run_enabled:
+            await_standard_ps_input()
+        # Protect even ordinary Standard-mode entry from a late focus change.
+        ps_focus_backend = (_background_backend if _background_backend is not None
+                            else _BackgroundRobloxWindow()) if IS_WIN else None
+        def guard_focus():
+            if state['quit']:
+                raise SystemExit
+            if ps_focus_backend is not None and ps_focus_backend.unfocused():
+                raise BackgroundModeUnavailable(
+                    'PS Code entry stopped: focus Roblox before continuing in Standard Mode.')
+        _type_private_server_code(code, keyboard, guard_focus)
+    def mission_ready(frame):
+        return bool(_start_template and find_quality_template(frame,_start_template,START_THRESHOLD))
+    try:
+        for attempt in range(1, RECONNECT_MAX_ATTEMPTS+1):
+            log(f'Image Reconnect: route attempt {attempt}/{RECONNECT_MAX_ATTEMPTS}')
+            try:
+                # When the Roblox reconnect prompt is visible, press it first.
+                # If already at the slot screen, resume from that known screen.
+                frame=capture()
+                # New Leave-only disconnect: leave Roblox's error modal, pick
+                # the AOT:R game from Home, press Play, then use the existing
+                # verified Slot A -> selected-server route unchanged.
+                # Also resume safely from Home/detail if a previous retry
+                # already clicked Leave or the game tile.
+                if (image_rc.find_leave_disconnect(frame) or
+                        image_rc.find_roblox_home_game(frame) or
+                        image_rc.find_roblox_game_play(frame)):
+                    image_rc.RobloxLeaveNavigator(
+                        matcher,capture,click,check,_image_reconnect_progress
+                    ).run(first_frame=frame)
+                    frame=capture()
+                hit=matcher.find(frame,'reconnect')
+                if hit:
+                    # Both disconnect styles require stable, fresh image
+                    # verification. The original Reconnect button is no
+                    # exception, even when OpenCV exceeds its normal threshold.
+                    check()
+                    time.sleep(.25)
+                    fresh_frame=capture()
+                    if image_rc.find_leave_disconnect(fresh_frame):
+                        raise image_rc.NewDisconnect(
+                            'Leave dialog replaced Reconnect before clicking')
+                    fresh_hit=matcher.find(fresh_frame,'reconnect')
+                    if (fresh_hit is None or abs(fresh_hit.x-hit.x)>16 or
+                            abs(fresh_hit.y-hit.y)>16):
+                        raise image_rc.ReconnectError(
+                            'Reconnect button not stable across two screenshots')
+                    hit=fresh_hit
+                    _image_reconnect_progress(0,10,'Reconnect','Clicking',attempt)
+                    click(hit)
+                    # Allow the button time to disappear and the slot page to load.
+                    expiry=time.monotonic()+85
+                    while time.monotonic()<expiry:
+                        check()
+                        f=capture()
+                        if matcher.slot_a_select(f):break
+                        if image_rc.find_leave_disconnect(f):
+                            raise image_rc.NewDisconnect('Leave dialog appeared after Reconnect')
+                        time.sleep(.45)
+                    else:
+                        raise image_rc.ReconnectError('Slot A did not load after Reconnect')
+                flow=image_rc.ImageReconnectFlow(
+                    matcher,capture,click,check,disconnect,_image_reconnect_progress,
+                    enter_code,mission_ready,
+                    server_mode=settings['reconnect'].get('server_mode','public'),
+                    ps_code=settings['reconnect'].get('ps_code',''))
+                flow.run()
+                log('Image Reconnect confirmed: Mission HUD visible; resuming selected macro')
+                state['disconnect_alert_sent'] = False
+                try:session_history().record('reconnect_completed',method='image')
+                except OSError:pass
+                ev.put(('reconnect_done',))
+                return True
+            except image_rc.NewDisconnect:
+                log('Another Roblox disconnect appeared during navigation; restarting route')
+                release_all_keys()
+            except image_rc.ReconnectError as exc:
+                log(f'Image Reconnect verification failed: {exc}')
+                release_all_keys()
+            if attempt < RECONNECT_MAX_ATTEMPTS:
+                # Do not reuse stale positions from a failed step.
+                for _ in range(15):
+                    check();time.sleep(.2)
+        log('Image Reconnect gave up after the configured number of attempts')
+        try:session_history().record('error',reason='image_reconnect_failed')
+        except OSError:pass
+        capture_error_snapshot('reconnect_failed')
+        notify_async('Image Reconnect failed. Please check the Roblox screen.')
+        ev.put(('reconnect_failed',))
+        return False
+    finally:
+        state['reconnecting']=False
+        state['rc_next']=time.time()+RECONNECT_COOLDOWN
+
+
 def reconnect_rejoin(reason="the Disconnect Image was seen"):
+    notify_disconnect_once(reason)
+    if settings['reconnect'].get('method') == 'image':
+        return image_reconnect_rejoin(reason)
     """Force a rejoin: reconnect_launch(), then click the picked coordinates step by step
     (reconnect_clicks). If the Select / Play picture never shows, the whole rejoin is tried again
     (up to RECONNECT_MAX_ATTEMPTS). The macro goes back to waiting for the next mission afterwards."""
     state["reconnecting"] = True
+    state["retry_processing"] = False
     state["rc_notified"] = False
-    # Discord: tell the user (with a mention when "Mention me" is on) that the rejoin started
-    if str(reason).startswith("the Disconnect Image"):
-        notify_async("Disconnected from the game - closing Roblox and rejoining...")
-    else:
+    # Genuine disconnect alerts are sent once by reconnect_rejoin() for BOTH
+    # Image Reconnect and coordinate routes. Manual requests retain a status msg.
+    if not is_game_disconnect(reason):
         notify_async(f"Rejoining the game ({reason}) - closing Roblox and rejoining...")
     try:
         for attempt in range(1, RECONNECT_MAX_ATTEMPTS + 1):
@@ -4841,6 +6299,9 @@ def reconnect_rejoin(reason="the Disconnect Image was seen"):
                 f"{len(reconnect_steps())} spots ({reconnect_click_delay():g}s apart)")
             if reconnect_clicks():
                 log("Rejoin done - waiting for the next mission")
+                state["disconnect_alert_sent"] = False
+                try:session_history().record('reconnect_completed',method='coordinates')
+                except OSError:pass
                 return
             reason = "a Reconnect picture did not show"
             if attempt < RECONNECT_MAX_ATTEMPTS:
@@ -4852,20 +6313,61 @@ def reconnect_rejoin(reason="the Disconnect Image was seen"):
         state["rc_next"] = time.time() + RECONNECT_COOLDOWN
 
 
+# Passive always-on Reconnect observer. The foreground macro alone may click.
+_rc_watch_stop = None
+_rc_watch_thread = None
+_rc_watch_hit = 0.0
+_rc_watch_lock = threading.Lock()
+
+
+def reconnect_watchdog_hit():
+    with _rc_watch_lock:
+        return bool(_rc_watch_hit and time.monotonic()-_rc_watch_hit < 1.8)
+
+
+def start_reconnect_watchdog():
+    """The Retry observer already captures frames for both watchers.
+    This does not launch another screenshot thread.
+    """
+    global _rc_watch_hit
+    with _rc_watch_lock:_rc_watch_hit=0.0
+    state['_rc_watch_count']=0
+    state['_rc_watch_kind']=None
+    if _disconnect_template is not None:
+        log('Reconnect Watchdog ON (shared passive screenshot engine)')
+
+
+def stop_reconnect_watchdog():
+    global _rc_watch_hit
+    with _rc_watch_lock:_rc_watch_hit=0.0
+    state['_rc_watch_count']=0
+    state['_rc_watch_kind']=None
+
+
+
 def tick(scan_retry=True):
     """Handles stop/pause/rescue and consumes the passive Retry observer without input delay."""
     if state["quit"]:
         raise SystemExit
+    check_macro_health()
     while state["paused"]:
         if state["quit"]:
             raise SystemExit
         time.sleep(0.1)
     # Detection is independent of scan_retry. A passive observer can stop a stalled routine
     # even inside a precise-timing wait; only the foreground macro thread handles Retry.
-    watchdog = cached_retry_hit()
-    if watchdog:
-        match, quality, screen, _timestamp = watchdog
-        raise RetryFound(match, quality, screen if tv(settings["family"], "fast_mode") else None)
+    if _disconnect_template is not None and not state.get('reconnecting'):
+        if reconnect_watchdog_hit():
+            if state.get('_rc_watch_kind')=='leave':
+                raise Disconnected('Leave dialog detected by image watchdog')
+            raise Disconnected('Reconnect button detected by image watchdog')
+    # A passive Retry hit cached before entering the Reconnect flow must not
+    # interrupt a verified Leave -> Home -> Slot A navigation.
+    if not state.get('reconnecting'):
+        watchdog = cached_retry_hit()
+        if watchdog:
+            match, quality, screen, _timestamp = watchdog
+            raise RetryFound(match, quality, screen if tv(settings["family"], "fast_mode") else None)
     if _disconnect_template is not None and not state.get("reconnecting"):
         # Reconnect is on: three ways to rejoin - the bot command, a failsafe rescue that has not
         # ended after RECONNECT_RESCUE_LIMIT (2 min), or the Disconnect Image
@@ -4876,8 +6378,11 @@ def tick(scan_retry=True):
             raise Disconnected(f"the failsafe has been rescuing for {RECONNECT_RESCUE_LIMIT / 60:g} minutes")
         if time.time() >= state.get("rc_next", 0.0):
             state["rc_next"] = time.time() + RECONNECT_CHECK_INTERVAL
-            if find_quality_template(grab_screen(), _disconnect_template, RECONNECT_THRESHOLD):
-                raise Disconnected
+            frame=passive_scan_screen()
+            if image_rc.find_leave_disconnect(frame):
+                raise Disconnected('Leave dialog detected by foreground scan')
+            if find_quality_template(frame, _disconnect_template, RECONNECT_THRESHOLD):
+                raise Disconnected('the Disconnect Image was seen')
     if scan_retry:
         t0 = state["mission_t0"]
         if state["debug_rescue"] and not state["rescuing"]:     # DEBUG: F3+K
@@ -4986,6 +6491,10 @@ def scan_end_screen(quality="normal", want_loot=True, want_result=True,
     matching remains unchanged. retry_anchor is the detected Retry button x.
     """
     loot_hits = {}   # kind -> [(center_x, center_y, score, w, h)]
+    hybrid_loot_kinds = set()  # Hybrid candidates always require two real frames
+    loot_last_frame = {}     # for stronger Beta-only consecutive-frame checks
+    loot_current_streak = {}
+    loot_max_streak = {}     # source's legacy standard multi-hit rule stays untouched
     loot_sizes = {}
     result_best = {}
     fix = bool(settings.get("fix_loot"))
@@ -5017,6 +6526,7 @@ def scan_end_screen(quality="normal", want_loot=True, want_result=True,
         crop = screen[y0:y1, x0:x1]
         for kind, templates in loot_tpls.items():
             best = None
+            uncertain = None
             size = 1.0
             for tpl in templates:
                 if tpl is None:
@@ -5027,7 +6537,16 @@ def scan_end_screen(quality="normal", want_loot=True, want_result=True,
                     cand, cand_size = best_match(crop, tpl), 1.0
                 if cand and cand[2] >= threshold and (best is None or cand[2] > best[2]):
                     best, size = cand, cand_size
-            if best and best[2] >= threshold:
+                elif cand and (uncertain is None or cand[2] > uncertain[0][2]):
+                    uncertain = (cand, cand_size)
+            # No AI shortcut in the one-frame fast path; a successful AI-assisted
+            # loot observation still needs to appear in two consecutive captures.
+            if best is None and frame is None and uncertain is not None:
+                cand, cand_size = uncertain
+                if hybrid_confirm(crop, 'loot_' + kind, cand, threshold):
+                    best, size = cand, cand_size
+                    hybrid_loot_kinds.add(kind)
+            if best and (best[2] >= threshold or kind in hybrid_loot_kinds):
                 cx, cy, score, tw, th = best
                 hit = (cx + x0, cy + y0, score, tw, th)
                 prev = loot_hits.setdefault(kind, [])
@@ -5037,6 +6556,11 @@ def scan_end_screen(quality="normal", want_loot=True, want_result=True,
                                    and abs(hit[1] - h[1]) <= max(hit[4], h[4])
                                    for h in prev):
                     prev.append(hit)
+                    streak = (loot_current_streak.get(kind, 0) + 1
+                              if loot_last_frame.get(kind) == frames - 1 else 1)
+                    loot_last_frame[kind] = frames
+                    loot_current_streak[kind] = streak
+                    loot_max_streak[kind] = max(loot_max_streak.get(kind, 0), streak)
                     loot_sizes[kind] = size
         if _result_templates and want_result:
             mask = gold_mask(screen)
@@ -5055,10 +6579,17 @@ def scan_end_screen(quality="normal", want_loot=True, want_result=True,
     loot_found = {}
     required_hits = 1 if frame is not None else 2
     for kind, hits in loot_hits.items():
-        if len(hits) >= required_hits:
-            loot_found[kind] = max(hits, key=lambda x: x[2])
+        best_hit = max(hits, key=lambda x: x[2])
+        confirmed_completed = (want_result and 'completed' in result_best
+                               and result_best['completed'][2] >= RESULT_THRESHOLD)
+        if ((len(hits) >= required_hits and
+             (kind not in hybrid_loot_kinds or loot_max_streak.get(kind, 0) >= 2)) or
+                (kind not in hybrid_loot_kinds and len(hits) == 1 and confirmed_completed
+                 and best_hit[2] >= 0.94)):
+            loot_found[kind] = best_hit
         else:
-            log(f"Loot candidate rejected: {kind} matched only {len(hits)} frame(s)")
+            log(f"Loot candidate rejected: {kind} matched only {len(hits)} frame(s), "
+                f"best score {best_hit[2]:.3f}, Completed={confirmed_completed}")
 
     # Multiple templates may resemble the exact SAME on-screen reward icon.
     # Keep the highest-scoring class for each location, rather than counting
@@ -5123,6 +6654,8 @@ def record_result(result, counted=False):
     else:
         kind = result[0]
         counters()[1][kind] += 1
+        try:session_history().record('mission_completed' if kind=='completed' else 'mission_failed')
+        except OSError:pass
         log(f"Result: {kind.capitalize()}")
     push_stats()
 
@@ -5130,6 +6663,9 @@ def record_result(result, counted=False):
 def record_loot(found):
     """Add detected drops once per completed result and update the current session Scroll count."""
     global session_scrolls
+    if found:
+        try:session_history().record('loot',kinds=','.join(sorted(found.keys())))
+        except OSError:pass
     lt = counters()[2]
     for kind in found:
         lt[kind] += 1
@@ -5182,6 +6718,8 @@ def wait_for_mission_start(scan_retry=True, after_retry=False):
     start_note = "Looking for acoustic_shells.png (Skill 2)" if attack_mode else ("Looking for the skip button / raid_start.png" if raid else "Looking for the ability 2 icon")
     show("Waiting for the raid" if raid else "Waiting for the mission", start_note)
     log("Waiting for the raid: " + start_note if raid else "Waiting for the mission to start")
+    background_wait_since = None
+    background_warned = False
     while True:
         try:
             tick(scan_retry=scan_retry)
@@ -5193,6 +6731,26 @@ def wait_for_mission_start(scan_retry=True, after_retry=False):
         if state["manual_start"]:
             state["manual_start"] = False
             return
+        if _background_run_enabled and _background_unfocused():
+            now = time.monotonic()
+            if background_wait_since is None:
+                background_wait_since = now
+            elapsed = now - background_wait_since
+            if elapsed > 12.0 and not background_warned:
+                background_warned = True
+                note = ('Background Beta: mission start icon not detected after 12s. '
+                        'Check whether window capture shows LIVE Roblox gameplay; '
+                        'try the capture test in Settings > Roblox.')
+                log(note)
+                show('Waiting for mission - capture check', note)
+            if elapsed > 60.0:
+                raise BackgroundModeUnavailable(
+                    'No mission start icon after 60s in background. '
+                    'Stopped safely; capture may be stale, cropped, or incompatible '
+                    'with Roblox. Check WGC capture and Windowed Mode.')
+        else:
+            background_wait_since = None
+            background_warned = False
         fast = tv(settings["family"], "fast_mode")
         # Suppress stale HUD icons during the transition from result screen to the next raid.
         if after_retry and time.monotonic() < state.get("retry_guard_until", 0.0):
@@ -5817,7 +7375,7 @@ def warn_raid_config():
     fam = settings["family"]
     if tv(fam, "chest1") is None:
         log(f"WARNING: {fam} - Chest 1 coordinate is not set! "
-            "Set it in Settings > Configs > Chest locations.")
+            "Set it in Settings > Macros > Chest locations.")
     if tv(fam, "open_chest2") and tv(fam, "chest2") is None:
         log(f"WARNING: {fam} - Chest 2 is enabled but its coordinate is not set.")
 
@@ -5926,7 +7484,7 @@ def attack_titan_chests():
             continue
         spot = t(key)
         if spot is None:
-            log(f"WARNING: {label} position not set. Use Pick spot in Settings > Configs.")
+            log(f"WARNING: {label} position not set. Use Pick spot in Settings > Macros.")
             continue
         log(f"Attack Titan Raid: opening {label} at {spot[0]}, {spot[1]}")
         raid_click_spam(spot[0], spot[1], t("chest_click_time"),
@@ -6343,7 +7901,7 @@ def _screen_scale():
 def auto_detect_roblox_monitor():
     """Look at the monitor the Roblox window is on (MONITOR_INDEX is only the fallback), and say so
     in the log when the picture can not be read well: the images are matched at screen size, so
-    Roblox has to fill its monitor (borderless fullscreen / F11)."""
+    Use Roblox Windowed Mode and preferably Adaptive Resolution for client capture."""
     global MONITOR_INDEX
     if not IS_WIN:
         return
@@ -6351,7 +7909,7 @@ def auto_detect_roblox_monitor():
         area = roblox_area()
         if area is None:
             log(f"Roblox window not found yet - watching monitor {MONITOR_INDEX}. "
-                "Open Roblox in fullscreen (F11) on the screen you want to use.")
+                "Please use Windowed Screen, not Fullscreen.")
             return
         cx, cy = area["left"] + area["width"] // 2, area["top"] + area["height"] // 2
         with mss.mss() as sct:
@@ -6368,8 +7926,8 @@ def auto_detect_roblox_monitor():
         if abs(area["height"] - mon["height"]) > 0.03 * mon["height"] \
                 or abs(area["width"] - mon["width"]) > 0.03 * mon["width"]:
             log(f"Warning: the Roblox window is {area['width']}x{area['height']} but the screen "
-                f"is {mon['width']}x{mon['height']}. Press F11 in Roblox (fullscreen), or the "
-                "pictures may not be recognised.")
+                f"is {mon['width']}x{mon['height']}. Use Windowed Mode; "
+                "enable Adaptive Resolution if recognition needs the client area.")
         else:
             log(f"Roblox fills the screen ({mon['width']}x{mon['height']}) - the pictures can be read")
     except Exception as e:  # noqa: BLE001
@@ -6391,8 +7949,13 @@ def _log_overrides():
 def macro_main():
     global _sct, _monitor, _scale, _retry_template, _start_template, _attack_start_template, _grab_template
     global _shiki_ability4_icon, _disconnect_template, _adaptive_run_enabled, _capture_rect
+    global _background_run_enabled, _background_backend
     try:
-        _adaptive_run_enabled = bool(settings.get("adaptive_resolution", False)) and IS_WIN
+        # In Development: cannot start even if an old configuration toggled the flag.
+        _background_run_enabled = False
+        _background_backend = None
+        _adaptive_run_enabled = (bool(settings.get("adaptive_resolution", False))
+                                 or _background_run_enabled) and IS_WIN
         _capture_rect = None
         if settings.get("auto_monitor", True):
             auto_detect_roblox_monitor()
@@ -6432,10 +7995,14 @@ def macro_main():
                 + ", ".join(reconnect_missing()) + ") - it stays of")
         elif settings["reconnect"]["enabled"]:
             try:
-                for kind, filename in RECONNECT_IMAGE_FILES.items():
-                    _reconnect_images[kind] = load_quality_templates(filename)
-                _disconnect_template = load_quality_templates(RECONNECT_IMAGE_FILE)
-                log(f"Reconnect is ON ({reconnect_macro_tab()} coordinates): rejoining game "
+                if settings['reconnect'].get('method') == 'image':
+                    _disconnect_template = load_quality_templates('rc_reconnect.png')
+                    log("Image Reconnect is ON: verified states + always-on reconnect observer")
+                else:
+                    for kind, filename in RECONNECT_IMAGE_FILES.items():
+                        _reconnect_images[kind] = load_quality_templates(filename)
+                    _disconnect_template = load_quality_templates(RECONNECT_IMAGE_FILE)
+                log(f"Reconnect is ON ({settings['reconnect'].get('method')}): rejoining game "
                     f"{ROBLOX_GAME_ID} on a disconnect, a failsafe longer than "
                     f"{RECONNECT_RESCUE_LIMIT / 60:g} min, or !reconnect")
             except FileNotFoundError:
@@ -6490,6 +8057,7 @@ def macro_main():
                     f"to 1080p size (x{1 / _scale:.2f}) to match template images")
 
             start_retry_watchdog()
+            start_reconnect_watchdog()
             need_start = True
             after_retry = False
             while True:
@@ -6547,8 +8115,20 @@ def macro_main():
                                 record_loot(loot_found)
                         if not low and not fast:
                             notify_mission_async(result or macro_result_tuple, loot_found or tracked or {}, mission_len)   # Discord stats embed (if on)
-                        show(retry_title, "Clicking...")
-                        log("Clicking retry")
+                        show(retry_title, "Verifying Retry before click...")
+                        fresh = grab_screen()
+                        verified = find_retry(fresh)
+                        if (not verified or not _retry_inside_panel(verified[0], fresh)
+                                or abs(verified[0][0] - cx) > 18
+                                or abs(verified[0][1] - cy) > 18):
+                            log("Retry button changed/disappeared: click cancelled")
+                            state["retry_processing"] = False
+                            need_start = True
+                            after_retry = True
+                            continue
+                        cx, cy, score, tw, th = verified[0]
+                        abs_x, abs_y = frame_to_screen(cx, cy)
+                        log(f"Clicking verified Retry (score {score:.3f})")
                         save_click_debug(cx, cy, tw, th)
                         click_at(abs_x, abs_y, int(tw * _scale), int(th * _scale))
                         clicked_at = time.time()
@@ -6592,6 +8172,7 @@ def macro_main():
                     after_retry = False
         finally:
             stop_retry_watchdog()
+            stop_reconnect_watchdog()
             # Clean up the mss instance (whether we're stopping or _reinit_mss() replaced it):
             # close whatever is current now.
             with _sct_lock:
@@ -6604,11 +8185,20 @@ def macro_main():
         log("Stopped")
     except Exception as e:  # noqa: BLE001 - show any error in the window
         log(f"Error: {type(e).__name__}: {e}")
+        try:session_history().record('error',reason=type(e).__name__)
+        except OSError:pass
+        capture_error_snapshot('macro_exception')
         if settings["webhook"]["notify_error"]:
             notify_async(f"thebums stopped because of an error: {type(e).__name__}: {e}")
     finally:
         state["mission_t0"] = None
+        try:session_history().end('user_stopped' if state.get('user_stopped') else 'unexpected_end')
+        except OSError:pass
         release_all_keys()
+        if _background_backend is not None:
+            _background_backend.close()
+        _background_run_enabled = False
+        _background_backend = None
         ev.put(("done",))
 
 
@@ -6904,9 +8494,11 @@ class ToggleSwitch(tk.Canvas):
     """Modern on/off switch bound to a BooleanVar (replaces the old tick boxes)."""
     ON, OFF, KNOB = "#3b82f6", "#272e40", "#ffffff"
 
-    def __init__(self, parent, variable, command=None, parent_bg=None):
+    def __init__(self, parent, variable, command=None, parent_bg=None, disabled=False):
         super().__init__(parent, width=38, height=22, bg=parent_bg or App.CARD,
-                         highlightthickness=0, bd=0, cursor="hand2")
+                         highlightthickness=0, bd=0,
+                         cursor="arrow" if disabled else "hand2")
+        self.disabled = disabled
         self.var = variable
         self.command = command
         self.var.trace_add("write", lambda *_: self.draw())
@@ -6914,6 +8506,8 @@ class ToggleSwitch(tk.Canvas):
         self.draw()
 
     def flip(self, _e=None):
+        if self.disabled:
+            return
         self.var.set(not self.var.get())
         if self.command:
             self.command()
@@ -6922,11 +8516,12 @@ class ToggleSwitch(tk.Canvas):
         try:
             self.delete("all")
             on = bool(self.var.get())
-            rounded_rect(self, 1, 1, 37, 21, App.R_SWITCH, fill=self.ON if on else self.OFF,
-                         outline="")
+            fill = "#343b49" if self.disabled else (self.ON if on else self.OFF)
+            knob = "#6b7280" if self.disabled else self.KNOB
+            rounded_rect(self, 1, 1, 37, 21, App.R_SWITCH, fill=fill, outline="")
             x = 28 if on else 10
             rounded_rect(self, x - 7, 11 - 7, x + 7, 11 + 7, max(0, App.R_SWITCH - 3),
-                         fill=self.KNOB, outline="")
+                         fill=knob, outline="")
         except tk.TclError:
             pass    # the window was closed
 
@@ -7039,7 +8634,7 @@ def _ease_out(t):
 
 
 def animations_on():
-    """Settings > UI > GUI animations (off by default)."""
+    """Settings > App > GUI animations (off by default)."""
     return bool(settings.get("animations"))
 
 
@@ -7296,7 +8891,9 @@ def style_title_bar(root, bg_hex):
 
 
 # ------------------------------- updater --------------------------------
-_update = {"busy": False}
+_update = {'busy':False,'staged':None,'release':None,'install_launched':False,
+           'prompted':False,'lockfile':None}
+_update_install_guard = threading.Lock()  # prevents Start racing with final Stop-gated installation
 
 
 def parse_version(text):
@@ -7337,9 +8934,19 @@ def fetch_repo_updates():
     latest_release = None
     try:
         release = _github_api("releases/latest")
+        asset=next((a for a in release.get('assets', [])
+                    if a.get('name')=='TheBumsMacro.exe' and
+                    isinstance(a.get('browser_download_url'),str)),None)
+        exe=None
+        if asset:
+            uri=asset['browser_download_url']
+            if uri.startswith('https://github.com/'+UPDATE_REPO+'/releases/download/'):
+                exe={'url':uri,'size':asset.get('size'),
+                     'digest':asset.get('digest') or ''}
         latest_release = {"tag": str(release.get("tag_name", "")),
                           "page": release.get("html_url") or GITHUB_URL + "/releases",
-                          "title": release.get("name") or str(release.get("tag_name", ""))}
+                          "title": release.get("name") or str(release.get("tag_name", "")),
+                          "exe":exe}
     except urllib.error.HTTPError as exc:
         if exc.code != 404:  # 404 means this project has no published release, not a broken repository
             raise
@@ -7380,78 +8987,169 @@ def start_update_check(manual=False):
     threading.Thread(target=_update_check_worker, args=(manual,), daemon=True).start()
 
 
-def _install_update_worker(info):
-    """Download the new .exe next to the running one, check it, then hand over to a small .bat
-    that waits for this program to close, swaps the files and starts the new version."""
-    exe = sys.executable
-    new_path = exe + ".new"
-    try:
-        log(f"Downloading {info['tag']}...")
-        req = urllib.request.Request(info["url"], headers={"User-Agent": "thebums-macro-updater"})
-        sha = hashlib.sha256()
-        done, last_pct = 0, -1
-        with urllib.request.urlopen(req, timeout=UPDATE_TIMEOUT) as r, open(new_path, "wb") as f:
-            total = int(r.headers.get("Content-Length") or info.get("size") or 0)
-            while True:
-                chunk = r.read(1 << 16)
-                if not chunk:
-                    break
-                f.write(chunk)
-                sha.update(chunk)
-                done += len(chunk)
-                if total:
-                    pct = done * 100 // total // 20 * 20
-                    if pct != last_pct:
-                        last_pct = pct
-                        log(f"Downloading update... {pct}%")
-        # make sure it is the whole, real file
-        if info.get("size") and done != info["size"]:
-            raise RuntimeError(f"incomplete download ({done} of {info['size']} bytes)")
-        with open(new_path, "rb") as f:
-            if f.read(2) != b"MZ":
-                raise RuntimeError("the downloaded file is not a Windows program")
-        digest = str(info.get("digest") or "")
-        if digest.startswith("sha256:") and digest[7:].lower() != sha.hexdigest():
-            raise RuntimeError("the download does not match GitHub's checksum")
+def can_install_update():
+    """Never install unless user has explicitly stopped any started session.
+    Pause, reconnect, idle-in-mission and unexpected thread death are NOT Stop.
+    """
+    if running() or state.get('reconnecting') or state.get('paused'):
+        return False
+    # Strict policy: even an app that just launched must wait until a genuine
+    # user Stop action. A merely idle app is not sufficient authorization.
+    return bool(state.get('user_stopped'))
 
-        q = lambda path: path.replace("%", "%%")      # % is special inside a .bat
-        bat = os.path.join(tempfile.gettempdir(), "thebums_update.bat")
-        with open(bat, "w", encoding="mbcs", errors="replace", newline="\r\n") as f:
-            f.write("\n".join([
-                "@echo of",
-                "set _MEIPASS2=",
-                "set PYINSTALLER_RESET_ENVIRONMENT=1",
-                f'cd /d "{q(os.path.dirname(exe))}"',
-                "set /a n=0",
-                ":wait",
-                "set /a n+=1",
-                f'move /y "{q(new_path)}" "{q(exe)}" >nul 2>&1',
-                "if not errorlevel 1 goto done",
-                "if %n% geq 60 goto end",
-                "ping -n 2 127.0.0.1 >nul",
-                "goto wait",
-                ":done",
-                f'start "" "{q(exe)}"',
-                ":end",
-                '(goto) 2>nul & del "%~f0"',
-            ]) + "\n")
-        env = {k: v for k, v in os.environ.items() if k != "_MEIPASS2"}
-        env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
-        subprocess.Popen(["cmd", "/c", bat], env=env, close_fds=True,
-                         creationflags=0x08000000 | 0x00000008)   # no window, detached
-        log("Update downloaded - restarting...")
-        ev.put(("update_ready",))
-    except Exception as e:  # noqa: BLE001
-        log(f"Error: update failed - {type(e).__name__}: {e}")
+
+def acquire_update_lock():
+    """Process-wide update reservation in the EXE directory, shared across instances."""
+    name=sys.executable+'.updating'
+    try:
+        descriptor=os.open(name,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+    except FileExistsError:
         try:
-            os.remove(new_path)
-        except OSError:
-            pass
-        _update["busy"] = False
+            if time.time()-os.path.getmtime(name)>24*3600:
+                os.remove(name)   # recover old crashed reservations only
+                return acquire_update_lock()
+        except OSError:pass
+        return False
+    try:
+        os.write(descriptor,str(os.getpid()).encode('ascii'))
+    finally:
+        os.close(descriptor)
+    _update['lockfile']=name
+    return True
+
+
+def release_update_lock():
+    name=_update.get('lockfile')
+    if name:
+        try:os.remove(name)
+        except OSError:pass
+        _update['lockfile']=None
+
+
+def _install_update_worker(info):
+    """ONLY download + verify. Actual installation is a later user-Stop-gated event."""
+    exe=sys.executable
+    new_path=exe+'.new'
+    try:
+        if not IS_WIN or not getattr(sys,'frozen',False):
+            raise RuntimeError('Auto-install requires the official Windows EXE build')
+        if not info.get('digest','').startswith('sha256:'):
+            raise RuntimeError('Release has no SHA-256 digest; refusing automatic installation')
+        if info.get('size') and (info['size']<1_000_000 or info['size']>500_000_000):
+            raise RuntimeError('Unexpected release file size')
+        if update_history().blocked(info['tag'],info['digest']):
+            raise RuntimeError('This failed release is blocked from automatic reinstallation')
+        log(f"Downloading verified update {info['tag']}...")
+        req=urllib.request.Request(info['url'],headers={'User-Agent':'thebums-macro-updater'})
+        sha=hashlib.sha256();size=0
+        with urllib.request.urlopen(req,timeout=UPDATE_TIMEOUT) as response,open(new_path,'wb') as out:
+            if response.geturl().split('/')[2] not in ('github.com','objects.githubusercontent.com',
+                                                        'release-assets.githubusercontent.com'):
+                raise RuntimeError('Unexpected update download host')
+            while True:
+                part=response.read(1<<17)
+                if not part:break
+                out.write(part);sha.update(part);size+=len(part)
+                if size>500_000_000:raise RuntimeError('Update exceeds permitted size')
+        if info.get('size') and info['size']!=size:
+            raise RuntimeError('Download size does not match the release asset')
+        if sha.hexdigest().lower()!=info['digest'][7:].lower():
+            raise RuntimeError('SHA-256 checksum mismatch')
+        with open(new_path,'rb') as stream:
+            if stream.read(2)!=b'MZ':raise RuntimeError('Downloaded asset is not a Windows EXE')
+        _update['staged']=new_path
+        _update['release']=info
+        update_history().record(info['tag'],'downloaded',info['digest'])
+        ev.put(('update_staged',))
+    except Exception as exc:
+        log(f'Update download refused: {type(exc).__name__}: {exc}')
+        update_history().record(info.get('tag','unknown'),'download_failed',info.get('digest',''),str(exc))
+        try:os.remove(new_path)
+        except OSError:pass
+        release_update_lock()
+    finally:
+        _update['busy']=False
 
 
 def install_update(info):
-    threading.Thread(target=_install_update_worker, args=(info,), daemon=True).start()
+    if _update['busy']:return
+    if not acquire_update_lock():
+        log('Another The Bums instance is already preparing an update')
+        return
+    _update['busy']=True
+    threading.Thread(target=_install_update_worker,args=(info,),daemon=True,
+                     name='UpdateDownloader').start()
+
+
+def launch_staged_update():
+    """Start the bundled local transaction helper; called ONLY after Stop verification."""
+    if not can_install_update():return False
+    info=_update.get('release')
+    staged=_update.get('staged')
+    if not info or not staged or not os.path.isfile(staged):return False
+    if _update.get('install_launched'):return False
+    if not IS_WIN or not getattr(sys,'frozen',False):return False
+    bundled_helper=os.path.join(getattr(sys,'_MEIPASS',app_dir()),'updater.ps1')
+    if not os.path.isfile(bundled_helper):
+        log('The bundled updater helper was not found')
+        return False
+    with _update_install_guard:
+        if not can_install_update() or _update.get('install_launched'):
+            return False
+        _update['install_launched']=True
+    health=os.path.join(data_dir(),'update_health.ok')
+    status_file=os.path.join(data_dir(),'update_status.json')
+    try:
+        # The PyInstaller one-file extraction directory vanishes on exit.
+        # Copy the trusted, bundled script to a stable local temporary path.
+        helper=os.path.join(tempfile.gettempdir(),
+                            'thebums_updater_'+uuid.uuid4().hex+'.ps1')
+        shutil.copy2(bundled_helper,helper)
+        subprocess.Popen(['powershell.exe','-NoProfile','-ExecutionPolicy','Bypass',
+                          '-File',helper,'-CurrentExe',sys.executable,
+                          '-StagedExe',staged,'-HealthFile',health,
+                          '-StatusFile',status_file,'-ReleaseTag',info['tag'],
+                          '-Digest',info['digest']],
+                         creationflags=0x00000008|0x08000000,close_fds=True)
+        ev.put(('update_ready',))
+        return True
+    except Exception as exc:
+        _update['install_launched']=False
+        log(f'Could not launch updater: {type(exc).__name__}: {exc}')
+        release_update_lock()
+        return False
+
+
+def update_startup_check(root):
+    """Report startup readiness and asynchronously consume completed update history.
+
+    The updater may write its success status *after* the new Tk window opens,
+    so reading only once at startup would silently miss successful installs.
+    """
+    status_file=os.path.join(data_dir(),'update_status.json')
+    def consume_status(remaining=12):
+        try:
+            with open(status_file,encoding='utf-8-sig') as f:
+                status=json.load(f)
+            if status.get('status') in ('installed','rolled_back','failed'):
+                update_history().record(status.get('tag','unknown'),status['status'],
+                                        status.get('digest',''),status.get('details',''))
+                log('Last update: '+status['status'])
+                os.remove(status_file)
+                return
+        except (OSError,ValueError,KeyError):
+            pass
+        if remaining>0 and root.winfo_exists():
+            root.after(2000,lambda:consume_status(remaining-1))
+    consume_status()
+    def healthy():
+        if not root.winfo_exists():return
+        try:
+            with open(os.path.join(data_dir(),'update_health.ok'),'w',encoding='ascii') as f:
+                f.write('ready')
+        except OSError:pass
+    root.after(3000,healthy)
+
 
 
 # main window words: (not Female Raid, Female Raid)
@@ -7465,6 +9163,106 @@ UI_WORDS = {
 def ui_word(key):
     """The caption of a main window counter for the config that is picked now."""
     return UI_WORDS[key][raid_counting()]
+
+
+def session_analytics_dataset(events):
+    """Summarize the existing event journal; never change or migrate user history.
+
+    Counts describe recorded events, not gameplay outcomes inferred from missing data.
+    Incomplete/rotated session histories remain visible as partial sessions.
+    """
+    sessions = {}
+    total = dict(completed=0, failed=0, reconnects=0, errors=0)
+    kinds = {'mission_completed': 'completed', 'mission_failed': 'failed',
+             'reconnect_completed': 'reconnects', 'error': 'errors'}
+    for event in events:
+        kind = event.get('kind')
+        if kind in kinds:
+            total[kinds[kind]] += 1
+        ident = event.get('session')
+        if not ident:
+            continue
+        row = sessions.setdefault(ident, {'id': str(ident), 'family': '',
+                                         'started': None, 'ended': None, 'status': None,
+                                         'completed': 0, 'failed': 0,
+                                         'reconnects': 0, 'errors': 0})
+        if event.get('family'):
+            row['family'] = str(event['family'])
+        if kind == 'session_started':
+            row['started'] = event.get('time')
+        elif kind == 'session_finished':
+            row['ended'] = event.get('time')
+            row['status'] = event.get('status')
+        elif kind in kinds:
+            row[kinds[kind]] += 1
+    result = list(sessions.values())
+    result.sort(key=lambda r: (r['started'] or r['ended'] or '', r['id']))
+    return {'sessions': sum(1 for row in result if row['started']),
+            'total': total, 'rows': result,
+            'recorded_results': total['completed'] + total['failed']}
+
+
+def analytics_local_time(value, date_only=False):
+    if not value:
+        return 'N/A'
+    try:
+        from datetime import datetime
+        parsed = datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone()
+        return parsed.strftime('%d %b %Y' if date_only else '%d %b %Y, %H:%M')
+    except (ValueError, TypeError, OverflowError):
+        return 'Unknown'
+
+
+def analytics_duration(start, end):
+    if not start or not end:
+        return 'In progress / unknown'
+    try:
+        from datetime import datetime
+        left = datetime.fromisoformat(str(start).replace('Z', '+00:00'))
+        right = datetime.fromisoformat(str(end).replace('Z', '+00:00'))
+        secs = max(0, int((right - left).total_seconds()))
+        hours, rest = divmod(secs, 3600)
+        minutes, seconds = divmod(rest, 60)
+        return f'{hours}h {minutes}m' if hours else f'{minutes}m {seconds}s'
+    except (ValueError, TypeError, OverflowError):
+        return 'Unknown'
+
+
+def run_user_diagnostics(root):
+    checks=[]
+    checks.append(('Roblox window', 'Found' if roblox_area() else 'Not found'))
+    checks.append(('Screen capture','Not tested'))
+    checks.append(('Background Mode', 'In Development (disabled); Standard Mode is available'))
+    with _shared_scan_lock:
+        published = _shared_scan_counts['published']
+        reused = _shared_scan_counts['reused']
+    checks.append(('Shared scan reuse', f'{reused} reused / {published} passive frames'))
+    if running():
+        checks.append(('Health Monitor', 'Passive stall alerts active; never sends recovery input'))
+    else:
+        checks.append(('Health Monitor', 'Ready (active during macro sessions)'))
+    try:
+        with mss.mss() as sct:
+            area=pick_monitor(sct.monitors)
+            shot=sct.grab(area)
+            checks[1]=('Screen capture',f'OK ({shot.width}x{shot.height})')
+    except Exception as exc:
+        checks[1]=('Screen capture',f'Error: {type(exc).__name__}')
+    for name in ('retry_text.png','result_completed.png','rc_reconnect.png',
+                 'rc_slot_a.png','rc_start.png','mission_start.png'):
+        checks.append((name,'Ready' if os.path.isfile(asset_path(name)) else 'Missing'))
+    # Buttons absent from the current screen are NOT classified as detection errors.
+    report={'time':time.strftime('%Y-%m-%d %H:%M:%S'),
+            'version':VERSION,'checks':dict(checks),
+            'note':'A button can be detected only while it is visible on Roblox.'}
+    report_path=os.path.join(data_dir(),'diagnostics_report.json')
+    with open(report_path,'w',encoding='utf-8') as file:
+        json.dump(report,file,indent=2)
+    messagebox.showinfo('User Diagnostics',
+                        '\n'.join(f'{a}: {b}' for a,b in checks)+
+                        f'\n\nReport saved: {report_path}',parent=root)
 
 
 class App:
@@ -7496,7 +9294,8 @@ class App:
         self.mission_last = None
         self.reset_armed = False
         self.reset_job = None
-        self.settings_win = None
+        self.settings_win = None      # currently visible Settings page, if any
+        self._settings_cached = None  # preserve widgets across Dashboard/Settings navigation
         self.pill_key = "idle"
         self.step_idx = -1
         self.geo_job = None
@@ -7537,8 +9336,15 @@ class App:
         root.bind("<FocusIn>", self.keep_settings_on_top, add="+")   # settings stays above this window
         root.bind("<ButtonPress>", self.keep_settings_on_top, add="+")
         self.pump()
+        update_startup_check(root)
+        self.root.after(1500,self.auto_check_updates)
         if UPDATE_CHECK_ON_START:
             root.after(1500, start_update_check)
+
+    def auto_check_updates(self):
+        if settings.get('update_prefs',{}).get('automatic'):
+            start_update_check(manual=False)
+        self.root.after(6*60*60*1000,self.auto_check_updates)
 
     # ----- (re)building the window, themes -----
     def apply_styles(self):
@@ -7582,7 +9388,8 @@ class App:
             "log": self.log_text.dump("1.0", "end-1c", text=True, tag=True),
         }
         for child in r.winfo_children():
-            if child is not self.settings_win:      # the settings window is rebuilt by itself
+            if child is not self.settings_win and child is not self._settings_cached:
+                # The hidden Settings page is a persistent sibling of Dashboard.
                 child.destroy()
         had_mini, self.mini = self.mini is not None, None   # (destroyed above with the rest)
         r.configure(bg=self.BG)
@@ -7652,6 +9459,9 @@ class App:
         tk.Label(brand, text="This is just a macro • keyboard/mouse automation only",
                  font=(App.FONT, 8), fg=self.SUB, bg=self.BG,
                  anchor="w", justify="left").pack(side="top", anchor="w", pady=(4, 0))
+        tk.Label(brand, text="ⓘ  Please use Windowed Screen, not Fullscreen",
+                 font=(App.FONT, 8), fg=self.SUB, bg=self.BG,
+                 anchor="w").pack(side="top", anchor="w", pady=(2, 0))
         self.pill = Pill(head, self.BG)
         self.pill.pack(side="right")
 
@@ -7688,6 +9498,9 @@ class App:
         self.stepper = Stepper(c, len(step_names()), self.CARD,
                                (self.STEP_DONE, self.ACCENT_SOFT, self.STEP_PENDING))
         self.stepper.pack(fill="x")
+        self.reconnect_bar = ttk.Progressbar(c, orient='horizontal',mode='determinate',maximum=100)
+        self.reconnect_detail = tk.Label(c, text='', font=(App.FONT,8),fg=self.SUB,bg=self.CARD)
+        # Both are hidden until a reconnect begins.
 
     def build_stats(self):
         c = self.card()
@@ -7877,21 +9690,18 @@ class App:
         self.log_text.tag_configure("info", foreground=self.ACCENT_SOFT)
 
     def keep_settings_on_top(self, _event=None):
-        """The settings window stays above the main window, even when that one is always on top."""
+        """Keep the inline Settings page above the dashboard widgets."""
         if self.settings_win is None or getattr(self, "_lift_job", None):
-            return                       # nothing to do, or a lift is already scheduled
+            return
         self._lift_job = self.root.after(60, self._lift_settings)
 
     def _lift_settings(self):
-        """One single lift, 60 ms after the last request (many events -> no flicker)."""
         self._lift_job = None
-        win = self.settings_win
-        if win is None:
-            return
-        try:
-            win.lift()                   # it is owned by the main window and topmost already
-        except tk.TclError:
-            pass
+        if self.settings_win is not None:
+            try:
+                self.settings_win.lift()
+            except tk.TclError:
+                pass
 
     def on_topmost_toggle(self):
         on = bool(self.topmost.get())
@@ -7906,8 +9716,7 @@ class App:
         apply_opacity(self.root)
         if self.mini is not None:
             apply_opacity(self.mini)
-        if self.settings_win is not None:
-            apply_opacity(self.settings_win)
+        # Settings is an embedded Frame; the root opacity already applies to it.
         save_stats()
 
     def build_footer(self):
@@ -7935,7 +9744,7 @@ class App:
         upd.bind("<Enter>", lambda _e: upd.configure(fg=self.TEXT))
         upd.bind("<Leave>", lambda _e: upd.configure(fg=self.SUB))
         # Show the installed release immediately beside Updates (not the newest GitHub release).
-        tk.Label(left, text="v1.2", font=(App.FONT, 8), fg=self.SUB,
+        tk.Label(left, text="v1.3 beta", font=(App.FONT, 8), fg=self.SUB,
                  bg=self.BG).pack(side="left", padx=(7, 0))
 
         self.reset_btn = tk.Label(foot, text="Reset stats", font=(App.FONT, 9),
@@ -8033,8 +9842,20 @@ class App:
                 self.settings_win.say(e[1], error=e[2], good=e[3])
         elif kind == "update_result":
             self.on_update_result(e[1], e[2], e[3])
+        elif kind == 'update_staged':
+            self.maybe_install_update()
         elif kind == "update_ready":
             self.on_close()          # the .bat swaps the files and starts the new version
+        elif kind == 'reconnect_progress':
+            _,i,total,label,stage,attempt=e
+            self.reconnect_bar['value']=round(max(0,i-1)/max(1,total)*100)
+            self.reconnect_detail.configure(text=f'{i}/{total}  {stage}  ·  Attempt {attempt}/3')
+            if not self.reconnect_bar.winfo_manager():
+                self.reconnect_bar.pack(fill='x',pady=(6,1))
+                self.reconnect_detail.pack(fill='x')
+        elif kind in ('reconnect_done','reconnect_failed'):
+            self.reconnect_bar.pack_forget()
+            self.reconnect_detail.pack_forget()
         elif kind == "mission_started":
             self.mission_t0 = time.time()
         elif kind == "mission_ended":
@@ -8050,6 +9871,9 @@ class App:
         elif kind == "stopping":
             self.hide_mini()
         elif kind == "done":
+            self.root.after(800,self.maybe_install_update)
+            self.reconnect_bar.pack_forget()
+            self.reconnect_detail.pack_forget()
             self.hide_mini()
             self.run_t0 = None
             self.mission_t0 = None
@@ -8152,7 +9976,7 @@ class App:
 
     def set_mini_paused(self, on):
         """Show / hide the PAUSED box and keep the bar at the top of Roblox (just under its
-        title bar), left / middle / right as picked in Settings > UI, or of the screen if Roblox
+        title bar), left / middle / right as picked in Settings > App, or of the screen if Roblox
         isn't found."""
         if self.mini is None:
             return
@@ -8177,63 +10001,109 @@ class App:
         reveal_window(self.root)
 
     def on_update_result(self, manual, info, error):
-        _update["busy"] = False
+        _update['busy']=False
         if error:
-            log(f"GitHub update check failed: {error}")
-            if manual:
-                messagebox.showerror("GitHub updates", f"Could not check GitHub.\n\n{error}",
-                                     parent=self.root)
+            log(f'GitHub update check failed: {error}')
+            if manual:messagebox.showerror('GitHub Updates',str(error),parent=self.root)
             return
-        release, commit = (info or {}).get("release"), (info or {}).get("commit")
-        if not release and not commit:
-            log("GitHub: no release or commit information was returned")
-            if manual:
-                messagebox.showinfo("GitHub updates", "No update information was returned.",
-                                    parent=self.root)
+        release=(info or {}).get('release')
+        if not release or not re.search(r'v?\d+\.\d+',release.get('tag','')):
+            if manual:messagebox.showinfo('Updates','No published release found.',parent=self.root)
             return
-        lines = ["The Bums Macro — GitHub", f"Installed version: {VERSION}"]
-        if release:
-            lines.append(f"Latest release: {release['tag']}  ({release['title']})")
-        else:
-            lines.append("Latest release: No published GitHub release")
-        if commit:
-            lines.append(f"Latest commit: {commit['sha'][:10]}")
-            lines.append(f"Date: {commit['date']}")
-            lines.append(f"Change: {commit['message']}")
-        # Compare published release versions independently from Git commit revisions.
-        # A source ZIP can have a valid public version even without an embedded Git SHA.
-        if release and re.search(r"v?\d+\.\d+", release.get("tag", ""), re.I):
-            published = parse_version(release["tag"])
-            installed = parse_version(VERSION)
-            if published > installed:
-                lines.append("A newer published release is available on GitHub.")
-            elif published == installed:
-                lines.append("This version matches the latest published release.")
-            else:
-                lines.append("This installed version is newer than the latest published release.")
-        local = (info or {}).get("local_sha")
-        if local and commit:
-            if local == commit["sha"].lower():
-                lines.append("Your embedded Git revision matches the latest repository commit.")
-            else:
-                lines.append("The repository commit differs from this build's embedded revision.")
-        else:
-            lines.append("Git commit revision unavailable; release-version comparison is shown above.")
-        log("GitHub checked: " + (commit["sha"][:10] if commit else release["tag"]))
-        if manual and messagebox.askyesno(
-                "GitHub updates", "\n".join(lines) + "\n\nOpen the repository in your browser?",
-                parent=self.root):
-            webbrowser.open(GITHUB_URL)
+        if parse_version(release['tag'])<=parse_version(VERSION):
+            if manual:messagebox.showinfo('Updates','You are using the latest release.',parent=self.root)
+            return
+        exe=release.get('exe')
+        if not exe or not exe.get('digest','').startswith('sha256:'):
+            if manual and messagebox.askyesno('Updates',
+                    'A release is available, but automatic installation cannot verify it.\nOpen GitHub?',
+                    parent=self.root):webbrowser.open(release['page'])
+            return
+        package=dict(exe,tag=release['tag'])
+        if update_history().blocked(package['tag'],package['digest']):
+            log(f"Update {package['tag']} is blocked after a prior rollback")
+            if manual and not messagebox.askyesno('Previous Update Failed',
+                    'This version previously failed and was rolled back. Retry manually?',parent=self.root):
+                return
+            if not manual:return
+            # Manual explicit retry may override the block for download.
+            h=update_history().read()
+            h.get('blocked',{}).pop(package['tag'],None)
+            from thebums_features import _atomic_json
+            _atomic_json(update_history().path,h)
+        if not getattr(sys,'frozen',False) or not IS_WIN:
+            if manual and messagebox.askyesno('Updates',
+                    'Automatic installation requires a Windows EXE build. Open the release?',parent=self.root):
+                webbrowser.open(release['page'])
+            return
+        if manual:
+            if not messagebox.askyesno('Update Available',
+                    f"Installed: {VERSION}\nAvailable: {package['tag']}\n\n"
+                    'Download and verify this update now? Installation will wait for Stop.',
+                    parent=self.root):return
+        elif not (settings['update_prefs']['automatic'] and settings['update_prefs']['download']):
+            log(f"Update available: {package['tag']} (open Updates to download)")
+            return
+        install_update(package)
+
+    def maybe_install_update(self):
+        if not _update.get('staged') or not can_install_update():return
+        if _update.get('prompted'):return
+        if settings['update_prefs'].get('install_mode')=='ask':
+            _update['prompted']=True
+            if not messagebox.askyesno('Install Update',
+                    'The update is ready. The macro is stopped. Install and restart now?',parent=self.root):
+                return
+        launch_staged_update()
 
 
     def open_settings(self):
+        """Show the cached Settings page; never rebuild all tabs on navigation."""
         if self.settings_win is not None:
-            self.settings_win.deiconify()
-            self.settings_win.attributes("-topmost", True)
             self.settings_win.lift()
-            self.settings_win.focus_force()
+            self.settings_win.focus_set()
             return
-        self.settings_win = SettingsWindow(self)
+        if self.geo_job is not None:
+            self.root.after_cancel(self.geo_job)
+            self.geo_job = None
+        self.save_window()
+        self._dashboard_geometry = self.root.geometry()
+        self._dashboard_minsize = self.root.minsize()
+        self._settings_transition = True
+        try:
+            page = self._settings_cached
+            if page is None or not page.winfo_exists():
+                page = SettingsWindow(self)
+                self._settings_cached = page
+            # Cover the existing Dashboard BEFORE resizing the OS window so
+            # the expensive Dashboard content is never exposed at Settings size.
+            self.settings_win = page
+            page.place(x=0, y=0, relwidth=1, relheight=1)
+            page.lift()
+            screen_w = self.root.winfo_screenwidth()
+            screen_h = self.root.winfo_screenheight()
+            wide = max(580, min(900, screen_w - 60))
+            tall = max(460, min(760, screen_h - 100))
+            self.root.minsize(min(760, wide), min(540, tall))
+            self.root.geometry(f"{wide}x{tall}")
+            self.root.title(f"{APP_NAME} - Settings")
+            page.activate()
+            page.focus_set()
+        finally:
+            self._settings_transition = False
+
+    def leave_settings(self):
+        """Return to the dashboard without changing its saved window dimensions."""
+        self.settings_win = None
+        self._settings_transition = True
+        try:
+            if hasattr(self, '_dashboard_minsize'):
+                self.root.minsize(*self._dashboard_minsize)
+            if hasattr(self, '_dashboard_geometry'):
+                self.root.geometry(self._dashboard_geometry)
+            self.root.title(APP_NAME)
+        finally:
+            self._settings_transition = False
 
     def refresh_hotkeys(self):
         """Hotkeys were changed in Settings: update the tile badges and the hint."""
@@ -8262,14 +10132,16 @@ class App:
         return w, h, x, y
 
     def on_configure(self, event):
-        if event.widget is not self.root:      # ignore the child widgets
-            return
+        if event.widget is not self.root or self.settings_win is not None or getattr(self, '_settings_transition', False):
+            return   # Settings has a temporary larger page size; never persist it as dashboard size.
         if self.geo_job:
             self.root.after_cancel(self.geo_job)
         self.geo_job = self.root.after(800, self.save_window)   # once it stops moving
 
     def save_window(self):
         self.geo_job = None
+        if self.settings_win is not None or getattr(self, '_settings_transition', False):
+            return
         r = self.root
         try:
             if r.state() != "normal":          # minimized / maximized: keep the last good one
@@ -8288,6 +10160,8 @@ class App:
             save_stats()
 
     def on_close(self):
+        if not _update.get('install_launched'):
+            release_update_lock()
         if self.geo_job:
             self.root.after_cancel(self.geo_job)
         self.save_window()
@@ -8544,17 +10418,16 @@ class ThemeCard(tk.Canvas):
             self.create_oval(W - 20, H - 20, W - 12, H - 12, fill=P["ACCENT"], outline="")
 
 
-class SettingsWindow(tk.Toplevel):
-    """Settings: Keybinds / Discord / Configs / UI. Every change is saved right away
-    (into the same json as the stats)."""
-    TABS = (("keys", "Keybinds"), ("family", "Configs"), ("recovery", "Recovery"),
-            ("discord", "Discord"), ("themes", "UI"))
+class SettingsWindow(tk.Frame):
+    """In-window Settings page: no second top-level window, same saved config keys."""
+    TABS = (("keys", "Keybinds"), ("family", "Macros"), ("recovery", "Recovery"),
+            ("roblox", "Roblox"), ("detection", "Detection"),
+            ("discord", "Discord"), ("app", "App"))
     UID_HELP = ("Discord > Settings > Advanced > Developer Mode on, then right-click "
                 "your name > Copy User ID.")
 
     def __init__(self, app):
-        super().__init__(app.root)
-        prepare_window(self)    # build everything hidden, then show it once - no flicker
+        super().__init__(app.root, bg=App.BG)
         self.app = app
         self.capturing = None       # bind id waiting for a key press
         self.capture_hook = None
@@ -8563,29 +10436,24 @@ class SettingsWindow(tk.Toplevel):
         self.key_buttons = {}
         self.pages = {}
         self.tab_widgets = {}
+        self._tab_yview = {}  # scroll positions survive tab navigation
+        self._root_wheel_bind = None
 
-        self.title(f"{APP_NAME} - settings")
-        try:
-            self.iconbitmap(asset_path(ICON_FILE))
-        except (tk.TclError, OSError):
-            pass
-        self.resizable(True, True)
-        self.minsize(420, 380)
-        self.wrap_w = 353                    # wraplength of the notes / hints (follows the width)
-        self.transient(app.root)             # owned by the main window = always drawn above it
-        self.attributes("-topmost", True)    # settings always stays above everything
-        self.protocol("WM_DELETE_WINDOW", self.close)
-
+        self.wrap_w = 560  # updated from the right-hand content canvas width
         self.build_ui("keys")
-        self.update_idletasks()
-        x, y = app.root.winfo_x() + 40, app.root.winfo_y() + 40
-        h = min(self.winfo_reqheight(), max(380, self.winfo_screenheight() - 120))
-        self.geometry(f"460x{h}+{x}+{max(0, min(y, self.winfo_screenheight() - h - 60))}")
-        style_title_bar(self, App.BG)
-        reveal_window(self)
-        self.lift()
-        self.attributes("-topmost", True)
-        self.focus_force()
+
+    def activate(self):
+        """Resume a hidden Settings page without recreating any Tk widgets."""
+        if getattr(self, '_built_theme', None) != settings['theme']:
+            self.build_ui(getattr(self, 'cur_tab', 'keys'))
+        if self._root_wheel_bind is None:
+            self._root_wheel_bind = self.app.root.bind('<MouseWheel>', self.on_wheel, add='+')
+        self.refresh_key_buttons()
+        if self.cur_tab == 'analytics':
+            self.refresh_analytics(force=False)
+        elif self.cur_tab == 'presets':
+            self.refresh_presets()
+        self.after_idle(self.on_size)
 
     def build_ui(self, tab):
         """(Re)build every widget - on open, and again when the theme changes."""
@@ -8596,14 +10464,19 @@ class SettingsWindow(tk.Toplevel):
                 continue
             child.destroy()
         self.key_buttons, self.pages, self.tab_widgets = {}, {}, {}
+        # A theme change is an intentional rebuild; ordinary tab switching is not.
+        self._tab_yview.clear()
+        self._wrapped_pages = {}  # defer costly label reflow until each page is visible
+        self.cur_tab = None
+        self._built_theme = settings['theme']
         self.configure(bg=App.BG)
         self.build_tab_bar()
-        # footer first, so it always stays visible when the window is made small
-        foot = tk.Frame(self, bg=App.BG)
+        # Footer is pinned within the content column while pages scroll independently.
+        foot = tk.Frame(self.content_host, bg=App.BG)
         foot.pack(side="bottom", fill="x", padx=22, pady=(4, 14))
         # the pages sit in a scrollable area: the window can be resized, a scrollbar shows when
         # the content no longer fits
-        body = tk.Frame(self, bg=App.BG)
+        body = tk.Frame(self.content_host, bg=App.BG)
         body.pack(side="top", fill="both", expand=True, padx=(18, 4))
         body.columnconfigure(0, weight=1)
         body.rowconfigure(0, weight=1)
@@ -8621,16 +10494,20 @@ class SettingsWindow(tk.Toplevel):
         inner.rowconfigure(0, weight=1)
         inner.bind("<Configure>", lambda _e: self.on_size())
         self.canvas.bind("<Configure>", lambda e: self.on_size(e.width))
-        self.bind("<MouseWheel>", self.on_wheel)
-        for key, _text in self.TABS:    # all pages sit on top of each other, one is raised
+        for key in [k for k, _text in self.TABS] + ['presets', 'analytics']:
+            # Utility pages use the same canvas/sidebar as the seven main tabs.
             page = tk.Frame(inner, bg=App.BG)
             page.grid(row=0, column=0, sticky="nsew")
             self.pages[key] = page
         self.build_keys(self.pages["keys"])
         self.build_discord(self.pages["discord"])
         self.build_family(self.pages["family"])
+        self.build_presets(self.pages["presets"])
+        self.build_analytics(self.pages["analytics"])
         self.build_recovery(self.pages["recovery"])
-        self.build_themes(self.pages["themes"])
+        self.build_roblox(self.pages["roblox"])
+        self.build_detection(self.pages["detection"])
+        self.build_themes(self.pages["app"])
         self.update_idletasks()
         # opens tall enough to show the whole Configs tab (capped to the screen in __init__);
         # a taller page on another tab is reached by scrolling
@@ -8672,7 +10549,10 @@ class SettingsWindow(tk.Toplevel):
                 wrap = max(200, width - 34)
                 if wrap != self.wrap_w:
                     self.wrap_w = wrap
-                    self.rewrap(inner)
+                    active = getattr(self, 'cur_tab', None)
+                    if active in self.pages:
+                        self.rewrap(self.pages[active])
+                        self._wrapped_pages[active] = wrap
             page = self.pages.get(getattr(self, "cur_tab", None))
             need = page.winfo_reqheight() if page is not None else inner.winfo_reqheight()
             self.canvas.configure(scrollregion=(0, 0, 1, need))
@@ -8695,23 +10575,9 @@ class SettingsWindow(tk.Toplevel):
             self.canvas.yview_scroll(-1 if e.delta > 0 else 1, "units")
 
     def retheme(self, tab):
-        """The theme changed: rebuild this window in the new look (same place, same size)."""
+        """Rebuild the embedded page using the newly chosen theme."""
         self.commit()
-        old_w, old_h = self.winfo_width(), self.winfo_height()
-        try:
-            self.attributes("-alpha", 0.0)      # rebuilt unseen
-        except tk.TclError:
-            pass
         self.build_ui(tab)
-        self.update_idletasks()
-        # keep the size it had; it only grows if the new look really needs more room
-        self.geometry(f"{max(old_w, self.winfo_reqwidth())}x{max(old_h, self.winfo_reqheight())}")
-        style_title_bar(self, App.BG)
-        self.update()
-        try:
-            self.attributes("-alpha", 1.0)
-        except tk.TclError:
-            pass
         self.app.keep_settings_on_top()
 
     # ----- look -----
@@ -8768,24 +10634,53 @@ class SettingsWindow(tk.Toplevel):
 
     # ----- tabs -----
     def build_tab_bar(self):
-        bar = tk.Frame(self, bg=App.BG)
-        bar.pack(fill="x", padx=22, pady=(16, 10))
-        for i, (key, text) in enumerate(self.TABS):
-            bar.columnconfigure(i, weight=1, uniform="tabs")    # equal widths, fill the window
-            cell = tk.Frame(bar, bg=App.BG, cursor="hand2")
-            cell.grid(row=0, column=i, sticky="ew", padx=(0 if i == 0 else 6, 0))
-            lbl = tk.Label(cell, text=text, font=(App.FONT, 11, "bold"), fg=App.SUB,
-                           bg=App.BG, cursor="hand2")
-            lbl.pack(fill="x")
-            line = tk.Frame(cell, height=3, bg=App.BG)
-            line.pack(fill="x", pady=(5, 0))
-            for w in (cell, lbl):
-                w.bind("<Button-1>", lambda _e, k=key: self.show_tab(k))
-            self.tab_widgets[key] = (lbl, line)
+        """Persistent left sidebar; Dashboard and Settings share the same OS window."""
+        shell = tk.Frame(self, bg=App.BG)
+        shell.pack(fill="both", expand=True)
+        sidebar = tk.Frame(shell, width=192, bg=App.CARD,
+                           highlightbackground=App.BORDER, highlightthickness=1)
+        sidebar.pack(side="left", fill="y")
+        sidebar.pack_propagate(False)
+        tk.Label(sidebar, text="THE BUMS", bg=App.CARD, fg=App.TEXT,
+                 font=(App.FONT, 14, "bold"), anchor="w").pack(fill="x", padx=18, pady=(24, 2))
+        tk.Label(sidebar, text="SETTINGS", bg=App.CARD, fg=App.SUB,
+                 font=(App.FONT, 8, "bold"), anchor="w").pack(fill="x", padx=18, pady=(0, 18))
+        back = tk.Label(sidebar, text="‹  Back to Dashboard", font=(App.FONT, 10, "bold"),
+                        bg=App.FIELD, fg=App.TEXT, anchor="w", padx=14, pady=12,
+                        cursor="hand2")
+        back.pack(fill="x", padx=12, pady=(0, 16))
+        back.bind("<Button-1>", lambda _e: self.close())
+        back.bind("<Enter>", lambda _e: back.configure(bg=App.FIELD_HOVER))
+        back.bind("<Leave>", lambda _e: back.configure(bg=App.FIELD))
+        tk.Frame(sidebar, bg=App.BORDER, height=1).pack(fill="x", padx=12, pady=(0, 10))
+        for key, caption in self.TABS:
+            entry = tk.Frame(sidebar, bg=App.CARD, cursor="hand2")
+            entry.pack(fill="x", padx=8, pady=2)
+            marker = tk.Frame(entry, bg=App.CARD, width=3)
+            marker.pack(side="left", fill="y")
+            label = tk.Label(entry, text=caption, font=(App.FONT, 10, "bold"),
+                             fg=App.SUB, bg=App.CARD, anchor="w", padx=14,
+                             pady=10, cursor="hand2")
+            label.pack(side="left", fill="x", expand=True)
+            for target in (entry, marker, label):
+                target.bind('<Button-1>', lambda _e, k=key: self.show_tab(k))
+            self.tab_widgets[key] = (label, marker)
+        self.content_host = tk.Frame(shell, bg=App.BG)
+        self.content_host.pack(side="left", fill="both", expand=True)
+        heading = tk.Frame(self.content_host, bg=App.BG)
+        heading.pack(side="top", fill="x", padx=24, pady=(22, 8))
+        self.page_heading = tk.Label(heading, text="", bg=App.BG, fg=App.TEXT,
+                                     font=(App.FONT, 17, "bold"), anchor="w")
+        self.page_heading.pack(side="left")
+        self.flat_button(heading, "Dashboard", self.close).pack(side="right")
 
     def show_tab(self, key):
+        if key == getattr(self, 'cur_tab', None):
+            return  # no redundant redraw when clicking the already selected tab
         self.cancel_capture()
         prev = getattr(self, "cur_tab", None)
+        if prev in self.pages:
+            self._tab_yview[prev] = self.canvas.yview()[0]
         job = getattr(self, "tab_job", None)
         if job:                              # a switch still animating: finish it at once
             try:
@@ -8794,35 +10689,53 @@ class SettingsWindow(tk.Toplevel):
             except tk.TclError:
                 pass
             self.tab_job = None
-        animate = animations_on() and prev in self.pages and prev != key
+        animate = (animations_on() and prev in self.pages and prev != key
+                   and prev not in ('presets', 'analytics')
+                   and key not in ('presets', 'analytics'))
         if not animate:
             for k, (lbl, line) in self.tab_widgets.items():
-                on = k == key
-                lbl.configure(fg=App.TEXT if on else App.SUB)
-                line.configure(bg=App.ACCENT if on else App.BG)
+                on = k == ("family" if key in ("presets", "analytics") else key)
+                lbl.configure(fg=App.TEXT if on else App.SUB,
+                              bg=App.FIELD if on else App.CARD)
+                line.configure(bg=App.ACCENT if on else App.CARD)
+        self.page_heading.configure(text={**dict(self.TABS),
+                                          'presets': 'Config Presets',
+                                          'analytics': 'Session Analytics'}[key])
         self.pages[key].tkraise()
+        if self._wrapped_pages.get(key) != self.wrap_w:
+            self.rewrap(self.pages[key])
+            self._wrapped_pages[key] = self.wrap_w
+        if key == 'presets':
+            self.refresh_presets()
+        elif key == 'analytics':
+            self.refresh_analytics(force=False)
         self.cur_tab = key
-        self.canvas.yview_moveto(0)          # every page starts at its top
         self.on_size()                       # scroll extent / scrollbar follow this page
+        self.canvas.yview_moveto(self._tab_yview.get(key, 0.0))
         self.say("")
         if animate:
             self.animate_tab(prev, key)
 
-    def animate_tab(self, old, new, steps=9, delay=14, dx=18):
-        """Tab switch: the new page slides in a few pixels while the tab names / underlines
-        fade between their two colours."""
+    def animate_tab(self, old, new, steps=6, delay=15):
+        """Animate just the sidebar highlight, not the full content canvas.
+
+        Moving the entire canvas on every animation frame invalidated large Tk
+        regions and looked like the settings were reloading on every click.
+        """
         def paint(k):
             for name, (lbl, line) in self.tab_widgets.items():
                 if name == new:
-                    lbl.configure(fg=mix_color(App.SUB, App.TEXT, k))
-                    line.configure(bg=mix_color(App.BG, App.ACCENT, k))
+                    lbl.configure(fg=mix_color(App.SUB, App.TEXT, k),
+                                  bg=App.FIELD)
+                    line.configure(bg=mix_color(App.CARD, App.ACCENT, k))
                 elif name == old:
-                    lbl.configure(fg=mix_color(App.TEXT, App.SUB, k))
-                    line.configure(bg=mix_color(App.ACCENT, App.BG, k))
+                    lbl.configure(fg=mix_color(App.TEXT, App.SUB, k),
+                                  bg=App.CARD)
+                    line.configure(bg=mix_color(App.ACCENT, App.CARD, k))
                 else:
-                    lbl.configure(fg=App.SUB)
-                    line.configure(bg=App.BG)
-            self.canvas.coords(self.inner_id, round(dx * (1 - k)), 0)
+                    lbl.configure(fg=App.SUB, bg=App.CARD)
+                    line.configure(bg=App.CARD)
+            # Keep the page content stationary: the sidebar is the only animation.
 
         def step(i=1):
             try:
@@ -8852,7 +10765,6 @@ class SettingsWindow(tk.Toplevel):
         reset.bind("<Button-1>", lambda _e: self.reset_keybinds())
         reset.bind("<Enter>", lambda _e: reset.configure(fg=App.TEXT))
         reset.bind("<Leave>", lambda _e: reset.configure(fg=App.SUB))
-        self.build_monitor_card(page)
 
     def build_monitor_card(self, page):
         """More than one screen: pick the monitor the macro looks at and clicks on."""
@@ -8972,6 +10884,7 @@ class SettingsWindow(tk.Toplevel):
         wh = settings["webhook"]
         self.v_url = tk.StringVar(value=wh["url"])
         self.v_mention = tk.BooleanVar(value=wh["mention"])
+        self.v_disconnect_ping = tk.BooleanVar(value=wh.get("notify_disconnect_ping", True))
         self.v_uid = tk.StringVar(value=wh["user_id"])
         self.v_hourly = tk.BooleanVar(value=wh["hourly_graph"])
         self.v_hours = tk.StringVar(value=str(wh["graph_hours"]))
@@ -9039,6 +10952,10 @@ class SettingsWindow(tk.Toplevel):
                    self.on_toggle)
         self.check(c, "Message me when the macro hits an error", self.v_error, self.on_toggle)
         self.check(c, "Mention me in error messages", self.v_mention, self.on_toggle)
+        self.check(c, "Ping my Discord User ID when Roblox disconnects",
+                   self.v_disconnect_ping, self.on_toggle)
+        self.hint(c, 'On by default. Auto Reconnect needs to be ON to detect disconnects. '
+                     'Configure the User ID and a webhook/bot. Sends only one ping per disconnect.')
         row = tk.Frame(c, bg=App.CARD)
         row.pack(fill="x", pady=(4, 0))
         tk.Label(row, text="User ID", font=(App.FONT, 10), fg=App.TEXT,
@@ -9092,7 +11009,8 @@ class SettingsWindow(tk.Toplevel):
         self.commit()
 
     def update_dependents(self):
-        self.uid_entry.configure(state="normal" if self.v_mention.get() else "disabled")
+        # Shared with bot command authorization and the separate disconnect ping.
+        self.uid_entry.configure(state="normal")
 
     def on_toggle(self):
         self.update_dependents()
@@ -9134,8 +11052,456 @@ class SettingsWindow(tk.Toplevel):
             ev.put(("settings_msg", "Test graph sent" if ok else msg, not ok, ok))
         threading.Thread(target=work, daemon=True).start()
 
+    # ----- in-page Config Presets and Session Analytics -----
+    def utility_header(self, page, description):
+        bar = tk.Frame(page, bg=App.BG)
+        bar.pack(fill='x', pady=(4, 12))
+        self.flat_button(bar, '‹  Back to Macros',
+                         lambda:self.show_tab('family')).pack(side='left')
+        tk.Label(page, text=description, bg=App.BG, fg=App.SUB,
+                 font=(App.FONT, 9), justify='left', anchor='w',
+                 wraplength=self.wrap_w).pack(fill='x', pady=(0, 8))
+
+    def build_presets(self, page):
+        self.utility_header(
+            page, 'Save ALL local settings, including every macro timing and recovery option. '
+                  'Generate a standalone offline code to share portable settings safely.')
+        c = self.card(page, 'SAVED CONFIGURATION PRESETS')
+        self.preset_family_label = tk.Label(c, bg=App.CARD, fg=App.SUB,
+                                            font=(App.FONT, 9), anchor='w')
+        self.preset_family_label.pack(fill='x', pady=(0, 8))
+        list_frame = tk.Frame(c, bg=App.CARD)
+        list_frame.pack(fill='x')
+        self.preset_list = tk.Listbox(list_frame, bg=App.LOGBG, fg=App.TEXT,
+                                      font=(App.FONT, 10), height=7, relief='flat',
+                                      selectbackground=App.ACCENT, exportselection=False,
+                                      highlightthickness=1, highlightbackground=App.BORDER)
+        sb = ttk.Scrollbar(list_frame, command=self.preset_list.yview)
+        self.preset_list.configure(yscrollcommand=sb.set)
+        self.preset_list.pack(side='left', fill='both', expand=True)
+        sb.pack(side='right', fill='y')
+        self.preset_list.bind('<<ListboxSelect>>', self.preset_selection_changed)
+        tk.Label(c, text='Preset name (Save / Duplicate / Rename)',
+                 bg=App.CARD, fg=App.SUB, font=(App.FONT, 9),
+                 anchor='w').pack(fill='x', pady=(12, 4))
+        self.preset_name = tk.StringVar()
+        self.entry(c, self.preset_name)
+        for group in ((('Save All Settings', 'save'), ('Apply', 'apply'),
+                       ('Duplicate', 'duplicate')),
+                      (('Rename', 'rename'), ('Delete', 'delete'))):
+            actions = tk.Frame(c, bg=App.CARD)
+            actions.pack(fill='x', pady=(8, 1))
+            for label, operation in group:
+                self.flat_button(actions, label,
+                                 lambda x=operation:self.preset_action(x)).pack(
+                    side='left', padx=(0, 6), pady=2)
+        share = self.card(page, 'SHARE / IMPORT PRESET (OFFLINE)')
+        self.hint(share, 'Generate a self-contained code for the selected preset, then Copy. '
+                  'To import, paste a code and click Import. No server, login or API needed.')
+        self.preset_code = tk.Text(share, height=5, wrap='char',
+                                   bg=App.LOGBG, fg=App.TEXT, insertbackground=App.TEXT,
+                                   font=('Consolas', 9), relief='flat', bd=1,
+                                   highlightthickness=1, highlightbackground=App.BORDER)
+        self.preset_code.pack(fill='x', pady=(9, 8))
+        actions = tk.Frame(share, bg=App.CARD)
+        actions.pack(fill='x')
+        for label, operation in (('Generate Share Code', 'export'),
+                                 ('Copy Code', 'copy'), ('Import Code', 'import')):
+            self.flat_button(actions, label,
+                             lambda x=operation:self.preset_action(x)).pack(
+                side='left', padx=(0, 6), pady=2)
+        self.hint(share, 'Shared codes exclude private-server PS Code, Discord token, '
+                  'webhook URL, Discord user/channel IDs and device-specific window data. '
+                  'Import saves a new preset; it does NOT apply it automatically. '
+                  'After applying an imported preset, reconfigure private credentials.')
+        self.preset_notice = tk.Label(share, text='', bg=App.CARD, fg=App.SUB,
+                                      font=(App.FONT, 9), anchor='w',
+                                      justify='left', wraplength=self.wrap_w)
+        self.preset_notice.pack(fill='x', pady=(9, 0))
+        self.preset_pending = None
+
+    def preset_selection_changed(self, _event=None):
+        self.preset_pending = None
+
+    def refresh_presets(self, select_name=None):
+        if not hasattr(self, 'preset_list'):
+            return
+        old = select_name if select_name is not None else self.preset_selected()
+        self.preset_family_label.configure(
+            text='All macros and settings · Legacy presets are supported')
+        presets = preset_store().list()
+        names = tuple(sorted(presets, key=str.casefold))
+        if names != self.preset_list.get(0, 'end'):
+            # Rebuild the Listbox only when names actually change; on navigation
+            # keep its selection and scroll position without a visual reset.
+            self.preset_list.delete(0, 'end')
+            for name in names:
+                self.preset_list.insert('end', name)
+        if old:
+            names = self.preset_list.get(0, 'end')
+            if old in names:
+                idx = names.index(old)
+                self.preset_list.selection_set(idx)
+                self.preset_list.see(idx)
+        self.preset_pending = None
+
+    def preset_selected(self):
+        sel = self.preset_list.curselection()
+        return self.preset_list.get(sel[0]) if sel else None
+
+    def preset_message(self, text, error=False):
+        self.preset_notice.configure(text=text, fg='#f87171' if error else '#34d399')
+
+    def preset_action(self, operation):
+        # Import/export are local-only operations and never interact with Roblox.
+        if (operation not in ('export', 'copy', 'import') and
+                (running() or (state.get('session_active') and not state.get('user_stopped')))):
+            self.preset_message('Stop the active macro before changing presets.', error=True)
+            return
+        selected = self.preset_selected()
+        name = self.preset_name.get().strip()
+        try:
+            store = preset_store()
+            if operation == 'save':
+                if not name:
+                    raise ValueError('Enter a new preset name first.')
+                existing = store.list().get(name)
+                if existing and self.preset_pending != ('overwrite', name):
+                    self.preset_pending = ('overwrite', name)
+                    self.preset_message('Preset exists. Click Save All Settings again to overwrite.', error=True)
+                    return
+                self.commit()
+                store.save(name, settings)
+                self.refresh_presets(name)
+                self.preset_message(f'Saved all settings: {name}')
+            elif operation == 'apply':
+                if not selected:
+                    raise ValueError('Select a preset to apply.')
+                self.commit()
+                record = store.list().get(selected, {})
+                shared = bool(record.get('shared'))
+                if shared and self.preset_pending != ('apply-shared', selected):
+                    self.preset_pending = ('apply-shared', selected)
+                    self.preset_message(
+                        'Imported preset: click Apply again to replace your portable settings. '
+                        'Private credentials stay local and Auto Reconnect will be disabled.',
+                        error=True)
+                    return
+                values = store.load(selected, settings['family'])
+                old_family = settings['family']
+                old_theme = settings['theme']
+                if shared:
+                    # Retain THIS user's secret credentials, not the sender's.
+                    if isinstance(values.get('webhook'), dict):
+                        values['webhook'] = {**settings['webhook'], **values['webhook']}
+                    if isinstance(values.get('reconnect'), dict):
+                        values['reconnect'] = {**settings['reconnect'], **values['reconnect']}
+                        values['reconnect']['enabled'] = False
+                if 'timings' in values:
+                    settings['timings'].clear()
+                    apply_timings(values['timings'])
+                # load_settings() only enables valid reconnect setups; explicitly
+                # clear the previous enabled state before loading the snapshot.
+                if 'reconnect' in values:
+                    settings['reconnect']['enabled'] = False
+                load_settings({k: v for k, v in values.items() if k != 'timings'})
+                # Legacy presets never stored the other settings: don't reset them.
+                if shared:
+                    settings['reconnect']['enabled'] = False
+                if family_is_raid(old_family) != raid_counting():
+                    report_rebase()
+                    push_stats(save=False)
+                apply_settings()
+                save_stats()
+                save_timings()
+                register_hotkeys()
+                bot_restart()
+                if old_theme != settings['theme']:
+                    self.app.set_theme(settings['theme'])
+                self.app.topmost.set(bool(settings['always_on_top']))
+                self.app.root.attributes('-topmost', bool(settings['always_on_top']))
+                apply_opacity(self.app.root)
+                self.app.refresh_labels()
+                log(f'Config preset applied: {selected}')
+                self.build_ui('presets')
+                self.refresh_presets(selected)
+                note = ('Apply complete. Reconfigure private PS Code / Discord credentials '
+                        'if needed; shared presets leave Auto Reconnect disabled.'
+                        if shared else f'Applied all saved settings: {selected}')
+                self.preset_message(note)
+            elif operation == 'duplicate':
+                if not selected or not name:
+                    raise ValueError('Select a preset and enter its new name.')
+                store.duplicate(selected, name)
+                self.refresh_presets(name)
+                self.preset_message(f'Duplicated: {name}')
+            elif operation == 'rename':
+                if not selected or not name:
+                    raise ValueError('Select a preset and enter its new name.')
+                store.rename(selected, name)
+                self.refresh_presets(name)
+                self.preset_message(f'Renamed to: {name}')
+            elif operation == 'delete':
+                if not selected:
+                    raise ValueError('Select a preset to delete.')
+                if self.preset_pending != ('delete', selected):
+                    self.preset_pending = ('delete', selected)
+                    self.preset_message(f'Click Delete again to remove {selected}.', error=True)
+                    return
+                store.delete(selected)
+                self.refresh_presets()
+                self.preset_message(f'Deleted: {selected}')
+            elif operation == 'export':
+                if not selected:
+                    raise ValueError('Select a saved preset to generate its share code.')
+                code = store.export_code(selected)
+                self.preset_code.delete('1.0', 'end')
+                self.preset_code.insert('1.0', code)
+                self.preset_message('Self-contained share code generated. Click Copy Code.')
+            elif operation == 'copy':
+                code = self.preset_code.get('1.0', 'end-1c').strip()
+                if not code:
+                    raise ValueError('Generate or paste a code first.')
+                self.clipboard_clear()
+                self.clipboard_append(code)
+                self.update_idletasks()
+                self.preset_message('Code copied to clipboard.')
+            elif operation == 'import':
+                code = self.preset_code.get('1.0', 'end-1c')
+                imported = store.import_code(code)
+                self.refresh_presets(imported)
+                self.preset_message(f'Imported preset: {imported}. Select Apply to use it.')
+        except (KeyError, ValueError, OSError, TypeError) as exc:
+            self.preset_pending = None
+            self.preset_message(str(exc), error=True)
+
+    def build_analytics(self, page):
+        self.utility_header(page, 'Visual summary of locally recorded sessions. '
+                            'Counts come from your existing Session History; no network access.')
+        toolbar = tk.Frame(page, bg=App.BG)
+        toolbar.pack(fill='x', pady=(0, 8))
+        tk.Label(toolbar, text='Results from recorded events', bg=App.BG, fg=App.SUB,
+                 font=(App.FONT, 9)).pack(side='left')
+        self.flat_button(toolbar, 'Refresh', self.refresh_analytics).pack(side='right')
+        self.analytics_kpis = {}
+        metrics = [('sessions', 'SESSIONS', App.ACCENT),
+                   ('completed', 'COMPLETED', '#34d399'),
+                   ('failed', 'FAILED', '#f87171'),
+                   ('rate', 'COMPLETION RATE', '#60a5fa'),
+                   ('reconnects', 'RECONNECTS', '#fbbf24'),
+                   ('errors', 'ERRORS', '#c084fc')]
+        for offset in (0, 3):
+            line = tk.Frame(page, bg=App.BG)
+            line.pack(fill='x', pady=3)
+            for key, label, color in metrics[offset:offset+3]:
+                tile = tk.Frame(line, bg=App.CARD, highlightbackground=App.BORDER,
+                                highlightthickness=1)
+                tile.pack(side='left', fill='both', expand=True, padx=(0, 6))
+                tk.Label(tile, text=label, bg=App.CARD, fg=App.SUB,
+                         font=(App.FONT, 8, 'bold')).pack(anchor='w', padx=12, pady=(11, 3))
+                value = tk.Label(tile, text='—', bg=App.CARD, fg=color,
+                                 font=(App.FONT, 19, 'bold'), anchor='w')
+                value.pack(anchor='w', padx=12, pady=(0, 11))
+                self.analytics_kpis[key] = value
+        c = self.card(page, 'RESULTS BY SESSION',
+                      'Most recent 12 sessions · green: completed · red: failed')
+        self.analytics_chart = tk.Canvas(c, height=180, bg=App.CARD,
+                                         highlightthickness=0, bd=0)
+        self.analytics_chart.pack(fill='x', expand=True)
+        self.analytics_chart.bind('<Configure>', lambda _e:self.draw_analytics_chart())
+        self.analytics_chart.bind('<Motion>', self.on_analytics_chart_motion)
+        self.analytics_chart.bind('<Leave>', self.hide_analytics_chart_tooltip)
+        self.analytics_chart.bind('<Unmap>', self.hide_analytics_chart_tooltip)
+        self._analytics_chart_rows = []
+        self._analytics_chart_bars = []
+        self._analytics_hover_index = None
+        self._analytics_rendered = False
+        self.analytics_last = self.card(page, 'LAST RECORDED SESSION')
+        self.analytics_last_text = tk.Label(self.analytics_last, bg=App.CARD, fg=App.TEXT,
+                                            font=(App.FONT, 9), anchor='w', justify='left',
+                                            wraplength=self.wrap_w)
+        self.analytics_last_text.pack(fill='x')
+        self.analytics_recent = self.card(page, 'RECENT SESSIONS')
+        self.analytics_recent_rows = tk.Frame(self.analytics_recent, bg=App.CARD)
+        self.analytics_recent_rows.pack(fill='x')
+        self.analytics_note = tk.Label(page, bg=App.BG, fg=App.SUB,
+                                       font=(App.FONT, 8), justify='left', anchor='w',
+                                       wraplength=self.wrap_w)
+        self.analytics_note.pack(fill='x', pady=(5, 8))
+
+    def draw_analytics_chart(self):
+        canvas = getattr(self, 'analytics_chart', None)
+        if canvas is None or not canvas.winfo_exists():
+            return
+        canvas.delete('all')
+        self._analytics_chart_bars = []
+        self._analytics_hover_index = None
+        rows = self._analytics_chart_rows
+        width = max(180, canvas.winfo_width())
+        height = max(140, canvas.winfo_height())
+        left, right, top, bottom = 35, width-12, 12, height-30
+        if not rows:
+            canvas.create_text(width/2, height/2, text='No recorded sessions yet',
+                               fill=App.SUB, font=(App.FONT, 10))
+            return
+        max_v = max(1, *(r['completed']+r['failed'] for r in rows))
+        for ratio in (0, 0.5, 1):
+            y = bottom - (bottom-top)*ratio
+            canvas.create_line(left, y, right, y, fill=App.BORDER)
+            canvas.create_text(left-5, y, text=str(round(max_v*ratio)),
+                               anchor='e', fill=App.SUB, font=(App.FONT, 8))
+        step = (right-left)/len(rows)
+        bw = min(29, max(9, step*0.52))
+        for idx, row in enumerate(rows):
+            x = left + step*(idx+0.5)
+            complete = (bottom-top)*row['completed']/max_v
+            failed = (bottom-top)*row['failed']/max_v
+            if complete:
+                canvas.create_rectangle(x-bw/2, bottom-complete, x+bw/2, bottom,
+                                        fill='#34d399', outline='')
+            if failed:
+                canvas.create_rectangle(x-bw/2, bottom-complete-failed,
+                                        x+bw/2, bottom-complete, fill='#f87171', outline='')
+            canvas.create_text(x, bottom+12, text=str(idx+1), fill=App.SUB,
+                               font=(App.FONT, 8))
+            # Keep hover bounds in canvas coordinates. Even a zero-result session
+            # can be inspected by pointing at its number along the x axis.
+            self._analytics_chart_bars.append((idx, x, bw,
+                                               bottom-complete-failed, bottom))
+
+    def hide_analytics_chart_tooltip(self, _event=None):
+        canvas = getattr(self, 'analytics_chart', None)
+        if canvas is not None and canvas.winfo_exists():
+            canvas.delete('analytics_hover')
+            canvas.configure(cursor='')
+        self._analytics_hover_index = None
+
+    def on_analytics_chart_motion(self, event):
+        """Show per-session values inside the canvas; no popup windows or re-render."""
+        canvas = getattr(self, 'analytics_chart', None)
+        if canvas is None or not canvas.winfo_exists():
+            return
+        hovered = None
+        for idx, x, bw, bar_top, bottom in getattr(self, '_analytics_chart_bars', ()):
+            # Small bars remain easy to target; large gaps between columns do not.
+            if (abs(event.x-x) <= bw/2+5 and
+                    min(bar_top-4, bottom-10) <= event.y <= bottom+18):
+                hovered = idx
+                break
+        if hovered == self._analytics_hover_index:
+            return
+        self.hide_analytics_chart_tooltip()
+        if hovered is None or hovered >= len(self._analytics_chart_rows):
+            return
+        self._analytics_hover_index = hovered
+        row = self._analytics_chart_rows[hovered]
+        idx, center_x, bw, bar_top, bottom = self._analytics_chart_bars[hovered]
+        canvas.configure(cursor='hand2')
+        if row['completed'] or row['failed']:
+            canvas.create_rectangle(center_x-bw/2-2, bar_top-2,
+                                    center_x+bw/2+2, bottom+2, outline=App.ACCENT,
+                                    width=1, tags='analytics_hover')
+        cw, ch = canvas.winfo_width(), canvas.winfo_height()
+        popup_w, popup_h = min(226, max(156, cw-12)), 111
+        px = center_x + bw/2 + 14
+        if px + popup_w > cw - 6:
+            px = center_x - bw/2 - popup_w - 14
+        px = max(5, min(px, cw-popup_w-5))
+        py = max(5, min(event.y - popup_h/2, ch-popup_h-5))
+        canvas.create_rectangle(px, py, px+popup_w, py+popup_h,
+                                fill=App.LOGBG, outline=App.ACCENT,
+                                width=1, tags='analytics_hover')
+        label_x = px + 10
+        canvas.create_text(label_x, py+9, anchor='nw',
+                           text=f'SESSION {hovered+1}', fill=App.TEXT,
+                           font=(App.FONT, 9, 'bold'), tags='analytics_hover')
+        family = str(row.get('family') or 'Unknown')
+        if len(family) > 29:
+            family = family[:26] + '...'
+        canvas.create_text(label_x, py+30, anchor='nw', text=family, fill=App.SUB,
+                           font=(App.FONT, 8), tags='analytics_hover')
+        canvas.create_text(label_x, py+49, anchor='nw',
+                           text=f"Completed: {row['completed']}", fill='#34d399',
+                           font=(App.FONT, 9, 'bold'), tags='analytics_hover')
+        canvas.create_text(label_x+110, py+49, anchor='nw',
+                           text=f"Failed: {row['failed']}", fill='#f87171',
+                           font=(App.FONT, 9, 'bold'), tags='analytics_hover')
+        canvas.create_text(label_x, py+69, anchor='nw',
+                           text=f"Total results: {row['completed']+row['failed']}",
+                           fill=App.TEXT, font=(App.FONT, 8), tags='analytics_hover')
+        canvas.create_text(label_x, py+88, anchor='nw',
+                           text=analytics_local_time(row.get('started') or row.get('ended')),
+                           fill=App.SUB, font=(App.FONT, 8), tags='analytics_hover')
+
+    def refresh_analytics(self, force=True):
+        if not hasattr(self, 'analytics_kpis'):
+            return
+        history = session_history()
+        try:
+            stat = history.path.stat()
+            stamp = (stat.st_mtime_ns, stat.st_size)
+        except OSError:
+            stamp = None
+        if (not force and self._analytics_rendered and
+                stamp == getattr(self, '_analytics_stamp', None)):
+            return  # avoid rebuilding chart and history rows on ordinary navigation
+        try:
+            data = session_analytics_dataset(history.events())
+        except OSError:
+            data = session_analytics_dataset([])
+        total = data['total']; result_count = data['recorded_results']
+        rate = f"{total['completed']/result_count*100:.1f}%" if result_count else '—'
+        values = dict(sessions=data['sessions'], rate=rate, **total)
+        for key, widget in self.analytics_kpis.items():
+            widget.configure(text=str(values[key]))
+        rows = data['rows']
+        self._analytics_chart_rows = rows[-12:]
+        self.draw_analytics_chart()
+        last = rows[-1] if rows else None
+        if last is None:
+            self.analytics_last_text.configure(text='No sessions recorded yet.')
+        else:
+            self.analytics_last_text.configure(
+                text=f"Macro: {last['family'] or 'Unknown'}\n"
+                     f"Started: {analytics_local_time(last['started'])}\n"
+                     f"Ended: {analytics_local_time(last['ended']) if last['ended'] else 'Not recorded'}"
+                     f"  ·  Duration: {analytics_duration(last['started'], last['ended'])}\n"
+                     f"Completed: {last['completed']}   Failed: {last['failed']}"
+                     f"   Reconnects: {last['reconnects']}   Errors: {last['errors']}")
+        for item in self.analytics_recent_rows.winfo_children():
+            item.destroy()
+        if not rows:
+            tk.Label(self.analytics_recent_rows, text='Your sessions will appear here.',
+                     bg=App.CARD, fg=App.SUB, font=(App.FONT, 9)).pack(anchor='w')
+        else:
+            for row in reversed(rows[-6:]):
+                line = tk.Frame(self.analytics_recent_rows, bg=App.CARD)
+                line.pack(fill='x', pady=4)
+                tk.Label(line, bg=App.CARD, fg=App.TEXT, font=(App.FONT, 9, 'bold'),
+                         text=f"{analytics_local_time(row['started'] or row['ended'], True)} · "
+                              f"{row['family'] or 'Unknown'}", anchor='w').pack(fill='x')
+                tk.Label(line, bg=App.CARD, fg=App.SUB, font=(App.FONT, 8),
+                         text=(f"Completed {row['completed']}  ·  Failed {row['failed']}  ·  "
+                               f"Reconnects {row['reconnects']}  ·  Errors {row['errors']}"),
+                         anchor='w').pack(fill='x')
+        self._analytics_stamp = stamp
+        self._analytics_rendered = True
+        self.analytics_note.configure(
+            text=('Completion rate = completed / (completed + failed). '
+                  'Totals include earlier recorded sessions, even if the last session has 0 results. '
+                  'Only events present in the local journal are counted; '
+                  'older/rotated or incomplete records may not appear.'))
+        self.after_idle(self.on_size)
+
     # ----- configs tab -----
     def build_family(self, page):
+        tools=self.card(page,'SESSION & CONFIG TOOLS',
+                        'View session history and manage complete configuration presets, including offline sharing.')
+        toolrow=tk.Frame(tools,bg=App.CARD);toolrow.pack(fill='x',pady=5)
+        self.flat_button(toolrow,'Config Presets',
+                         lambda:self.show_tab('presets')).pack(side='left',padx=(0,8))
+        self.flat_button(toolrow,'Session Analytics',
+                         lambda:self.show_tab('analytics')).pack(side='left')
         # section 1: abilities (the family)
         self.v_family = tk.StringVar(value=settings["family"])
         c = self.card(page, "ABILITIES")
@@ -9198,28 +11564,6 @@ class SettingsWindow(tk.Toplevel):
         self.fs_slot = tk.Frame(page, bg=page.cget("bg"))
         self.fs_slot.pack(fill="x")
         self.build_fs_slot()
-
-        # section 4: fix image detection (replace the macro's pictures with your own)
-        a = self.card(page, "FIX IMAGE DETECTION",
-                      "Detection not working? Replace the macro's pictures with your own screenshots.",
-                      hot=True)
-        self.asset_open_btn = self.flat_button(a, "Open", self.open_asset_window)
-        self.asset_open_btn.pack(anchor="w")
-        tk.Frame(a, height=10, bg=App.CARD).pack()
-        self.v_fix_loot = tk.BooleanVar(value=bool(settings.get("fix_loot")))
-        row = tk.Frame(a, bg=App.CARD)
-        row.pack(fill="x", pady=(0, 2))
-        sw = ToggleSwitch(row, self.v_fix_loot, self.on_fix_loot, parent_bg=App.CARD)
-        sw.pack(side="right")
-        lbl = tk.Label(row, text="Fix loot tracking", font=(App.FONT, 10), fg=App.TEXT,
-                       bg=App.CARD, anchor="w", cursor="hand2")
-        lbl.pack(side="left")
-        lbl.bind("<Button-1>", sw.flip)
-        tk.Label(row, text="Beta", font=(App.FONT, 7, "bold"), fg=ModernDropdown.BETA_FG,
-                 bg=ModernDropdown.BETA_BG, padx=6, pady=1).pack(side="left", padx=(8, 0))
-        self.hint(a, "Some UIs let you resize the loot drops, so the loot pictures no longer match. "
-                     "When on, every loot icon is looked for at many sizes. Costs a little extra time "
-                     "when the mission ends. Off by default.", App.TEXT)
 
     def on_fix_loot(self):
         settings["fix_loot"] = bool(self.v_fix_loot.get())
@@ -9286,10 +11630,41 @@ class SettingsWindow(tk.Toplevel):
                 custom_macro_type(fam) == "raid" or custom_uses_chest(fam))):
             self.build_chest_card(self.fs_slot)         # openchest() clicks these spots
 
+    def save_performance_mode(self):
+        # Affect passive scan rate only; NEVER relax Retry/Reconnect confidence.
+        settings['performance_mode']=self.perf_mode.get()
+        save_stats()
+        log('Performance Mode: '+self.perf_mode.get())
+
     def build_recovery(self, page):
         """Recovery tab: what happens when something goes wrong - the failsafe and Reconnect."""
         self.build_failsafe_card(page)
         self.build_reconnect_card(page)
+
+    def build_hybrid_card(self, parent):
+        f = self.card(parent, 'RECOGNITION ENGINE',
+                      'Standard Mode is the default. Hybrid AI (Beta) only verifies '
+                      'borderline OpenCV results for Retry, Loot and Image Reconnect. '
+                      'Offline CPU model required; missing/failed model returns to Standard.')
+        self.v_hybrid = tk.BooleanVar(value=settings.get('recognition_mode') == 'hybrid_beta')
+        self.check(f, 'Hybrid AI (Beta) - opt in', self.v_hybrid, self.on_hybrid_toggle)
+        self.hint(f, 'Needs an independently validated models/hybrid_manifest.json and '
+                     'CPU ONNX weights. No APIs and no changes to original PNG templates.')
+
+    def on_hybrid_toggle(self):
+        if running():
+            self.v_hybrid.set(settings.get('recognition_mode') == 'hybrid_beta')
+            self.say('Stop the macro before switching recognition engines.', error=True)
+            return
+        settings['recognition_mode'] = 'hybrid_beta' if self.v_hybrid.get() else 'standard'
+        reset_hybrid_advisor()
+        if self.v_hybrid.get() and get_hybrid_advisor() is None:
+            self.v_hybrid.set(False)
+            self.say('Hybrid AI unavailable: local validated ONNX model / runtime missing.', error=True)
+        else:
+            self.say('Hybrid AI (Beta) enabled' if self.v_hybrid.get()
+                     else 'Standard Mode enabled', good=True)
+        save_stats()
 
     def build_reconnect_card(self, parent):
         f = self.card(parent, "RECONNECT",
@@ -9309,13 +11684,14 @@ class SettingsWindow(tk.Toplevel):
         if lbl is None:
             return
         on = settings["reconnect"]["enabled"]
-        incomplete = on and bool(reconnect_missing())     # e.g. the macro was switched to Raids
+        incomplete = on and bool(reconnect_missing())     # e.g. invalid image mode for Raids
         try:
             if incomplete:
                 lbl.configure(text="Reconnect: Off - fill in the " + reconnect_macro_tab()
                                    + " tab for this macro", fg="#fbbf24")
             else:
-                lbl.configure(text="Reconnect: On" if on else "Reconnect: Of",
+                lbl.configure(text=("Reconnect: On (Image)" if settings['reconnect'].get('method')=='image'
+                                    else "Reconnect: On (Coordinates)") if on else "Reconnect: Off",
                               fg="#34d399" if on else App.SUB)
         except tk.TclError:
             pass
@@ -9676,22 +12052,34 @@ class SettingsWindow(tk.Toplevel):
             pass
 
     # ----- themes tab -----
-    def build_themes(self, page):
-        c = self.card(page, "THEME", "Pick a look - the whole app updates instantly.")
-        grid = tk.Frame(c, bg=App.CARD)
-        grid.pack(fill="x")
-        grid.columnconfigure(0, weight=1)
-        grid.columnconfigure(1, weight=1)
-        for i, name in enumerate(THEMES):
-            card = ThemeCard(grid, name, name == settings["theme"], self.on_theme_pick,
-                             App.CARD)
-            card.grid(row=i // 2, column=i % 2, padx=4, pady=4)
+    def save_update_prefs(self):
+        settings['update_prefs']={'automatic':bool(self.up_auto.get()),
+                                  'download':bool(self.up_download.get()),
+                                  'install_mode':self.up_install.get()}
+        save_stats()
 
-        c = self.card(page, "LAYOUT")
-        self.v_compact = tk.BooleanVar(value=bool(settings.get("compact_ui", False)))
-        self.check(c, "Compact mode", self.v_compact, self.on_compact_toggle)
-        self.hint(c, "On: while the macro runs, the window is replaced by a small stats bar "
-                     "over Roblox. Off: the main window stays open.")
+    def show_update_history(self):
+        data=update_history().read()
+        lines=[]
+        for e in data.get('entries',[])[:20]:
+            lines.append(f"{e.get('time','')[:16]}  {e.get('version')}  {e.get('status')}")
+            if e.get('details'):lines.append('  '+e['details'][:130])
+        messagebox.showinfo('Update History','\n'.join(lines) or 'No updates recorded yet.',parent=self)
+
+    def build_roblox(self, page):
+        """Game window, monitor and background controls (not image matching)."""
+        self.build_monitor_card(page)
+        perf = self.card(page, 'PERFORMANCE',
+                         'Control how frequently the macro scans; conservative Retry thresholds remain unchanged.')
+        perfrow=tk.Frame(perf,bg=App.CARD);perfrow.pack(fill='x',pady=(8,1))
+        tk.Label(perfrow,text='Performance Mode',bg=App.CARD,fg=App.SUB,
+                 font=(App.FONT,9)).pack(side='left',padx=(0,9))
+        self.perf_mode=tk.StringVar(value=settings.get('performance_mode','balanced'))
+        for value in ('eco','balanced','fast'):
+            tk.Radiobutton(perfrow,text=value.capitalize(),variable=self.perf_mode,
+                           value=value,command=self.save_performance_mode,bg=App.CARD,
+                           fg=App.TEXT,selectcolor=App.LOGBG,
+                           activebackground=App.CARD,activeforeground=App.TEXT).pack(side='left')
         c = self.card(page, "ROBLOX MONITOR")
         self.v_auto_monitor = tk.BooleanVar(value=bool(settings.get("auto_monitor", True)))
         self.check(c, "Auto-detect Roblox monitor", self.v_auto_monitor, self.on_auto_monitor_toggle)
@@ -9719,6 +12107,85 @@ class SettingsWindow(tk.Toplevel):
         adaptive_label.pack(side="left", fill="x", expand=True)
         adaptive_label.bind("<Button-1>", adaptive_switch.flip)
         self.hint(c, "OFF by default. Hover over ? for details. Applies when starting the macro.")
+        # Visible, deliberately disabled: this feature does not accept Roblox gameplay input
+        # while unfocused. Keep the control for discoverability, not as an operable toggle.
+        settings['background_mode'] = False
+        self.v_background = tk.BooleanVar(value=False)
+        background_row = tk.Frame(c, bg=App.CARD)
+        background_row.pack(fill='x', pady=(12, 2))
+        ToggleSwitch(background_row, self.v_background, parent_bg=App.CARD,
+                     disabled=True).pack(side='right')
+        tk.Label(background_row, text='Background Mode', fg=App.DIS_TEXT,
+                 bg=App.CARD, font=(App.FONT, 10), anchor='w').pack(side='left')
+        tk.Label(background_row, text='In Development', fg=App.SUB,
+                 bg=App.CARD, font=(App.FONT, 8, 'bold')).pack(side='left', padx=(9, 0))
+        self.hint(c, 'Unavailable for now. Roblox did not respond to background input '
+                     'during Windows testing. Standard Mode remains enabled. '
+                     'This switch cannot be turned on in v1.3.')
+
+    def build_detection(self, page):
+        """All image-recognition settings in one place, independent of Roblox window controls."""
+        self.build_hybrid_card(page)
+        # section 4: fix image detection (replace the macro's pictures with your own)
+        a = self.card(page, "FIX IMAGE DETECTION",
+                      "Detection not working? Replace the macro's pictures with your own screenshots.",
+                      hot=True)
+        self.asset_open_btn = self.flat_button(a, "Open", self.open_asset_window)
+        self.asset_open_btn.pack(anchor="w")
+        tk.Frame(a, height=10, bg=App.CARD).pack()
+        self.v_fix_loot = tk.BooleanVar(value=bool(settings.get("fix_loot")))
+        row = tk.Frame(a, bg=App.CARD)
+        row.pack(fill="x", pady=(0, 2))
+        sw = ToggleSwitch(row, self.v_fix_loot, self.on_fix_loot, parent_bg=App.CARD)
+        sw.pack(side="right")
+        lbl = tk.Label(row, text="Fix loot tracking", font=(App.FONT, 10), fg=App.TEXT,
+                       bg=App.CARD, anchor="w", cursor="hand2")
+        lbl.pack(side="left")
+        lbl.bind("<Button-1>", sw.flip)
+        tk.Label(row, text="Beta", font=(App.FONT, 7, "bold"), fg=ModernDropdown.BETA_FG,
+                 bg=ModernDropdown.BETA_BG, padx=6, pady=1).pack(side="left", padx=(8, 0))
+        self.hint(a, "Some UIs let you resize the loot drops, so the loot pictures no longer match. "
+                     "When on, every loot icon is looked for at many sizes. Costs a little extra time "
+                     "when the mission ends. Off by default.", App.TEXT)
+
+        diag = self.card(page, 'USER DIAGNOSTICS',
+                         'Check screen capture and required image assets without game input.')
+        self.flat_button(diag, 'Run Diagnostics',
+                         lambda: run_user_diagnostics(self)).pack(anchor='w', pady=6)
+
+    def build_themes(self, page):
+        up=self.card(page,'UPDATE MANAGER',
+                     'Updates never install until you stop the macro. Downloads are allowed during runs.')
+        self.up_auto=tk.BooleanVar(value=settings['update_prefs']['automatic'])
+        self.up_download=tk.BooleanVar(value=settings['update_prefs']['download'])
+        self.up_install=tk.StringVar(value=settings['update_prefs']['install_mode'])
+        for label,var in [('Automatic Updates',self.up_auto),('Auto Download Updates',self.up_download)]:
+            tk.Checkbutton(up,text=label,variable=var,command=self.save_update_prefs,
+                           bg=App.CARD,fg=App.TEXT,selectcolor=App.LOGBG,
+                           activebackground=App.CARD,activeforeground=App.TEXT).pack(anchor='w',pady=3)
+        tk.Label(up,text='Install preference',font=(App.FONT,9,'bold'),bg=App.CARD,
+                 fg=App.SUB).pack(anchor='w',pady=(8,2))
+        for label,value in [('Install automatically after Stop','automatic'),('Ask before installing','ask')]:
+            tk.Radiobutton(up,text=label,variable=self.up_install,value=value,
+                           command=self.save_update_prefs,bg=App.CARD,fg=App.TEXT,
+                           selectcolor=App.LOGBG,activebackground=App.CARD,
+                           activeforeground=App.TEXT).pack(anchor='w')
+        self.flat_button(up,'Update History',self.show_update_history).pack(anchor='w',pady=8)
+        c = self.card(page, "THEME", "Pick a look - the whole app updates instantly.")
+        grid = tk.Frame(c, bg=App.CARD)
+        grid.pack(fill="x")
+        grid.columnconfigure(0, weight=1)
+        grid.columnconfigure(1, weight=1)
+        for i, name in enumerate(THEMES):
+            card = ThemeCard(grid, name, name == settings["theme"], self.on_theme_pick,
+                             App.CARD)
+            card.grid(row=i // 2, column=i % 2, padx=4, pady=4)
+
+        c = self.card(page, "LAYOUT")
+        self.v_compact = tk.BooleanVar(value=bool(settings.get("compact_ui", False)))
+        self.check(c, "Compact mode", self.v_compact, self.on_compact_toggle)
+        self.hint(c, "On: while the macro runs, the window is replaced by a small stats bar "
+                     "over Roblox. Off: the main window stays open.")
         c = self.card(page, "ANIMATIONS")
         self.v_anim = tk.BooleanVar(value=bool(settings.get("animations", False)))
         self.check(c, "GUI animations", self.v_anim, self.on_animations_toggle)
@@ -9763,7 +12230,7 @@ class SettingsWindow(tk.Toplevel):
         if name == settings["theme"]:
             return
         self.app.set_theme(name)                           # main window rebuilds right now
-        self.after(10, lambda: self.retheme("themes"))     # then this window follows
+        self.after(10, lambda: self.retheme("app"))     # then this window follows
 
     # ----- saving -----
     def save_soon(self):
@@ -9782,6 +12249,7 @@ class SettingsWindow(tk.Toplevel):
         wh = settings["webhook"]
         wh["url"] = self.v_url.get().strip()
         wh["mention"] = bool(self.v_mention.get())
+        wh["notify_disconnect_ping"] = bool(self.v_disconnect_ping.get())
         wh["user_id"] = self.v_uid.get().strip()
         wh["hourly_graph"] = bool(self.v_hourly.get())
         wh["notify_mission"] = bool(self.v_mission.get())
@@ -9800,7 +12268,10 @@ class SettingsWindow(tk.Toplevel):
         if family_is_raid(old_fam) != raid_counting():
             report_rebase()
             push_stats(save=False)      # mission <-> raid counters on the main window
-        self.app.refresh_labels()
+        if old_fam != settings['family']:
+            # Settings is often opened just to read a value. Avoid redrawing the
+            # dashboard's stepper/counters on every return when nothing changed.
+            self.app.refresh_labels()
         ms = self.v_move_shifted.get()
         settings["move_shifted"] = ms if ms in MOVE_SHIFTED_OPTIONS else DEFAULT_MOVE_SHIFTED
         fs = settings["failsafe"]
@@ -9827,7 +12298,7 @@ class SettingsWindow(tk.Toplevel):
         bad_url = (not wh["use_bot"]) and bool(wh["url"]) and not webhook_url()
         self.hint_url.configure(
             text="That doesn't look like a Discord webhook URL." if bad_url else "")
-        bad_uid = wh["mention"] and not wh["user_id"].isdigit()
+        bad_uid = (wh["mention"] or wh["notify_disconnect_ping"]) and bool(wh["user_id"]) and not wh["user_id"].isdigit()
         self.hint_uid.configure(
             text="The user ID must be numbers only." if bad_uid else
                  self.UID_HELP,
@@ -9846,11 +12317,22 @@ class SettingsWindow(tk.Toplevel):
             self.say_job = self.after(5000, lambda: self.status.configure(text=""))
 
     def close(self):
+        """Hide Settings without destroying tabs or user-entered UI state."""
+        if self.app.settings_win is not self:
+            return
         failsafe_test_stop()
         self.cancel_capture()
         self.commit()
-        self.app.settings_win = None
-        fade_close(self)
+        if self._root_wheel_bind is not None:
+            try:
+                self.app.root.unbind('<MouseWheel>', self._root_wheel_bind)
+            except (tk.TclError, ValueError):
+                pass
+            self._root_wheel_bind = None
+        # Keep this page over the Dashboard until the original geometry is
+        # restored. Only then unmap it to avoid a momentary blank/expanded UI.
+        self.app.leave_settings()
+        self.place_forget()
 
 
 _spot_picker = {"win": None}   # the open picker overlay (only one at a time)
@@ -9952,7 +12434,7 @@ class MacroEditorWindow(tk.Toplevel):
         ("row", "retry()", "wait for the retry button and retry, like every config (nothing below it runs)"),
         ("row", "trackloot()", "look for the loot pictures now and add what is seen to the loot"),
         ("row", "openchest()", "the raid's chests: wait for the finish button, open the chests, click "
-                               "finish (spots: Settings > Configs)"),
+                               "finish (spots: Settings > Macros)"),
         ("row", "addwin()  /  addlose()", "add one to Completed / Failed"),
         ("row", "addmission()  /  addraid()", "add one to the Missions / Raids counter"),
         ("title", "LOGIC"),
@@ -9983,7 +12465,7 @@ class MacroEditorWindow(tk.Toplevel):
                  "whole script. The macro only reads the words."),
         ("title", "PICTURES   (IMAGE = a file name like retry.png)"),
         ("note", "Add them with the Images button (or drop the files into asset_override). Every "
-                 "picture a macro uses is listed in Settings > Fix image detection > Macros, so "
+                 "picture a macro uses is listed in Settings > Detection > Fix image detection > Macros, so "
                  "whoever gets your .tbmacro sees what it looks for. Send the picture files along with "
                  "it - they go into their asset_override folder. A picture that is missing shows "
                  "red in the editor."),
@@ -10024,7 +12506,7 @@ class MacroEditorWindow(tk.Toplevel):
         except (tk.TclError, OSError):
             pass
         self.configure(bg=App.BG)
-        self.transient(settings_win)
+        self.transient(settings_win.winfo_toplevel())
         self.attributes("-topmost", True)
         self.minsize(520, 460)
         self.protocol("WM_DELETE_WINDOW", self.close)
@@ -10135,7 +12617,7 @@ class MacroEditorWindow(tk.Toplevel):
         self.load()
         self.highlight()
         self.update_idletasks()
-        x, y = settings_win.winfo_x() + 30, settings_win.winfo_y() + 30
+        x, y = settings_win.winfo_rootx() + 30, settings_win.winfo_rooty() + 30
         self.geometry(f"600x660+{x}+{y}")
         style_title_bar(self, App.BG)
         reveal_window(self)
@@ -10673,7 +13155,7 @@ class FailsafeConfigWindow(tk.Toplevel):
         except (tk.TclError, OSError):
             pass
         self.configure(bg=App.BG)
-        self.transient(sw)
+        self.transient(sw.winfo_toplevel())
         self.attributes("-topmost", True)
         self.resizable(False, False)
         self.protocol("WM_DELETE_WINDOW", self.close)
@@ -10732,7 +13214,7 @@ class FailsafeConfigWindow(tk.Toplevel):
 
         self.update_total()
         self.update_idletasks()
-        self.geometry(f"+{sw.winfo_x() + 30}+{sw.winfo_y() + 30}")
+        self.geometry(f"+{sw.winfo_rootx() + 30}+{sw.winfo_rooty() + 30}")
         style_title_bar(self, App.BG)
         reveal_window(self)
         self.lift()
@@ -10823,7 +13305,7 @@ class ReconnectConfigWindow(tk.Toplevel):
         except (tk.TclError, OSError):
             pass
         self.configure(bg=App.BG)
-        self.transient(sw)
+        self.transient(sw.winfo_toplevel())
         self.attributes("-topmost", True)
         self.resizable(False, True)          # taller / shorter by dragging; the content scrolls
         self.minsize(300, 260)
@@ -10870,6 +13352,53 @@ class ReconnectConfigWindow(tk.Toplevel):
                  bg=App.CARD, anchor="w", justify="left", wraplength=400).pack(fill="x", pady=(4, 0))
 
         tk.Frame(f, height=1, bg=App.BORDER).pack(fill="x", pady=(12, 10))
+        tk.Label(f, text="Reconnect Method", font=(App.FONT,10,"bold"),
+                 fg=App.TEXT,bg=App.CARD).pack(anchor='w')
+        self.rc_method = tk.StringVar(value=settings['reconnect'].get('method','coordinates'))
+        for label,value in (("Coordinate Recognition (Legacy)",'coordinates'),
+                            ("Image Recognition (Beta)",'image')):
+            tk.Radiobutton(f,text=label,variable=self.rc_method,value=value,
+                           command=self._save_image_mode,bg=App.CARD,fg=App.TEXT,
+                           selectcolor=App.LOGBG,activebackground=App.CARD,
+                           activeforeground=App.TEXT).pack(anchor='w')
+        self.rc_image_options = tk.Frame(f,bg=App.CARD)
+        tk.Label(self.rc_image_options,text="Server Mode",font=(App.FONT,10,'bold'),
+                 fg=App.TEXT,bg=App.CARD).pack(anchor='w',pady=(6,3))
+        self.rc_server = tk.StringVar(value=settings['reconnect'].get('server_mode','public'))
+        for label,value in (("Public Server",'public'),
+                            ("Private Server (PS Code)",'ps_code'),
+                            ("Private Server (Gamepass)",'gamepass')):
+            tk.Radiobutton(self.rc_image_options,text=label,variable=self.rc_server,value=value,
+                           command=self._save_image_mode,bg=App.CARD,fg=App.TEXT,
+                           selectcolor=App.LOGBG,activebackground=App.CARD,
+                           activeforeground=App.TEXT).pack(anchor='w')
+        self.rc_code_container=tk.Frame(self.rc_image_options,bg=App.CARD)
+        tk.Label(self.rc_code_container,text="Private Server Code (stored locally)",
+                 font=(App.FONT,8),fg=App.SUB,bg=App.CARD).pack(anchor='w')
+        self.rc_code=tk.StringVar(value=settings['reconnect'].get('ps_code',''))
+        self.rc_code_entry=tk.Entry(self.rc_code_container,textvariable=self.rc_code,show='•',
+                                    bg=App.LOGBG,fg=App.TEXT,insertbackground=App.TEXT,
+                                    relief='flat',highlightthickness=1,
+                                    highlightbackground=App.BORDER)
+        self.rc_code_entry.pack(fill='x',ipady=5,pady=(3,2))
+        self.rc_code_entry.bind('<FocusOut>',lambda _e:self._save_image_mode())
+        self.rc_show_code=tk.BooleanVar(value=False)
+        tk.Checkbutton(self.rc_code_container, text='Show PS Code',
+                       variable=self.rc_show_code,
+                       command=self._toggle_ps_code_visibility,
+                       bg=App.CARD, fg=App.TEXT, selectcolor=App.LOGBG,
+                       activebackground=App.CARD, activeforeground=App.TEXT,
+                       cursor='hand2').pack(anchor='w', pady=(3, 0))
+        tk.Label(self.rc_code_container,
+                 text='Codes may contain uppercase/lowercase letters and numbers. Case matters.',
+                 font=(App.FONT, 8), fg=App.SUB, bg=App.CARD,
+                 wraplength=385, justify='left').pack(anchor='w',pady=(2, 0))
+        tk.Label(self.rc_image_options,text="Only Outskirts mission macros are supported. "
+                 "The Reconnect button stays monitored while the macro runs.",
+                 font=(App.FONT,8),fg=App.SUB,bg=App.CARD,
+                 wraplength=385,justify='left').pack(anchor='w',pady=(6,4))
+        self._render_image_mode()
+        tk.Frame(f,height=1,bg=App.BORDER).pack(fill='x',pady=(12,10))
 
         # setting 1: the Images (the Disconnect Image + the two that gate the clicks)
         tk.Label(f, text="Images", font=(App.FONT, 10, "bold"), fg=App.TEXT, bg=App.CARD,
@@ -10973,8 +13502,8 @@ class ReconnectConfigWindow(tk.Toplevel):
         self.canvas.configure(width=self.inner.winfo_reqwidth(),
                               height=min(self.inner.winfo_reqheight(), maxh))
         self.update_idletasks()
-        x = sw.winfo_x() + 30
-        y = max(0, min(sw.winfo_y() + 30, self.winfo_screenheight() - self.winfo_reqheight() - 60))
+        x = sw.winfo_rootx() + 30
+        y = max(0, min(sw.winfo_rooty() + 30, self.winfo_screenheight() - self.winfo_reqheight() - 60))
         self.geometry(f"+{x}+{y}")
         style_title_bar(self, App.BG)
         reveal_window(self)
@@ -11119,6 +13648,46 @@ class ReconnectConfigWindow(tk.Toplevel):
                    f"The first 4 are shared with that tab.")
         self.sub_note.configure(text=txt)
 
+    def _render_image_mode(self):
+        if self.rc_method.get()=='image':
+            self.rc_image_options.pack(fill='x',pady=(6,4))
+            if self.rc_server.get()=='ps_code':
+                self.rc_code_container.pack(fill='x',pady=(6,4))
+            else:
+                self.rc_code_container.pack_forget()
+        else:
+            self.rc_image_options.pack_forget()
+
+    def _toggle_ps_code_visibility(self):
+        # Display-only toggle: never changes, copies or logs the stored code.
+        self.rc_code_entry.configure(show='' if self.rc_show_code.get() else '•')
+
+    def _save_image_mode(self):
+        rc=settings['reconnect']
+        rc['method']=self.rc_method.get()
+        rc['server_mode']=self.rc_server.get()
+        entered_code=self.rc_code.get()
+        invalid_code=len(entered_code)>128 or any(ord(c)<32 for c in entered_code)
+        if invalid_code:
+            # Never truncate or silently discard characters from a PS Code.
+            rc['ps_code']=''
+            rc['enabled']=False
+            self.v_on.set(False)
+        else:
+            rc['ps_code']=entered_code  # keep every letter, digit and its case
+        # Do not keep reconnect enabled when the new mode is incomplete.
+        if reconnect_missing():
+            rc['enabled']=False
+            self.v_on.set(False)
+        save_stats()
+        self._render_image_mode()
+        self.update_requirements()
+        if invalid_code:
+            self.say('PS Code must be at most 128 printable characters. Please correct it.',
+                     error=True)
+        else:
+            self.say('Reconnect method saved',good=True)
+
     # ----- state -----
     def say(self, msg, error=False, good=False):
         self.note.configure(text=msg, fg="#f87171" if error else "#34d399" if good else App.SUB)
@@ -11225,9 +13794,9 @@ class BuiltInMacroCommandsWindow(tk.Toplevel):
         self.sw = settings_win
         self.family = family
         self.configure(bg=App.BG)
-        self.geometry(f"720x660+{settings_win.winfo_x()+35}+{settings_win.winfo_y()+30}")
+        self.geometry(f"720x660+{settings_win.winfo_rootx()+35}+{settings_win.winfo_rooty()+30}")
         self.minsize(580, 430)
-        self.transient(settings_win)
+        self.transient(settings_win.winfo_toplevel())
         self.attributes("-topmost", True)
         self.title(f"{APP_NAME} - Edit Macro Commands")
         self.header = tk.Label(self, text="", bg=App.BG, fg=App.TEXT,
@@ -11363,7 +13932,7 @@ class ConfigEditorWindow(tk.Toplevel):
         except (tk.TclError, OSError):
             pass
         self.configure(bg=App.BG)
-        self.transient(settings_win)
+        self.transient(settings_win.winfo_toplevel())
         self.attributes("-topmost", True)
         self.minsize(480, 380)
         self.protocol("WM_DELETE_WINDOW", self.close)
@@ -11404,7 +13973,7 @@ class ConfigEditorWindow(tk.Toplevel):
 
         self.build_rows()
         self.update_idletasks()
-        x, y = settings_win.winfo_x() + 30, settings_win.winfo_y() + 30
+        x, y = settings_win.winfo_rootx() + 30, settings_win.winfo_rooty() + 30
         self.geometry(f"520x640+{x}+{y}")
         style_title_bar(self, App.BG)
         reveal_window(self)
@@ -11661,7 +14230,7 @@ class ConfigEditorWindow(tk.Toplevel):
         self.build_rows()
 
     def set_family(self, family):
-        """Follow Settings > Configs > Abilities without losing unsaved edits."""
+        """Follow Settings > Macros > Abilities without losing unsaved edits."""
         if family not in FAMILIES or family == self.family:
             return
         self.commit()
@@ -11727,7 +14296,7 @@ class GuideWindow(tk.Toplevel):
         except (tk.TclError, OSError):
             pass
         self.configure(bg=App.BG)
-        self.transient(settings_win)
+        self.transient(settings_win.winfo_toplevel())
         self.attributes("-topmost", True)
         self.minsize(460, 400)
         self.protocol("WM_DELETE_WINDOW", lambda: fade_close(self))
@@ -11753,7 +14322,7 @@ class GuideWindow(tk.Toplevel):
         self.text.bind("<Key>", lambda e: "break" if e.state & 4 == 0 else None)   # read-only
         self.bind("<MouseWheel>", lambda e: self.text.yview_scroll(-1 if e.delta > 0 else 1, "units"))
 
-        self.geometry(f"560x640+{settings_win.winfo_x() + 40}+{settings_win.winfo_y() + 40}")
+        self.geometry(f"560x640+{settings_win.winfo_rootx() + 40}+{settings_win.winfo_rooty() + 40}")
         self.load()
         style_title_bar(self, App.BG)
         reveal_window(self)
@@ -12227,7 +14796,7 @@ class AssetOverrideWindow(tk.Toplevel):
         except (tk.TclError, OSError):
             pass
         self.configure(bg=App.BG)
-        self.transient(settings_win)
+        self.transient(settings_win.winfo_toplevel())
         self.attributes("-topmost", True)
         self.minsize(480, 320)
 
@@ -12277,7 +14846,7 @@ class AssetOverrideWindow(tk.Toplevel):
 
         self.refresh()
         self.update_idletasks()
-        x, y = settings_win.winfo_x() + 30, settings_win.winfo_y() + 30
+        x, y = settings_win.winfo_rootx() + 30, settings_win.winfo_rooty() + 30
         self.geometry(f"560x560+{x}+{y}")
         style_title_bar(self, App.BG)
         self.protocol("WM_DELETE_WINDOW", lambda: fade_close(self))
@@ -12661,6 +15230,10 @@ def apply_theme(name):
 
 def main():
     load_stats()          # stats + settings (saved keybinds, webhook, family)
+    # A previously enabled Beta may now have missing model files. Revalidate
+    # before drawing the UI, persist a safe Standard fallback if necessary.
+    if settings.get('recognition_mode') == 'hybrid_beta' and get_hybrid_advisor() is None:
+        save_stats()
     load_timings()        # config.json: the timings changed in Edit configs
     ensure_override_dir() # Documents\\thebums Macro\\asset_override: users drop their own pictures here
     register_thebums_file_type()   # Windows: the lambda icon on .tbmacro files (no admin needed)

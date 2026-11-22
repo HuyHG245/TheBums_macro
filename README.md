@@ -1,133 +1,217 @@
 # The Bums Macro
 
-**Release:** `TheBumsMacro_v1.2`  
-**Game:** Roblox — Attack on Titan: Revolution  
-**Repository:** https://github.com/HuyHG245/TheBums_macro
+**Windows source · Setup · Build · Update**
 
-The Bums Macro is a community-made **keyboard/mouse automation** application. It captures the Roblox screen, recognizes UI images and sends configured inputs. It does not require game-memory reading or code injection. It is not an official Roblox or Attack on Titan: Revolution product; using automation may be subject to the game's rules.
+The Bums Macro is an independent keyboard/mouse automation application for Roblox: Attack on Titan Revolution. It is not affiliated with Roblox or the game. Use it in accordance with applicable game rules.
 
-## Features
+> **Status:** v1.3 source snapshot for Windows. Reconnect, the updater and several beta features still require Windows/Roblox end-to-end verification. **Background Mode is In Development and cannot be enabled.** The default Standard Mode remains available.
 
-### Built-in macros
+## Quick start — TheBumsMacro_v1.3 source ZIP
 
-| Mode | Purpose |
-| --- | --- |
-| Shiki | Mission automation with Shiki-specific ability handling. |
-| Universal | General mission routine with directional actions, camera movement and Shift handling. |
-| Outskirts Fritz | Universal-style mission, with Fritz's skill layout and additional Skill 1 after Skill 3's animation. |
-| Blood Awakening | Mission routine with Blood Awakening and improved Colossal Shift confirmation. |
-| Female Raid | Raid automation with cutscene handling, chest positions and Retry support. |
-| Attack Titan Raid Fritz (Not Recommended) | Fritz-based raid opening, directional dashes, automatic cutscene skip and Colossal combat. |
-| Attack Titan Raid Blood Awakening | Acoustic Shells → forward Dash → Colossal Shift; then shared Colossal combat and chest handling. |
+**This ZIP contains the full v1.3 source, not a prebuilt Windows EXE.** Extract to a separate folder, especially if you already have a working installation.
 
-The two Attack Titan modes require **Colossal Titan** and use on-screen skill templates, including `acoustic_shells.png` and `heatwave.png`. Colossal Heatwave is controlled using its two-stage visibility/cooldown cycle; other Colossal skills operate on separate schedules. Raid chest options support the left Raider's Chest and optional right Emperor's Trove.
+1. Install **Python 3.10+ on Windows** and check **Add Python to PATH**.
+2. Double-click **`setup.bat`** once (internet connection required for dependencies).
+3. Double-click **`run.bat`** to open the Beta application.
+4. Optionally double-click **`build.bat`** to build `TheBumsMacro.exe` on Windows.
 
-### Custom macros
+If the app does not open, run ` .venv\Scripts\python.exe main.py ` in a terminal from this folder to see any error messages.
 
-- Create, record, edit, validate and run user-defined `.tbmacro` scripts.
-- Commands include `press ability1`–`ability5`, `wait`, `hold`, `spam`, `dash`, `backdash`, `strafe`, mouse movement/clicks, image checks, loops, conditions and Retry/loot actions.
-- The **Guide** button in the Custom Macro Editor opens a command reference with timing examples.
-- **Edit Macro Commands (Beta)** allows per-mode script overrides for built-in macros, with Check, Save and Reset to Original. Native image/state-driven steps remain protected.
-- Built-in mode Guides and skill-layout images are included; guide content is stored in `guides/*.txt` and formatted by the app.
+**Beta caution:** Test with your existing setup backed up. Do not depend on the new reconnect, automatic update, or rollback during an unattended overnight session until tested on your Windows/Roblox installation.
 
-### Automation, detection and recovery
+## 1. Download the application
 
-- On-screen detection for mission/raid readiness, results, Retry, rewards, cutscenes and selected ability icons.
-- Persistent Retry monitoring designed to avoid a stalled result screen and avoid double counting.
-- Raid chest Pick Spot configuration, Auto Skip and image-detection overrides.
-- Loot reporting for Scrolls, Vessels, Fragments and Serums, including Attack Titan-specific **Primordial Devil** and **Attack Serum**.
-- Alternative Scroll recognition using `loot_scroll.png` and `loot_scroll2.png`; matching either or both counts as **one Scroll per result**, never two from the two templates.
-- Saved session/statistics counters and detailed activity logs.
-- Reconnect and failsafe options for supported flows.
+1. Open the [official Releases page](https://github.com/HuyHG245/TheBums_macro/releases/latest).
+2. Expand **Assets** and download `TheBumsMacro.exe`.
+3. Save the EXE in a folder you can write to, such as `Documents\TheBumsMacro`.
+4. Launch it. Windows may request administrator consent because of the keyboard/mouse input requirements.
 
-### User interface and connectivity
+A prebuilt EXE does **not** require Python. Download only from the official repository.
 
-- App branding: **The Bums Macro**, with a note that it is keyboard/mouse automation only.
-- Configurable hotkeys/keybinds, per-macro Edit Configs with persistence and Reset.
-- Opacity slider (**30–100%**), Always on Top, themes and compact stats-bar mode.
-- Roblox monitor selection/automatic monitor detection.
-- **Adaptive Resolution (Beta)** is **OFF by default**. When enabled on Windows, it prefers capturing Roblox's client area and remaps template-match coordinates; the legacy full-monitor detector is used when disabled.
-- GitHub update checks (Releases and repository commits), Discord webhook/bot options and result reports.
-- The installed version **v1.2** is shown beside **Updates** in the main window, and the updater compares published release versions.
+## 2. Run from source
 
-## Requirements
+1. Install **Python 3.10+** for Windows and enable **Add Python to PATH**.
+2. Download the repository with **Code → Download ZIP** and extract it, or clone it:
 
-- Windows 10/11 and Roblox.
-- Python **3.10+** for running or building from source.
-- Dependencies listed in `requirements.txt`.
+   ```powershell
+   git clone https://github.com/HuyHG245/TheBums_macro.git
+   cd TheBums_macro
+   ```
 
-## Run from source
+3. Double-click **`setup.bat`** to create a Python environment and install dependencies.
+4. Double-click **`run.bat`** to launch the app.
 
-1. Install Python, enabling **Add Python to PATH**.
-2. Run `setup.bat` once to create the virtual environment and install packages.
-3. Run `run.bat`, or run `.venv\Scripts\python.exe main.py` from a terminal for troubleshooting.
-4. In **Settings → Configs**, choose your macro, read its Guide and configure chest positions or timings where applicable.
-5. Keep Roblox in focus when testing inputs. Default hotkeys: **F8 Start**, **F6 Pause**, **F7 Stop**.
+Please use **Windowed Screen, not Fullscreen** for Roblox. The optional Adaptive Resolution setting can capture the Roblox client area on supported Windows configurations.
 
-User-specific settings and history are stored under **Documents\The Bums**, outside this source repository in the normal Windows configuration. When storage there is unavailable, the app may fall back to its own folder: keep the `.gitignore` in place and review changes before publishing.
+## 3. Build the Windows EXE
 
-## Build an EXE
+Double-click **`build.bat`** to make the self-contained `TheBumsMacro.exe` in the project directory and `dist`.
 
-Run `build.bat` to build a single `TheBumsMacro.exe`. `build.bat onedir` makes a directory-based build instead. The build uses PyInstaller with `--uac-admin`; Windows shows a normal UAC consent prompt at launch. Administrator rights can help with input to an elevated Roblox window, but do not guarantee compatibility or immunity to detection errors.
+For a folder-based distribution run:
 
-Build outputs, installed Python environments, local configuration, logs, screenshots, user macros and credentials are excluded from Git by `.gitignore`.
+```powershell
+.\build.bat onedir
+```
 
-## Adaptive Resolution (Beta)
+The build uses PyInstaller and embeds the `image/` templates, `guides/` and the local `updater.ps1` helper. Folder-based builds must remain together. The build may request UAC approval at launch; it does not bypass Windows security.
 
-The stable/default capture mode remains **Legacy (OFF)**. Enable Adaptive Resolution only when you want to test capture from the Roblox client region. The app's **?** tooltip explains the mode in Settings.
+## 4. Updating the application
 
-Known limitations: different Roblox HUD scales, DPI settings, nonstandard window layouts, multi-monitor setups and user-specific chest/reconnect coordinates may still require calibration. For stable macro operation, test Legacy mode first and use **Settings → Fix Image Detection** to verify templates when needed.
+Click **Updates** in the main window to compare your installed version with the latest GitHub Release.
 
-## Security and privacy
+For a future release that ships the verified Update Manager, the app can download and verify a new EXE and install it without manual ZIP extraction. **It cannot install an update while a macro session is active, paused, reconnecting, or otherwise not explicitly stopped.** Downloads can be prepared in advance.
 
-- Do **not** commit your Discord webhook URL, bot token, personal JSON configuration, screenshots, custom macros or debug captures.
-- The `.gitignore` prevents common accidental *new* files from being staged, but it cannot remove secrets from files already tracked or from Git history. Inspect `git status` / `git diff --cached` before every push.
-- If a credential was ever committed, revoke/rotate it and clean Git history before publishing; a later `.gitignore` entry alone is not enough.
-- Only run EXE files built from source you trust. Be careful with administrator prompts.
+In **Settings → App → Update Manager**, choose whether to enable **Automatic Updates**, **Auto Download** and **Install automatically after Stop** or **Ask before installing**. Automatic Updates start **OFF** by default.
 
-## Changelog — TheBumsMacro_v1.2
+Update transactions retain the previous EXE for rollback if the newly installed EXE fails its startup check. Failed builds are recorded to avoid repeated automatic reinstalls. **Update History** shows the last 20 records. Real-world verification is required before depending on these capabilities.
 
-### New in v1.2 (compared with v1.1)
+If a release does not provide a verifiable Windows EXE asset with SHA-256, the application refuses automatic installation and offers the release page instead.
 
-- Added **Outskirts Fritz** with its own Skill Layout and Guide. The opening follows Universal except that Skill 1 is triggered after Skill 3, the Universal camera action and an extra adjustable animation wait, before Skill 4.
-- Added **Edit Macro Commands (Beta)** for built-in modes, with saved overrides, syntax checking and Reset to Original. Complex native state-detection stages remain protected.
-- Added alternative **`loot_scroll2.png`** Scroll detection; both Scroll icon templates share one counter and cannot double-count a single loot result.
-- Added a visible **v1.2** label beside **Updates**, updated release comparisons and synchronized EXE metadata to 1.2.
-- Updated the Custom Macro Guide and per-mode configuration support, including Outskirts timing adjustments.
-- Cleaned the GitHub source package, removed old beta changelogs/test artifacts and moved in-app guides into `.txt` files while keeping their Markdown formatting.
+## 5. Personal settings and troubleshooting
 
-## Changes since the original The Bums ZIP
+Your personal data normally lives in **`Documents\The Bums`**, separately from the application executable. This includes configurations, statistics, user-created macros, diagnostics and local settings.
+
+For common problems:
+
+- Python missing: install Python 3.10+ and run `setup.bat` again.
+- Build failed: check the terminal output and install dependencies with an internet connection.
+- Screen recognition problems: use **Settings → Detection → Run Diagnostics** and save its local report.
+- Unexpected macro errors: inspect the locally saved **Error Snapshots** (private PS code screens are not captured).
+- Failed update: check **Update History** and see if the previous executable was restored.
+
+Do not share private server codes, bot tokens, webhooks, or your personal configuration files publicly.
+
+## 6. Official links
+
+- [Repository](https://github.com/HuyHG245/TheBums_macro)
+- [Latest release](https://github.com/HuyHG245/TheBums_macro/releases/latest)
+- [Issue tracker](https://github.com/HuyHG245/TheBums_macro/issues)
+
+**The Bums Macro — keyboard/mouse automation only.**
+
+## Hybrid AI (Beta) — source development option
+
+A local, CPU-only Hybrid AI verification integration is available in this
+working source tree. **Standard/OpenCV recognition is still the default**;
+existing `image/` templates and all gameplay macros are preserved. The Beta
+option only considers borderline candidates in Retry, Loot and Image Reconnect.
+It uses no API or cloud inference. Existing OpenCV recognition images remain unchanged.
+
+**Background Mode — In Development:** The toggle in **Settings → Roblox** is
+visible but disabled (cannot be switched on). It is disabled for gameplay and
+old saved settings/presets cannot re-enable it. Windows testing showed that
+Roblox could be captured while unfocused but did not accept tested keyboard,
+click or camera messages. **Standard Mode** is the supported choice. The
+experimental Background Input Diagnostics interface and module have been
+removed from this source release. Ordinary **Settings → Detection → User
+Diagnostics** remains available.
+
+**No trained, gameplay-validated ONNX model is bundled.** The Hybrid AI option
+requires a validated model and optional CPU ONNX Runtime; otherwise Standard
+OpenCV recognition is used. See [models/README.md](models/README.md) for the
+expected model and manifest. Use `setup-hybrid-ai.bat` optionally; `setup.bat`,
+`run.bat` and `build.bat` retain Standard behavior.
+
+## Settings navigation and session tools (development build)
+
+**Settings** replaces the Dashboard inside the same main window and provides a
+left sidebar: **Keybinds, Macros, Recovery, Roblox, Detection, Discord, App**.
+Select **Settings → Macros → Session Analytics** for an in-page overview of
+recorded sessions, completed and failed runs, completion rate, reconnects,
+errors, a recent-session chart and session list. The local journal is bounded;
+these are the *recorded events* available on this machine, not guaranteed
+all-time server statistics. A last session with 0 runs can be normal even when
+the totals from earlier sessions are nonzero.
+
+Select **Settings → Macros → Config Presets** to save, apply, duplicate, rename
+and delete named presets without opening another window. New local presets
+capture the full `settings` snapshot, including all macro timing overrides,
+Recovery, Detection, Discord, Roblox, Keybinds and App options. **Local preset
+storage also contains private PS codes and credentials**: treat the saved
+`config_presets.json` as sensitive, just like your normal settings file.
+Older macro-only presets remain readable. Stop the macro before applying or
+changing presets; a second click confirms overwrite and delete.
+
+**Offline preset sharing:** select a saved preset and click **Generate Share Code**
+then **Copy Code**. Send the self-contained `TBP1...` text to the recipient;
+no account, server or API is required. They paste it into the same page and
+click **Import Code**, then can select **Apply**. Repeated imports receive
+independent names. The code includes portable options but *never* includes
+private PS codes, Discord bot tokens, webhook URLs, Discord user/channel IDs,
+window geometry or a device's retry-scale cache. Import never auto-applies.
+Applying an imported preset disables Auto Reconnect until checked locally;
+existing private credentials on the recipient's computer are not overwritten.
+Code checksums detect accidental corruption, **not impersonation**; accept codes
+only from people you trust. Codes may be long because they contain the settings.
+Custom macro script files and replacement recognition images are not settings
+and are not included in the share code.
+
+**Image Reconnect:** the original Reconnect-button flow remains supported.
+For a Leave-only disconnect, OpenCV confirms the Leave dialog and button,
+then accepts either Roblox Home **or directly the Attack on Titan Revolution
+game detail page**; the correct route proceeds through the blue triangle Play
+button to Slot A and the existing server/mission steps. These branches have
+been simulated without Windows; actual Roblox behavior must still be tested.
+
+**Settings → Detection** contains recognition settings and diagnostics.
+**Settings → Roblox** contains monitor selection, adaptive resolution,
+Performance Mode and **Background Mode (In Development, disabled)**. Keep Roblox
+in **Windowed** mode for normal macro use.
+
+**Testing status:** The inline Settings pages have passed a virtual-display
+Tkinter smoke test and pure-data tests in a non-Windows development environment.
+Actual Roblox input, capture, updates, notifications and crash recovery still
+need Windows-level verification before being considered production ready.
+
+## Stability / Shared Scan (v1.3)
+
+**Background input remains unavailable.** The Background Mode switch is labeled
+*In Development*, is non-interactive, and cannot be enabled using old
+configuration files or imported presets. User-triggered Background Input
+Diagnostics and the unused experimental diagnostic module are not distributed.
+
+**Shared Screenshot / Smart Scan:** The passive Retry and Reconnect watchdog
+continues to use a single capture per polling cycle. Its normalized BGR frame
+can now also be reused by the foreground *non-decisive* Retry and Disconnect
+scans if it is less than 180 ms old and matches the current capture geometry.
+Any Retry verification just before clicking, mission start verification and
+Reconnect step/state verification still take a **fresh capture**, never the
+shared cache. Performance Mode adjusts polling frequency; pausing and active
+Reconnect also reduce the passive scan rate. Diagnostic reports show the count
+of shared frames published and reused. This is a conservative optimization,
+not a complete replacement of every screenshot call in the macro.
+
+**Macro Health Monitor:** Script-stage/step changes are tracked separately
+from countdown redraws. If a running mission shows no step change for 210
+seconds, or a Reconnect stage shows no step change for 130 seconds, the monitor
+logs one warning, records a health event and attempts an existing protected
+error snapshot. Idle waiting and Pause are excluded. This diagnostic **does not
+invent recovery clicks or restart Roblox**, and is not proof that the game
+responded to any key. Existing mission failsafe, Retry, and Reconnect logic
+remains responsible for actual recovery.
+
+**Validation:** Existing recognition tests and additional in-memory
+state/cache/safety tests were run on Linux. Windows/Roblox gameplay
+compatibility has not been established for the new performance changes.
 
 
-The following is a comparison with the **original The Bums ZIP supplied for this project**, not a claim that every item is new compared with every historical GitHub release.
+## Settings & Analytics UI responsiveness (2026-11-22)
 
-### New features since that original ZIP
+Settings is now a page inside the main application window. Returning to the
+Dashboard hides the existing Settings widgets instead of destroying and
+recreating all nine pages. Switching tabs preserves scroll position and avoids
+full-page slide redraws. Rebuilding the Settings interface is still intentional
+when the theme changes. Session Analytics avoids redrawing unchanged history,
+and hovering a bar in **Results by Session** displays that session's Completed,
+Failed, total results, macro and start time directly on the chart (no new
+window). These behaviors were tested on a Linux virtual Tk display; final
+rendering on Windows should be checked during normal beta use.
 
-- Added **Attack Titan Raid Fritz (Not Recommended)** and **Attack Titan Raid Blood Awakening**, including distinct opening sequences and a shared Colossal combat state machine.
-- Added **Outskirts Fritz**, based on Universal with an additional Skill 1 after Skill 3's animation and configurable timing.
-- Added Shift confirmation using `heatwave.png`, Heatwave's two-cycle behavior, phase cutscene handling, raid chest processing and Attack Titan-specific loot templates.
-- Added **Custom Macro Editor**, recorder, script validation, configurable command language and a formatted in-app command reference, plus built-in Edit Macro Commands (Beta).
-- Added **Recovery / Reconnect** options and stronger Retry monitoring/retry-screen handling.
-- Added **Adaptive Resolution (Beta)**, disabled by default, with a nearby explanatory **?** tooltip.
-- Added GitHub **Updates** checks and optional Discord bot workflow alongside the existing webhook functionality.
-- Added per-macro **Edit Configs** behavior, with saved values and filtered shared controls.
-- Added independent Scroll display and Attack Titan-specific Primordial Devil / Attack Serum tracking.
+### Private Server Code (PS Code)
 
-### Improvements and fixes
-
-- Retained and refined the original **opacity slider**, automatic Roblox monitor detection, themes, stats and Discord reporting.
-- Improved Blood Awakening Shift reliability and more conservative loot matching.
-- Added diagnostic logging for input steps, image matching and Retry recovery.
-- Added scalable image matching for some critical raid ability templates and explicit directional double-tap timing.
-- Redesigned Custom Macro Guide rendering and made attack-raid Guides identify their required builds.
-- Updated in-app branding to **The Bums Macro** and added the discreet automation disclaimer.
-- Added Windows EXE **UAC administrator prompt** support in `build.bat`.
-- Cleaned the GitHub source distribution: removed obsolete experiment notes, temporary build files and stale version readmes; kept the working Guide content in `.txt` files so **README.md is the only Markdown file**.
-
-### What was already in the original ZIP
-
-The original The Bums release already contained **Shiki, Universal, Blood Awakening and Female Raid**, built-in guides, a loot/stats UI, Discord webhook notifications, multiple themes, Always on Top, **opacity control**, Roblox monitor detection and crash logging. These are **retained capabilities**, not claimed as newly invented in this release.
-
-## Source and licensing
-
-This project incorporates code from more than one source baseline. Before publishing or redistributing it, ensure you have permission for each third-party contribution and preserve any copyright/license notices that the applicable licenses require. The repo's own branding does not override those obligations.
+The PS Code field in Recovery > Reconnect accepts mixed-case letters and digits.
+Use **Show PS Code** to visually check the exact code; it starts masked.
+PS Code is saved locally and excluded from shared preset codes and diagnostics.
+Image Reconnect now types each alphanumeric character with explicit key-down/up
+and a short delay to reduce missed characters on Roblox. Entry still requires
+Roblox to have focus in Standard Mode.

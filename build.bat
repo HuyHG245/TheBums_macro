@@ -13,8 +13,12 @@ rem Default: ONE file, TheBumsMacro.exe. Run "build.bat onedir" to get a folder 
 rem it starts faster and antivirus programs complain less about it.
 set "MODE=--onefile"
 if /i "%~1"=="onedir" set "MODE=--onedir"
+rem Opt-in: build.bat hybrid OR build.bat onedir hybrid. Standard EXE stays lean.
+set "HYBRID_BUILD=0"
+if /i "%~1"=="hybrid" set "HYBRID_BUILD=1"
+if /i "%~2"=="hybrid" set "HYBRID_BUILD=1"
 
-for %%F in (main.py requirements.txt version_info.txt image\thebums.ico) do (
+for %%F in (main.py requirements.txt version_info.txt image\thebums.ico updater.ps1 thebums_reconnect.py thebums_features.py thebums_hybrid_ai.py) do (
     if not exist "%%F" (
         echo Missing file: %%F
         goto :fail
@@ -52,6 +56,11 @@ if errorlevel 1 (
     echo Could not install the requirements. Check your internet connection.
     goto :fail
 )
+if "%HYBRID_BUILD%"=="1" (
+    echo Installing optional local CPU ONNX runtime for Hybrid AI Beta...
+    "%PY%" -m pip install -r requirements-hybrid-ai.txt
+    if errorlevel 1 goto :fail
+)
 
 rem Embed a source revision when this is a real Git checkout; otherwise mark unknown.
 echo unpublished-local-build>"build_revision.txt"
@@ -66,8 +75,10 @@ echo Building - this takes a few minutes...
     --icon "image\thebums.ico" ^
     --version-file "version_info.txt" ^
     --add-data "image;image" ^
+    --add-data "models;models" ^
     --add-data "build_revision.txt;." ^
     --add-data "guides;guides" ^
+    --add-data "updater.ps1;." ^
     main.py
 if errorlevel 1 goto :fail
 

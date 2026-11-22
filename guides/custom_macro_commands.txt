@@ -1,7 +1,7 @@
 # Custom Macro Guide — The Bums Macro
 
 The Custom Macro Editor creates a `.tbmacro` file under **Documents / thebums Macro / Custom-Macros**.
-Open **Settings > Configs > + (New macro)**. Enter a name, choose **Mission** or **Raid**, write
+Open **Settings > Macros > + (New macro)**. Enter a name, choose **Mission** or **Raid**, write
 one command per line, press **Check**, then **Save**. Select it from the Abilities menu to run it.
 Use **Record** to capture a real sequence; **Pick click spot** inserts coordinates; **Images**
 lets you provide image templates. The **Syntax** button shows an inline command reference.
@@ -10,7 +10,7 @@ lets you provide image templates. The **Syntax** button shows an inline command 
 
 ## Quick start
 
-1. Open **Settings > Configs > + (New macro)**.
+1. Open **Settings > Macros > + (New macro)**.
 2. Give the macro a name and choose **Mission** or **Raid**.
 3. Write one command per line.
 4. Press **Check** to validate the script.
@@ -135,7 +135,7 @@ replace the built-in Raid routine without adding game-state checks.
 
 ## Edit Macro Commands (built-in macros, Beta)
 
-Open **Settings > Configs**, choose a built-in macro, and select **Edit macro commands**.
+Open **Settings > Macros**, choose a built-in macro, and select **Edit macro commands**.
 The preview lists executable pseudo-script commands where possible. `native ACTION`
 represents an original built-in action that depends on game-state detection.
 
