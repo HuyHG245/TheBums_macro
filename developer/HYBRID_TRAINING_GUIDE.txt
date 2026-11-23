@@ -57,3 +57,28 @@ Do NOT mark fake or template-only data as validated in a manifest.
    The developer must actively review private data and results before any
    public GitHub upload. datasets/, training_runs/ and private screenshots
    remain gitignored.
+
+
+PRIVATE VIDEO REVIEW INDEX (DEV ONLY)
+-------------------------------------
+The collector does NOT automatically label frames. Use this optional local
+index to find candidate timestamps before choosing a cropped ROI.
+
+1. Extract the developer branch and install ordinary app dependencies.
+2. Keep the MP4 on your own computer. Example commands from repo root:
+     python developer/video_review_index.py --video "20261123-0655-33.4962075.mp4"
+     python developer/video_dataset_collector.py --video "20261123-0655-33.4962075.mp4"
+3. In Collector, click "Load local review suggestions" and select the
+   datasets/hybrid/review_<video SHA256 prefix>.json generated in step 2.
+4. Browse Previous/Next suggestion, visually confirm the correct element,
+   draw an ROI and confirm the label/privacy before saving. Completed/Failed
+   are navigation context ONLY, NOT classifier labels at this stage.
+5. Never place train/val/test crops from the same video recording in more
+   than one split; do not treat copies as independent recording sessions.
+6. Run the real dataset audit before any training:
+     python developer/hybrid_dataset.py audit --root datasets/hybrid --release
+
+No recording, extracted crop or review index should be committed to GitHub:
+the datasets/ directory and video extensions are gitignored.
+This index is based on the existing OpenCV templates and may generate
+incorrect/missing timestamps. It is an aid to manual review, not AI.
