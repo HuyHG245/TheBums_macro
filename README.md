@@ -106,11 +106,19 @@ experimental Background Input Diagnostics interface and module have been
 removed from this source release. Ordinary **Settings → Detection → User
 Diagnostics** remains available.
 
-**No trained, gameplay-validated ONNX model is bundled.** The Hybrid AI option
-requires a validated model and optional CPU ONNX Runtime; otherwise Standard
-OpenCV recognition is used. See [models/README.md](models/README.md) for the
-expected model and manifest. Use `setup-hybrid-ai.bat` optionally; `setup.bat`,
-`run.bat` and `build.bat` retain Standard behavior.
+**No trained, gameplay-validated ONNX model is bundled in this source version.**
+Until an independently verified model is released, Hybrid AI is visibly
+unavailable rather than allowing a switch that silently fails. Standard/OpenCV
+continues to work. Model training uses **one shared model for all users**, not
+one model per machine. See `models/README.md` in the full source archive and
+`developer/HYBRID_TRAINING_GUIDE.txt` for developer dataset/training steps.
+
+**When a verified shared model is released**, it will be shipped with the app.
+`setup.bat` will automatically install its CPU runtime for source users;
+`build.bat` will automatically embed both the model and its CPU runtime into
+Windows EXE releases. End users will not install or train model files manually.
+No API, cloud inference or user training is involved. Standard/OpenCV and
+original recognition PNGs remain supported.
 
 ## Settings navigation and session tools (development build)
 

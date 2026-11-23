@@ -23,6 +23,23 @@ if errorlevel 1 (
     pause
     exit /b 1
 )
+rem End users never manually install AI: when this release includes a verified
+rem shared model, install its CPU inference runtime automatically.
+if exist "models\hybrid_manifest.json" (
+    ".venv\Scripts\python.exe" developer\check_hybrid_model.py --models models
+    if errorlevel 1 (
+        echo Unsafe or incomplete AI model; cannot finish setup.
+        pause
+        exit /b 1
+    )
+    echo Installing bundled shared AI CPU runtime...
+    ".venv\Scripts\python.exe" -m pip install -r requirements-hybrid-ai.txt
+    if errorlevel 1 (
+        echo CPU runtime installation failed. Standard Mode remains available.
+        pause
+        exit /b 1
+    )
+)
 echo.
 echo Done. Double-click run.bat to start The Bums.
 pause

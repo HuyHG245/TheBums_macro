@@ -13,10 +13,12 @@ rem Default: ONE file, TheBumsMacro.exe. Run "build.bat onedir" to get a folder 
 rem it starts faster and antivirus programs complain less about it.
 set "MODE=--onefile"
 if /i "%~1"=="onedir" set "MODE=--onedir"
-rem Opt-in: build.bat hybrid OR build.bat onedir hybrid. Standard EXE stays lean.
+rem A validated shared model is automatically included, with CPU runtime.
+rem No validated model: Standard stays lean; never ship a dummy model.
 set "HYBRID_BUILD=0"
-if /i "%~1"=="hybrid" set "HYBRID_BUILD=1"
-if /i "%~2"=="hybrid" set "HYBRID_BUILD=1"
+set "HYBRID_FORCE=0"
+if /i "%~1"=="hybrid" set "HYBRID_FORCE=1"
+if /i "%~2"=="hybrid" set "HYBRID_FORCE=1"
 
 for %%F in (main.py requirements.txt version_info.txt image\thebums.ico updater.ps1 thebums_reconnect.py thebums_features.py thebums_hybrid_ai.py) do (
     if not exist "%%F" (
@@ -56,10 +58,22 @@ if errorlevel 1 (
     echo Could not install the requirements. Check your internet connection.
     goto :fail
 )
+if exist "models\hybrid_manifest.json" (
+    echo Verifying shared model and independent held-out report...
+    "%PY%" developer\check_hybrid_model.py --models models
+    if errorlevel 1 goto :fail
+    set "HYBRID_BUILD=1"
+)
+if "%HYBRID_FORCE%"=="1" if "%HYBRID_BUILD%"=="0" (
+    echo Cannot build Hybrid AI: no independently validated shared ONNX model.
+    goto :fail
+)
+set "HYBRID_ARGS="
 if "%HYBRID_BUILD%"=="1" (
     echo Installing optional local CPU ONNX runtime for Hybrid AI Beta...
     "%PY%" -m pip install -r requirements-hybrid-ai.txt
     if errorlevel 1 goto :fail
+    set "HYBRID_ARGS=--collect-all onnxruntime"
 )
 
 rem Embed a source revision when this is a real Git checkout; otherwise mark unknown.
@@ -70,7 +84,7 @@ if not errorlevel 1 (
 )
 echo.
 echo Building - this takes a few minutes...
-"%PY%" -m PyInstaller --noconfirm --clean %MODE% --windowed --noupx %ADMIN_FLAG% ^
+"%PY%" -m PyInstaller --noconfirm --clean %MODE% --windowed --noupx %ADMIN_FLAG% %HYBRID_ARGS% ^
     --name TheBumsMacro ^
     --icon "image\thebums.ico" ^
     --version-file "version_info.txt" ^

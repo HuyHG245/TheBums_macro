@@ -8,6 +8,7 @@ import ctypes
 import json
 import os
 import hashlib
+import importlib.util
 import queue
 import random
 import re
@@ -4475,6 +4476,44 @@ def reset_hybrid_advisor():
         _hybrid_init_error = ''
 
 
+def _hybrid_models_dir():
+    """Prefer a bundled model; use a manually installed local model otherwise."""
+    local_models = os.path.join(app_dir(), 'models')
+    packaged_models = os.path.join(getattr(sys, '_MEIPASS', app_dir()), 'models')
+    if os.path.isfile(os.path.join(packaged_models, 'hybrid_manifest.json')):
+        return packaged_models
+    return local_models
+
+
+def hybrid_install_status():
+    """Fast GUI status check; never install packages or enable missing AI."""
+    root = _hybrid_models_dir()
+    manifest_path = os.path.join(root, 'hybrid_manifest.json')
+    if not os.path.isfile(manifest_path):
+        return False, 'Shared AI model has not been released yet. Standard/OpenCV remains available.'
+    try:
+        with open(manifest_path, encoding='utf-8') as fh:
+            meta = json.load(fh)
+        name = meta.get('model')
+        if meta.get('schema_version') != 1 or meta.get('validated') is not True or meta.get('calibrated') is not True:
+            raise ValueError('Model has not passed validation/calibration')
+        if not isinstance(name, str) or not name.endswith('.onnx') or os.path.basename(name) != name:
+            raise ValueError('Bad ONNX model filename')
+        path = os.path.join(root, name)
+        if not os.path.isfile(path):
+            raise FileNotFoundError('Model weights missing')
+        expected = meta.get('model_sha256')
+        if expected:
+            with open(path, 'rb') as fh:
+                if hashlib.sha256(fh.read()).hexdigest() != expected.lower():
+                    raise ValueError('Model SHA-256 mismatch')
+        if importlib.util.find_spec('onnxruntime') is None:
+            return False, 'CPU ONNX Runtime is missing. Run setup.bat for a bundled model.'
+    except (OSError, ValueError, TypeError) as exc:
+        return False, 'Invalid AI model: ' + str(exc)
+    return True, 'Shared offline AI model is ready.'
+
+
 def get_hybrid_advisor():
     """Return a CPU-only local advisor, or None. Never fail a macro run."""
     global _hybrid_advisor, _hybrid_init_done, _hybrid_init_error
@@ -4484,13 +4523,7 @@ def get_hybrid_advisor():
         if not _hybrid_init_done:
             _hybrid_init_done = True
             try:
-                # Prefer a user-supplied model beside the EXE/source, like
-                # asset_path(): no EXE rebuild required just to update weights.
-                local_models = os.path.join(app_dir(), 'models')
-                packaged_models = os.path.join(getattr(sys, '_MEIPASS', app_dir()), 'models')
-                models = (local_models if os.path.isfile(os.path.join(local_models,
-                                           'hybrid_manifest.json')) else packaged_models)
-                _hybrid_advisor = HybridAdvisor(CpuOnnxBackend(models))
+                _hybrid_advisor = HybridAdvisor(CpuOnnxBackend(_hybrid_models_dir()))
             except Exception as exc:
                 _hybrid_init_error = f'{type(exc).__name__}: {exc}'
                 settings['recognition_mode'] = 'standard'
@@ -8570,16 +8603,17 @@ class OpacitySlider(tk.Canvas):
         except tk.TclError:
             pass
 
-def switch_row(parent, text, var, command, bg, fg, sub_font=None, pady=4):
+def switch_row(parent, text, var, command, bg, fg, sub_font=None, pady=4, disabled=False):
     """Label on the left, switch on the right. Clicking the label flips it too."""
     row = tk.Frame(parent, bg=bg)
     row.pack(fill="x", pady=pady)
-    sw = ToggleSwitch(row, var, command, parent_bg=bg)
+    sw = ToggleSwitch(row, var, command, parent_bg=bg, disabled=disabled)
     sw.pack(side="right")
     lbl = tk.Label(row, text=text, font=sub_font or (App.FONT, 10), fg=fg, bg=bg, anchor="w",
-                   cursor="hand2")
+                   cursor="arrow" if disabled else "hand2")
     lbl.pack(side="left", fill="x", expand=True)
-    lbl.bind("<Button-1>", sw.flip)
+    if not disabled:
+        lbl.bind("<Button-1>", sw.flip)
     return row
 
 
@@ -10602,8 +10636,9 @@ class SettingsWindow(tk.Frame):
         tk.Frame(inner, height=8, bg=App.CARD).pack()
         return inner
 
-    def check(self, parent, text, var, command):
-        return switch_row(parent, text, var, command, App.CARD, App.TEXT)
+    def check(self, parent, text, var, command, disabled=False):
+        return switch_row(parent, text, var, command, App.CARD, App.TEXT,
+                          disabled=disabled)
 
     def entry(self, parent, var, show=None):
         e = tk.Entry(parent, textvariable=var, show=show, font=(App.FONT, 10),
@@ -11647,9 +11682,12 @@ class SettingsWindow(tk.Frame):
                       'borderline OpenCV results for Retry, Loot and Image Reconnect. '
                       'Offline CPU model required; missing/failed model returns to Standard.')
         self.v_hybrid = tk.BooleanVar(value=settings.get('recognition_mode') == 'hybrid_beta')
-        self.check(f, 'Hybrid AI (Beta) - opt in', self.v_hybrid, self.on_hybrid_toggle)
-        self.hint(f, 'Needs an independently validated models/hybrid_manifest.json and '
-                     'CPU ONNX weights. No APIs and no changes to original PNG templates.')
+        ai_ready, ai_message = hybrid_install_status()
+        self.check(f, 'Hybrid AI (Beta) - opt in', self.v_hybrid,
+                   self.on_hybrid_toggle, disabled=not ai_ready)
+        self.hint(f, ai_message if not ai_ready else
+                     'AI checks borderline OpenCV candidates. Offline CPU; original PNGs stay unchanged.',
+                  color=App.SUB if ai_ready else '#fbbf24')
 
     def on_hybrid_toggle(self):
         if running():
