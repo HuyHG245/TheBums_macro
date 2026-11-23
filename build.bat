@@ -69,18 +69,23 @@ if not errorlevel 1 (
     for /f "delims=" %%H in ('git rev-parse --verify HEAD 2^>nul') do echo %%H>"build_revision.txt"
 )
 echo.
+set "MODEL_DATA="
+if exist "models\" set "MODEL_DATA=--add-data models;models"
 echo Building - this takes a few minutes...
 "%PY%" -m PyInstaller --noconfirm --clean %MODE% --windowed --noupx %ADMIN_FLAG% ^
     --name TheBumsMacro ^
     --icon "image\thebums.ico" ^
     --version-file "version_info.txt" ^
     --add-data "image;image" ^
-    --add-data "models;models" ^
+    %MODEL_DATA% ^
     --add-data "build_revision.txt;." ^
     --add-data "guides;guides" ^
     --add-data "updater.ps1;." ^
     main.py
-if errorlevel 1 goto :fail
+if errorlevel 1 (
+    if exist "TheBumsMacro.spec" del /q "TheBumsMacro.spec"
+    goto :fail
+)
 
 if exist "build" rmdir /s /q "build"
 if exist "TheBumsMacro.spec" del /q "TheBumsMacro.spec"
