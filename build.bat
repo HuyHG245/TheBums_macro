@@ -73,7 +73,7 @@ if "%HYBRID_BUILD%"=="1" (
     echo Installing optional local CPU ONNX runtime for Hybrid AI Beta...
     "%PY%" -m pip install -r requirements-hybrid-ai.txt
     if errorlevel 1 goto :fail
-    set "HYBRID_ARGS=--collect-all onnxruntime"
+    set "HYBRID_ARGS=--collect-all onnxruntime --add-data models;models"
 )
 
 rem Embed a source revision when this is a real Git checkout; otherwise mark unknown.
@@ -89,12 +89,14 @@ echo Building - this takes a few minutes...
     --icon "image\thebums.ico" ^
     --version-file "version_info.txt" ^
     --add-data "image;image" ^
-    --add-data "models;models" ^
     --add-data "build_revision.txt;." ^
     --add-data "guides;guides" ^
     --add-data "updater.ps1;." ^
     main.py
-if errorlevel 1 goto :fail
+if errorlevel 1 (
+    if exist "TheBumsMacro.spec" del /q "TheBumsMacro.spec"
+    goto :fail
+)
 
 if exist "build" rmdir /s /q "build"
 if exist "TheBumsMacro.spec" del /q "TheBumsMacro.spec"
