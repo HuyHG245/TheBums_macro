@@ -22,6 +22,7 @@ import cv2
 import numpy as np
 
 from hybrid_dataset import BACKGROUND, SPLITS, VALID_SESSION, allowed_labels
+from video_review_index import load_index
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATASET = ROOT / "datasets" / "hybrid"
@@ -170,6 +171,8 @@ class VideoCollector:
         self.drag_item = None
         self.image_w = 0
         self.image_h = 0
+        self.suggestions = []
+        self.suggestion_index = -1
 
         self.root.title("The Bums Macro - Private AI Video Collector")
         self.root.geometry("1070x830")
@@ -211,6 +214,20 @@ class VideoCollector:
             orient="horizontal", showvalue=True, length=600, command=self.seek,
         )
         self.time_slider.pack(side="left", fill="x", expand=True, padx=8)
+        review = ttk.Frame(root)
+        review.pack(fill="x", padx=12, pady=(0, 4))
+        ttk.Button(review, text="Load local review suggestions", command=self.load_suggestions).pack(
+            side="left", padx=(0, 8)
+        )
+        ttk.Button(review, text="Previous suggestion", command=lambda: self.move_suggestion(-1)).pack(
+            side="left", padx=3
+        )
+        ttk.Button(review, text="Next suggestion", command=lambda: self.move_suggestion(1)).pack(
+            side="left", padx=3
+        )
+        ttk.Label(review, text="Review each suggestion manually; never auto-save a label.",
+                  wraplength=340).pack(side="left", padx=8)
+
         self.canvas = tk.Canvas(root, width=940, height=530, bg="#151515", highlightthickness=0)
         self.canvas.pack(padx=12, pady=6)
         self.canvas.bind("<ButtonPress-1>", self.mouse_down)
@@ -227,6 +244,52 @@ class VideoCollector:
         )
         ttk.Label(root, textvariable=self.status, wraplength=990).pack(anchor="w", padx=12)
         self.load_frame(0)
+
+    def load_suggestions(self):
+        try:
+            expected = self.dataset / ("review_" + self.video_digest[:12] + ".json")
+            source = filedialog.askopenfilename(
+                parent=self.root,
+                title="Open PRIVATE timestamp suggestions for this video",
+                initialdir=str(self.dataset),
+                initialfile=expected.name,
+                filetypes=[("Review index", "*.json")],
+            )
+            if not source:
+                return
+            self.suggestions = load_index(
+                Path(source), source_sha256=self.video_digest, duration=self.duration
+            )
+            self.suggestion_index = -1
+            self.status.set(
+                f"Loaded {len(self.suggestions)} UNVERIFIED timestamp suggestions. "
+                "Use Next/Previous, inspect each frame and draw a crop manually."
+            )
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            self.suggestions = []
+            self.suggestion_index = -1
+            messagebox.showwarning("Suggestions unavailable", str(exc), parent=self.root)
+
+    def move_suggestion(self, direction: int):
+        if not self.suggestions:
+            self.status.set(
+                "No suggestions loaded. Run video_review_index.py locally, "
+                "then click Load local review suggestions."
+            )
+            return
+        if direction not in (-1, 1):
+            raise ValueError("Invalid suggestion direction")
+        self.suggestion_index = (self.suggestion_index + direction) % len(self.suggestions)
+        suggestion = self.suggestions[self.suggestion_index]
+        self.time_slider.set(suggestion["seconds"])
+        label = suggestion["label"]
+        notice = "context-only (NOT a model label)" if suggestion.get("context_only") else "unverified target"
+        self.status.set(
+            f"Suggestion {self.suggestion_index + 1}/{len(self.suggestions)}: "
+            f"{label}, {notice}, score {suggestion['score']:.3f} at "
+            f"{suggestion['seconds']:.1f}s. Draw ROI and verify the true label/privacy "
+            "before saving; this is NOT ground truth."
+        )
 
     def seek(self, value):
         self.load_frame(float(value))
