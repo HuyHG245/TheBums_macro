@@ -1,0 +1,50 @@
+THE BUMS AI STUDIO 0.1 (MAINTAINER PREVIEW)
+==========================================
+Windows, 64-bit Python 3.10-3.12 with Tkinter (3.11/3.12 recommended).
+Open AI_Studio.bat from the extracted development branch. No administrator
+access, CUDA, API key or PyTorch required for video indexing/review.
+First launch needs internet to install OpenCV/NumPy into datasets/ai_studio_env.
+
+1. Import your original AOTR_Hybrid_Dataset_v9.zip. A NEW working copy goes
+   into datasets/hybrid_v10. The ZIP, old datasets and original splits remain.
+   Existing working copies are never overwritten; keep using the same folder.
+2. Add original video files (no copy) or import a video ZIP. ZIP extraction is
+   streamed, limited, and content-deduplicated in datasets/ai_studio/videos.
+   Remove selected only removes queue entries, not source files.
+3. Select videos or leave all unselected and Find candidates. Default 0.5 fps
+   saves metadata, not full video frames. Only original templates suggest
+   locations. Low confidence and missing detections are possible; use manual
+   seeking for omitted cases. The existing index caps samples at 1800/video;
+   scan shorter segments if needed, keeping their ORIGINAL recording identity.
+4. Select ONE video, Review. Next/Previous load proposed crop boxes for
+   supported labels. Correct label and crop; manually confirm privacy before
+   Save. Mark a genuine no-target near miss __background__. NEVER label a
+   real different target as background just because the suggestion was wrong.
+   Completed/Failed/Finish are only navigation context, not model classes.
+   Never include chats, names, PS codes, or other private information.
+   IMPORTANT: copies, trimmed/re-encoded clips and frames from the same
+   recording are not independent sessions. Use the original v9 split/session
+   from sources.csv where available. File digests catch exact copies, not every
+   edited copy. Resolve uncertain provenance before saving; do not invent test
+   sessions. The collector can reject a second digest already tied to a
+   session; use the original recording instead.
+5. Audit release data. Missing classes, negatives or sessions must be
+   collected; never lower the audit threshold to create an approved model.
+6. Install CPU training tools only when enough disk space is available.
+   The Studio checks for 10 GB free before installation. Close Roblox and
+   other memory-heavy applications during training if needed.
+7. Train if audit passes. Uses existing 96x96 CNN, default 35 epochs,
+   early stopping and up to four CPU threads. Reports/candidate exports are
+   stored in training_runs/. No ONNX is copied into the production macro.
+   A trainer pass still requires independent real Windows/Roblox validation.
+
+PRIVATE LOCAL DATA: datasets/ and training_runs/ are gitignored. Never add
+private data, source archives or unapproved model outputs to GitHub.
+To reclaim space, close Studio, back up needed data, then manually remove
+unneeded imported videos or unused training run folders. The original MP4s
+selected outside Studio are not touched. Deleting the private environment
+datasets/ai_studio_env removes its dependencies (next start recreates it).
+Do not delete datasets/hybrid_v10 unless you have backed it up.
+
+Preview limitation: Studio is a lightweight launcher, not a fully automatic
+labeler. Not yet validated on Windows. No macro runtime files were changed.
