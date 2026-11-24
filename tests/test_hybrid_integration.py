@@ -471,3 +471,20 @@ def test_leave_navigator_requires_successive_verified_screens():
     with pytest.raises(rc.ReconnectError,match='target moved'):
         moved._click_verified('leave','Leave disconnected game','home_game',3)
     assert not did_click
+
+
+def test_party_retry_requires_both_labels_in_the_results_panel(macro, monkeypatch):
+    retry = cv2.imread(str(ROOT / 'image' / 'party_retry_word.png'))
+    modifiers = cv2.imread(str(ROOT / 'image' / 'party_modifiers_word.png'))
+    monkeypatch.setattr(macro, '_party_retry_pair', (retry, modifiers))
+    frame = np.zeros((600, 1000, 3), dtype=np.uint8)
+    h, w = retry.shape[:2]
+    frame[420:420+h, 660:660+w] = retry
+    assert macro._match_party_retry(frame, [1.0]) is None
+    mh, mw = modifiers.shape[:2]
+    frame[420:420+mh, 472:472+mw] = modifiers
+    match, quality, scale = macro._match_party_retry(frame, [1.0])
+    assert match[:2] == (660+w//2, 420+h//2)
+    assert quality == 'normal' and scale == 1
+    frame[420:420+h, 660:660+w] = 0
+    assert macro._match_party_retry(frame, [1.0]) is None
