@@ -206,6 +206,10 @@ def video_source_hint(root, video):
                 continue
             split = row.get("split", "")
             session = row.get("session", row.get("session_id", ""))
+            # v9 provenance encodes split/session in path, not separate columns.
+            parts = row.get("path", "").replace("\\", "/").split("/")
+            if len(parts) >= 4 and parts[0] in SPLITS:
+                split, session = parts[0], parts[1]
             if split in SPLITS and SESSION.fullmatch(session):
                 matches.add((split, session))
     return next(iter(matches)) if len(matches) == 1 else None
@@ -328,6 +332,10 @@ class Studio:
                      width=5, state="readonly").pack(side="left", padx=4)
         self.button(scan, "3. Find candidates (selected/all)", self.scan)
         self.button(scan, "4. Review one video", self.review)
+        export = ttk.Frame(outer)
+        export.pack(fill="x", pady=(3, 0))
+        self.button(export, "Export review sheets (selected/all)", self.export_review)
+        self.button(export, "Open review export folder", lambda: self.open_folder(WORK / "review_exports"))
         ttk.Label(outer, text="Review is mandatory. Suggested labels are not training truth. "
                   "Use the original recording session and split.", wraplength=900).pack(anchor="w", pady=5)
         actions = ttk.Frame(outer)
@@ -525,6 +533,23 @@ class Studio:
         path = self.paths[selected[0]]
         self.run("Review selected video; close review window to return",
                  lambda: self.command(["developer/ai_studio.py", "--review", path, "--root", DATASET]))
+
+    def export_review(self):
+        if not self.ensure_data():
+            return
+        selected = [self.paths[i] for i in self.listbox.curselection()] or self.paths[:]
+        if not selected:
+            messagebox.showinfo("No video", "Add at least one video.")
+            return
+        def work():
+            out = WORK / "review_exports" / time.strftime("review_%Y%m%d_%H%M%S")
+            args = ["developer/review_sheet_export.py", "--root", DATASET, "--out", out]
+            for video in selected:
+                args.extend(["--video", video])
+            self.command(args)
+            self.emit("Review sheets: " + str(out))
+            self.emit("Inspect every sheet for private data before sharing. No labels were saved.")
+        self.run("Export numbered candidate crops for batch review", work)
 
     def audit(self):
         if self.ensure_data():

@@ -1,4 +1,4 @@
-THE BUMS AI STUDIO 0.1 (MAINTAINER PREVIEW)
+THE BUMS AI STUDIO 0.2 (MAINTAINER PREVIEW)
 ==========================================
 Windows, 64-bit Python 3.10-3.12 with Tkinter (3.11/3.12 recommended).
 Open AI_Studio.bat from the extracted development branch. No administrator
@@ -48,3 +48,15 @@ Do not delete datasets/hybrid_v10 unless you have backed it up.
 
 Preview limitation: Studio is a lightweight launcher, not a fully automatic
 labeler. Not yet validated on Windows. No macro runtime files were changed.
+
+BATCH REVIEW EXPORT (0.2)
+After Find candidates, select all desired recordings or leave none selected.
+Click Export review sheets and Open review export folder. The newest subfolder
+contains numbered sheets and manifest.json. Review privacy locally before
+sharing only the requested sheets and manifest. Crops may accidentally show
+private text; do not send any sheet containing it. Suggestions are NOT labels.
+Exact pixel repeats of the same proposed label in the same recording are grouped;
+close matches to the baseline and overlapping labels are flagged, not discarded.
+Existing v9 path-based source split/session provenance is read automatically.
+Unresolved sources (including renamed/trimmed clips) need manual confirmation.
+No candidate is added to the dataset by this export.
