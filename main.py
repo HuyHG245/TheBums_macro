@@ -4351,7 +4351,6 @@ _scale = 1.0     # real capture height / BASE_HEIGHT (set when the macro starts)
 _adaptive_run_enabled = False  # frozen on Start so changing Settings cannot interrupt combat
 _capture_rect = None         # exact area used to create the latest normalized detection frame
 _retry_template = None
-_party_retry_pair = None
 _alt_retry_templates = []        # extra looks of the retry button: [(templates, dx)] - see load_alt_retry()
 _start_template = None
 _attack_start_template = None    # only loaded when Attack Titan Raid is selected
@@ -5463,12 +5462,6 @@ def load_alt_retry():
     Two looks are made of it: the whole picture and the RETRY word only (the "(0/1)" counter
     changes). dx = how far the picture's centre is from the whole button's centre, so a match
     can be turned back into the button centre for the click."""
-    global _party_retry_pair
-    try:
-        _party_retry_pair = (load_template("party_retry_word.png"),
-                             load_template("party_modifiers_word.png"))
-    except FileNotFoundError:
-        _party_retry_pair = None
     _alt_retry_templates.clear()
     try:
         whole = load_quality_templates(ALT_RETRY_FILE)
@@ -5518,30 +5511,6 @@ def _log_retry_score(screen, scales):
 _retry_scans = 0
 
 
-def _match_party_retry(screen, scales):
-    """Verify both adjacent labels before accepting the word on a timed party button."""
-    if not _party_retry_pair:
-        return None
-    retry, modifiers = _party_retry_pair
-    height, width = screen.shape[:2]
-    left, top = int(width * .40), int(height * .56)
-    panel = screen[top:int(height * .94), left:int(width * .79)]
-    match = best_match(panel, retry, scales)
-    if not match or match[2] < ALT_RETRY_THRESHOLD:
-        return None
-    x, y, score, w, h = match
-    scale = w / retry.shape[1]
-    # The adjacent label is about two Retry-word widths to the left.
-    x0, x1 = max(0, x - 4*w), x - w
-    y0, y1 = max(0, y - h), min(panel.shape[0], y + h)
-    if x1 <= x0 or y1 <= y0:
-        return None
-    neighbour = best_match(panel[y0:y1, x0:x1], modifiers, [scale])
-    if not neighbour or neighbour[2] < ALT_RETRY_THRESHOLD:
-        return None
-    return (left+x, top+y, min(score, neighbour[2]), w, h), "normal", scale
-
-
 def _match_retry(screen, scales):
     """retry_text.png first, then alt_retry_button.png, at the given template sizes.
     Returns (match, quality, size) or None. size = how much bigger/smaller than the picture."""
@@ -5558,7 +5527,7 @@ def _match_retry(screen, scales):
             size = w / templates[quality].shape[1]
             # centre of the whole button (dx is in picture pixels, so it grows with the size)
             return (cx + dx * size, cy, score, w, h), quality, size
-    return _match_party_retry(screen, scales)
+    return None
 
 
 def _hybrid_retry_candidate(screen, scales=None):
