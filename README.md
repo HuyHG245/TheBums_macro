@@ -4,11 +4,11 @@
 
 The Bums Macro is an independent keyboard/mouse automation application for Roblox: Attack on Titan Revolution. It is not affiliated with Roblox or the game. Use it in accordance with applicable game rules.
 
-> **Status:** v1.4 source snapshot for Windows. Reconnect, the updater and several beta features still require Windows/Roblox end-to-end verification. **Background Mode is In Development and cannot be enabled.** The default Standard Mode remains available.
+> **Status:** v1.4.1 development candidate for Windows. Reconnect, the updater and several beta features still require Windows/Roblox end-to-end verification. **Background Mode is In Development and cannot be enabled.** The default Standard Mode remains available.
 
-## Quick start — TheBumsMacro_v1.4 source ZIP
+## Quick start — TheBumsMacro_v1.4.1 source
 
-**This ZIP contains the full v1.4 source, not a prebuilt Windows EXE.** Extract to a separate folder, especially if you already have a working installation.
+**This source contains no prebuilt Windows EXE.** Extract to a separate folder, especially if you already have a working installation.
 
 1. Install **Python 3.10+ on Windows** and check **Add Python to PATH**.
 2. Double-click **`setup.bat`** once (internet connection required for dependencies).
@@ -234,3 +234,7 @@ Extract the branch ZIP first. Double-click **run-grid-v11.4.bat** in the extract
 The local observer consumes existing watchdog screenshots and logs Gold/Gem candidates. After a reward screen, let the run continue into the next mission and stop the macro before closing its window. Open **logs/grid114/** and share the newest JSONL for review. Each file records observations, finalized events, and sampled/dropped frame counts. A run with no detected rewards still creates a log. Confirmed rewards are credited once per mission and currency to a playtest session total shown in Activity and recorded in the JSONL. Only events with ledger_allowed=true contribute. Totals start fresh on each Grid launch. Use **run.bat** for the regular mode.
 
 Mission and raid webhooks include REWARDS before the screenshot. This run shows confirmed Gold, Gem and perk quantities. Session totals start on Start. A question mark means the amount is unconfirmed. Launch with run-grid-v11.4.bat to enable recognition.
+
+## Auto Update reliability (v1.4.1)
+
+The official one-file Windows EXE supports bounded download retries, in-session HTTP Range resume, progress, cancellation, verified staging and Stop-gated installation. The installer rechecks the SHA-256 digest and uses a transaction-specific startup marker. Source and onedir builds use manual downloads. A stale update reservation requires confirmation that all macro and installer processes have exited before manual cleanup. Windows end-to-end playtest is required.

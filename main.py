@@ -34,6 +34,7 @@ import numpy as np
 import thebums_reconnect as image_rc
 from thebums_skill_scheduler import BloodSkillScheduler
 from thebums_hybrid_ai import CpuOnnxBackend, HybridAdvisor
+from thebums_update_download import download_verified, DownloadCancelled, DownloadNetworkError
 from thebums_features import ConfigPresetStore, SessionHistory, ErrorSnapshotStore, UpdateHistory, _atomic_json
 
 IS_WIN = sys.platform == "win32"
@@ -186,7 +187,7 @@ if IS_WIN:
 
 # ----------------------------- SETTINGS ---------------------------------
 APP_NAME = "The Bums Macro"
-VERSION = "TheBumsMacro_v1.4"  # Windows/Roblox playtest remains required
+VERSION = "TheBumsMacro_v1.4.1"  # Windows/Roblox playtest remains required
 
 # --- Update checker (footer > Updates) ---
 UPDATE_REPO = "HuyHG245/TheBums_macro"   # <-- your GitHub "owner/repo" (public). Releases are read from it
@@ -9490,7 +9491,7 @@ def style_title_bar(root, bg_hex):
 
 # ------------------------------- updater --------------------------------
 _update = {'busy':False,'staged':None,'release':None,'install_launched':False,
-           'prompted':False,'lockfile':None}
+           'prompted':False,'lockfile':None,'downloading':False,'cancel':None}
 _update_install_guard = threading.Lock()  # prevents Start racing with final Stop-gated installation
 
 
@@ -9548,7 +9549,13 @@ def fetch_repo_updates():
     except urllib.error.HTTPError as exc:
         if exc.code != 404:  # 404 means this project has no published release, not a broken repository
             raise
-    commits = _github_api("commits?per_page=1")
+    # Commit metadata is informational; a transient failure must not hide a valid release.
+    try:
+        commits = _github_api("commits?per_page=1")
+    except (OSError, ValueError):
+        if latest_release is None:
+            raise
+        commits = []
     latest_commit = None
     if commits:
         obj = commits[0]
@@ -9573,7 +9580,7 @@ def _update_check_worker(manual):
 
 
 def start_update_check(manual=False):
-    if _update["busy"]:
+    if _update["busy"] or _update.get("staged"):
         return
     if not update_repo_ok():
         if manual:
@@ -9602,10 +9609,11 @@ def acquire_update_lock():
     try:
         descriptor=os.open(name,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
     except FileExistsError:
+        # Age alone cannot prove the previous process or PowerShell installer is dead.
+        # Never remove a reservation that may still protect an installation.
         try:
-            if time.time()-os.path.getmtime(name)>24*3600:
-                os.remove(name)   # recover old crashed reservations only
-                return acquire_update_lock()
+            age=max(0,int(time.time()-os.path.getmtime(name)))
+            log(f'Update reservation exists ({age}s old). If stuck, close all macro and updater processes before clearing .updating and .new files.')
         except OSError:pass
         return False
     try:
@@ -9638,45 +9646,70 @@ def _install_update_worker(info):
         if update_history().blocked(info['tag'],info['digest']):
             raise RuntimeError('This failed release is blocked from automatic reinstallation')
         log(f"Downloading verified update {info['tag']}...")
-        req=urllib.request.Request(info['url'],headers={'User-Agent':'thebums-macro-updater'})
-        sha=hashlib.sha256();size=0
-        with urllib.request.urlopen(req,timeout=UPDATE_TIMEOUT) as response,open(new_path,'wb') as out:
-            if response.geturl().split('/')[2] not in ('github.com','objects.githubusercontent.com',
-                                                        'release-assets.githubusercontent.com'):
-                raise RuntimeError('Unexpected update download host')
-            while True:
-                part=response.read(1<<17)
-                if not part:break
-                out.write(part);sha.update(part);size+=len(part)
-                if size>500_000_000:raise RuntimeError('Update exceeds permitted size')
-        if info.get('size') and info['size']!=size:
-            raise RuntimeError('Download size does not match the release asset')
-        if sha.hexdigest().lower()!=info['digest'][7:].lower():
-            raise RuntimeError('SHA-256 checksum mismatch')
-        with open(new_path,'rb') as stream:
-            if stream.read(2)!=b'MZ':raise RuntimeError('Downloaded asset is not a Windows EXE')
+        def progress(done,total,speed,eta):
+            ev.put(('update_progress',done,total,speed,eta))
+        download_verified(info,new_path,repo=UPDATE_REPO,cancel=_update['cancel'],
+                          progress=progress,status=log,timeout=UPDATE_TIMEOUT)
+        if _update['cancel'].is_set():
+            raise DownloadCancelled('Download cancelled')
+        update_history().record(info['tag'],'downloaded',info['digest'])
         _update['staged']=new_path
         _update['release']=info
-        update_history().record(info['tag'],'downloaded',info['digest'])
-        ev.put(('update_staged',))
+        log('Update downloaded and verified. Press Stop (F7 by default), then Updates if installation has not started.')
     except Exception as exc:
-        log(f'Update download refused: {type(exc).__name__}: {exc}')
-        update_history().record(info.get('tag','unknown'),'download_failed',info.get('digest',''),str(exc))
-        try:os.remove(new_path)
-        except OSError:pass
-        release_update_lock()
+        cancelled=isinstance(exc,DownloadCancelled)
+        log(f"Update download {'cancelled' if cancelled else 'failed'}: {type(exc).__name__}: {exc}")
+        try:
+            update_history().record(info.get('tag','unknown'),
+                'download_cancelled' if cancelled else 'download_failed',info.get('digest',''),str(exc))
+        finally:
+            try:os.remove(new_path)
+            except OSError:pass
+            release_update_lock()
+        if not cancelled and info.get('manual'):
+            ev.put(('update_download_failed',))
     finally:
         _update['busy']=False
+        _update['downloading']=False
+        ev.put(('update_download_done',))
+        if _update.get('staged'):
+            ev.put(('update_staged',))
+
+
+def supports_exe_update():
+    """Only one-file PyInstaller builds can be replaced by a single release EXE."""
+    if not IS_WIN or not getattr(sys,'frozen',False):return False
+    bundle=getattr(sys,'_MEIPASS',None)
+    if not bundle:return False
+    try:
+        folder=os.path.normcase(os.path.realpath(os.path.dirname(sys.executable)))
+        bundle=os.path.normcase(os.path.realpath(bundle))
+        return os.path.commonpath([folder,bundle])!=folder
+    except ValueError:  # extraction directory is on a different Windows volume
+        return True
 
 
 def install_update(info):
-    if _update['busy']:return
+    if _update['busy'] or _update.get('staged'):return
+    if not supports_exe_update():
+        log('Auto Update requires the official one-file EXE. Download the complete release manually.')
+        if info.get('manual'):ev.put(('update_download_failed',))
+        return
     if not acquire_update_lock():
         log('Another The Bums instance is already preparing an update')
         return
     _update['busy']=True
-    threading.Thread(target=_install_update_worker,args=(info,),daemon=True,
-                     name='UpdateDownloader').start()
+    _update['downloading']=True
+    _update['cancel']=threading.Event()
+    try:
+        threading.Thread(target=_install_update_worker,args=(info,),daemon=True,
+                         name='UpdateDownloader').start()
+    except Exception as exc:
+        _update['busy']=False
+        _update['downloading']=False
+        release_update_lock()
+        log(f'Could not start update download: {type(exc).__name__}: {exc}')
+        if info.get('manual'):ev.put(('update_download_failed',))
 
 
 def launch_staged_update():
@@ -9686,7 +9719,7 @@ def launch_staged_update():
     staged=_update.get('staged')
     if not info or not staged or not os.path.isfile(staged):return False
     if _update.get('install_launched'):return False
-    if not IS_WIN or not getattr(sys,'frozen',False):return False
+    if not supports_exe_update():return False
     bundled_helper=os.path.join(getattr(sys,'_MEIPASS',app_dir()),'updater.ps1')
     if not os.path.isfile(bundled_helper):
         log('The bundled updater helper was not found')
@@ -9695,7 +9728,7 @@ def launch_staged_update():
         if not can_install_update() or _update.get('install_launched'):
             return False
         _update['install_launched']=True
-    health=os.path.join(data_dir(),'update_health.ok')
+    health=os.path.join(data_dir(),'update_health_'+uuid.uuid4().hex+'.ok')
     status_file=os.path.join(data_dir(),'update_status.json')
     try:
         # The PyInstaller one-file extraction directory vanishes on exit.
@@ -9714,7 +9747,8 @@ def launch_staged_update():
     except Exception as exc:
         _update['install_launched']=False
         log(f'Could not launch updater: {type(exc).__name__}: {exc}')
-        release_update_lock()
+        # Keep the reservation while the verified staged asset is still owned by us.
+        _update['prompted']=False
         return False
 
 
@@ -9743,7 +9777,11 @@ def update_startup_check(root):
     def healthy():
         if not root.winfo_exists():return
         try:
-            with open(os.path.join(data_dir(),'update_health.ok'),'w',encoding='ascii') as f:
+            # Legacy helpers expect update_health.ok. New helpers pass a per-transaction name.
+            name=os.environ.get('THEBUMS_UPDATE_HEALTH','')
+            if not re.fullmatch(r'update_health_[0-9a-f]{32}\.ok',name):
+                name='update_health.ok'
+            with open(os.path.join(data_dir(),name),'w',encoding='ascii') as f:
                 f.write('ready')
         except OSError:pass
     root.after(3000,healthy)
@@ -10338,11 +10376,12 @@ class App:
         upd = tk.Label(left, text="\u21bb  Updates", font=(App.FONT, 9), fg=self.SUB,
                        bg=self.BG, cursor="hand2")
         upd.pack(side="left", padx=(14, 0))
-        upd.bind("<Button-1>", lambda _e: start_update_check(manual=True))
+        self.update_link = upd
+        upd.bind("<Button-1>", self.on_update_click)
         upd.bind("<Enter>", lambda _e: upd.configure(fg=self.TEXT))
         upd.bind("<Leave>", lambda _e: upd.configure(fg=self.SUB))
         # Show the installed release immediately beside Updates (not the newest GitHub release).
-        tk.Label(left, text="v1.4", font=(App.FONT, 8), fg=self.SUB,
+        tk.Label(left, text="v1.4.1", font=(App.FONT, 8), fg=self.SUB,
                  bg=self.BG).pack(side="left", padx=(7, 0))
 
         self.reset_btn = tk.Label(foot, text="Reset stats", font=(App.FONT, 9),
@@ -10370,7 +10409,7 @@ class App:
         if key == "idle":
             self.btn_start.update_tile(enabled=True, active=False)
             self.btn_pause.update_tile(label="Pause", enabled=False, active=False)
-            self.btn_stop.update_tile(enabled=False, active=False)
+            self.btn_stop.update_tile(enabled=bool(_update.get("staged")), active=False)
         elif key == "paused":
             self.btn_start.update_tile(enabled=False, active=False)
             self.btn_pause.update_tile(label="Resume", enabled=True, active=True)
@@ -10440,10 +10479,28 @@ class App:
                 self.settings_win.say(e[1], error=e[2], good=e[3])
         elif kind == "update_result":
             self.on_update_result(e[1], e[2], e[3])
+        elif kind == 'update_progress':
+            _,done,total,speed,eta=e
+            pct=100*done/total
+            self.update_link.configure(text=f"↓ {pct:.0f}%")
+            now=time.monotonic()
+            if done==total or now-getattr(self,'_update_log_at',-100)>5:
+                self._update_log_at=now
+                remaining=f"{eta:.0f}s" if eta is not None else "--"
+                log(f"Update: {pct:.1f}% · {speed/1_000_000:.2f} MB/s · ETA {remaining}")
+        elif kind == 'update_download_done':
+            self.update_link.configure(text="↻  Updates")
+        elif kind == 'update_download_failed':
+            if not getattr(self,'_closing_for_download',False) and messagebox.askyesno('Updates',
+                    'Update download failed. Open the official release page?' ,parent=self.root):
+                webbrowser.open(GITHUB_URL+'/releases/latest')
         elif kind == 'update_staged':
-            self.maybe_install_update()
+            if not getattr(self,'_closing_for_download',False):
+                self.update_link.configure(text='↓ Ready')
+                self.btn_stop.update_tile(enabled=True, active=False)
+                self.maybe_install_update()
         elif kind == "update_ready":
-            self.on_close()          # the .bat swaps the files and starts the new version
+            self.on_close()          # the bundled PowerShell helper replaces the EXE
         elif kind == 'reconnect_progress':
             _,i,total,label,stage,attempt=e
             self.reconnect_bar['value']=round(max(0,i-1)/max(1,total)*100)
@@ -10598,6 +10655,20 @@ class App:
         self.mini = None
         reveal_window(self.root)
 
+    def on_update_click(self, _event=None):
+        if _update.get('downloading'):
+            if messagebox.askyesno('Updates','Cancel the current download?',parent=self.root):
+                _update['cancel'].set()
+            return
+        if _update.get('staged'):
+            if not can_install_update():
+                messagebox.showinfo('Updates','Download verified. Press Stop (F7 by default), then Updates again.',parent=self.root)
+                return
+            _update['prompted']=False
+            self.maybe_install_update()
+            return
+        start_update_check(manual=True)
+
     def on_update_result(self, manual, info, error):
         _update['busy']=False
         if error:
@@ -10605,8 +10676,11 @@ class App:
             if manual:messagebox.showerror('GitHub Updates',str(error),parent=self.root)
             return
         release=(info or {}).get('release')
-        if not release or not re.search(r'v?\d+\.\d+',release.get('tag','')):
+        if not release:
             if manual:messagebox.showinfo('Updates','No published release found.',parent=self.root)
+            return
+        if not re.search(r'v?\d+\.\d+',release.get('tag','')):
+            if manual:messagebox.showwarning('Updates','Latest release tag has no version number. Check GitHub.',parent=self.root)
             return
         if parse_version(release['tag'])<=parse_version(VERSION):
             if manual:messagebox.showinfo('Updates','You are using the latest release.',parent=self.root)
@@ -10617,7 +10691,7 @@ class App:
                     'A release is available, but automatic installation cannot verify it.\nOpen GitHub?',
                     parent=self.root):webbrowser.open(release['page'])
             return
-        package=dict(exe,tag=release['tag'])
+        package=dict(exe,tag=release['tag'],manual=manual)
         if update_history().blocked(package['tag'],package['digest']):
             log(f"Update {package['tag']} is blocked after a prior rollback")
             if manual and not messagebox.askyesno('Previous Update Failed',
@@ -10629,9 +10703,9 @@ class App:
             h.get('blocked',{}).pop(package['tag'],None)
             from thebums_features import _atomic_json
             _atomic_json(update_history().path,h)
-        if not getattr(sys,'frozen',False) or not IS_WIN:
+        if not supports_exe_update():
             if manual and messagebox.askyesno('Updates',
-                    'Automatic installation requires a Windows EXE build. Open the release?',parent=self.root):
+                    'Automatic installation requires the official one-file Windows EXE. Open the release?',parent=self.root):
                 webbrowser.open(release['page'])
             return
         if manual:
@@ -10645,7 +10719,8 @@ class App:
         install_update(package)
 
     def maybe_install_update(self):
-        if not _update.get('staged') or not can_install_update():return
+        if (getattr(self,'_closing_for_download',False) or _update.get('downloading')
+                or not _update.get('staged') or not can_install_update()):return
         if _update.get('prompted'):return
         if settings['update_prefs'].get('install_mode')=='ask':
             _update['prompted']=True
@@ -10758,7 +10833,19 @@ class App:
             save_stats()
 
     def on_close(self):
+        if _update.get('downloading'):
+            _update['cancel'].set()
+            request_stop()
+            if not getattr(self,'_closing_for_download',False):
+                self._closing_for_download=True
+                self.root.after(100,self._wait_download_close)
+            return
         if not _update.get('install_launched'):
+            staged=_update.get('staged')
+            if staged and _update.get('lockfile'):
+                try:os.remove(staged)
+                except OSError:pass
+                _update['staged']=None
             release_update_lock()
         if self.geo_job:
             self.root.after_cancel(self.geo_job)
@@ -10771,6 +10858,13 @@ class App:
         except Exception:
             pass
         self.root.destroy()
+
+
+    def _wait_download_close(self):
+        if _update.get('downloading'):
+            self.root.after(100,self._wait_download_close)
+        else:
+            self.on_close()
 
 
 class KeyButton(tk.Label):

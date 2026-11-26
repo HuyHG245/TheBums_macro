@@ -20,7 +20,7 @@ set "HYBRID_FORCE=0"
 if /i "%~1"=="hybrid" set "HYBRID_FORCE=1"
 if /i "%~2"=="hybrid" set "HYBRID_FORCE=1"
 
-for %%F in (main.py requirements.txt version_info.txt image\thebums.ico updater.ps1 thebums_reconnect.py thebums_features.py thebums_hybrid_ai.py) do (
+for %%F in (main.py requirements.txt version_info.txt image\thebums.ico updater.ps1 thebums_reconnect.py thebums_features.py thebums_hybrid_ai.py thebums_update_download.py) do (
     if not exist "%%F" (
         echo Missing file: %%F
         goto :fail

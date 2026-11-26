@@ -229,3 +229,27 @@ Settings > Detection > Recognition Engine: opt-in is selectable while stopped.
 If the independently verified local ONNX model/runtime is missing, Standard/OpenCV
 remains ACTIVE and the opt-in is pending. Restart or toggle off/on to recheck.
 This is not an active AI model test until the verified model is available.
+
+Auto Update reliability (development candidate; no new release tag yet):
+- Download retry: initial request plus up to five retries (2/4/8/16/32s).
+- Resume only inside the same download; valid 206 Content-Range required.
+- Updates footer shows percentage; Activity shows transfer speed and ETA.
+- Click Updates while downloading to cancel. Closing the app cancels and waits
+  for the worker to release its reservation; an in-flight network read can take
+  until its timeout. A manual failed retry sequence offers the official release page.
+- Test network loss before and during download, cancellation, successful download,
+  explicit Stop before installation, restart health check and rollback on Windows.
+- Never ship a fake SHA-256 or change the official release asset name.
+
+v1.4.1 release candidate – updater transaction checks:
+- Build the default one-file EXE; onedir builds cannot be updated by replacing one EXE.
+- Check the download footer percentage, cancel, reconnect and retry, including a slow transfer.
+- If an abandoned .updating reservation exists, close all macro and installer processes
+  before clearing .updating, .new and .new.part. Never delete a live install reservation.
+- After verified download, explicitly Stop before installation. Test the ready state while idle.
+- Test a refused PowerShell launch, tampered staged EXE, healthy restart and rollback in a
+  disposable installation. The new helper verifies SHA-256 again before replacing the EXE,
+  uses a transaction-specific startup marker, and will not restore an old backup if this
+  transaction did not attempt replacement. Future releases must retain marker compatibility.
+- Older v1.3/v1.4 users with a stuck updater may need one manual installation of v1.4.1.
+- Source and onedir builds should use manual downloads. Windows end-to-end validation pending.
