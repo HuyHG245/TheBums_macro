@@ -1,0 +1,84 @@
+The Bums Macro v1.3 – One shared offline Hybrid AI model (MAINTAINER ONLY)
+=========================================================================
+
+STATUS: The current source does NOT have enough real labeled game crops to
+produce a verified shared AI model. This is a real blocker, not an install bug.
+Do NOT mark fake or template-only data as validated in a manifest.
+
+1. From REAL Roblox gameplay, privately collect cropped candidate regions:
+   Retry buttons/text, disconnect/reconnect screens, loot symbols, plus many
+   hard-negative lookalikes and empty/no-target regions. Do not record any
+   PS code, chat, player username, Discord or private desktop contents.
+   The developer capture helper never sends Roblox inputs or uploads images:
+     python developer/hybrid_dataset.py capture --split train        --session pc1_morning001 --label retry_text --roi 480,300,140,45        --count 60 --interval 0.4
+   IMPORTANT: the coordinates above are an EXAMPLE, not real screen positions.
+   ROI is x,y,width,height in absolute desktop coordinates. Capture only when
+   the intended element is in that ROI. Do not share raw private captures.
+
+2. Manually curate all crops into this structure:
+     datasets/hybrid/train/<session>/<label>/*.png
+     datasets/hybrid/val/<different_session>/<label>/*.png
+     datasets/hybrid/test/<another_session>/<label>/*.png
+   Valid labels are the names of existing target PNGs listed in
+   thebums_hybrid_ai.GATES, and __background__ for hard negatives.
+   All inputs MUST be actual gameplay UI crops, not the source template PNGs.
+   Each split uses different recording sessions (and ideally screen scale,
+   UI quality, devices). Repeated video frames are NOT independent sessions.
+   The model uses 96x96 inputs; include varied resolution/scaling and effects.
+
+3. Audit for missing labels, duplicates across sessions and insufficient real
+   negatives. Requires >=500 HARD NEGATIVES in unseen TEST sessions:
+     python developer/hybrid_dataset.py audit --root datasets/hybrid --release
+
+4. On maintainer computer only, install developer dependencies:
+     pip install -r developer/requirements-hybrid-training.txt
+
+5. Run trainer. Do not train into an existing verified model folder:
+     python developer/train_hybrid.py --root datasets/hybrid --out model_candidates/v1 --epochs 35
+
+   It fits a small CNN on TRAIN, tunes probability temperature only on VAL,
+   evaluates once on held-out TEST, and requires strong per-class precision,
+   recall, calibration and zero false accepts from tested hard negatives.
+   Failure writes only hybrid_validation_report.json, not an enabled model.
+   Pass exports a CPU ONNX model + checksum + validation report/manifest.
+
+6. Independently test on Windows/Roblox and compare false-click rates versus
+   Standard/OpenCV, including window resolution, UI scaling, low graphics,
+   rare loading/reconnect transitions, Retry, loot, and unexpected HUD.
+   No click or mission is allowed merely because the AI probability is high:
+   existing OpenCV gates, ROI, and multi-frame checks remain authoritative.
+
+7. Copy approved outputs into models/, and run:
+     python developer/check_hybrid_model.py --models models
+   Then build.bat automatically embeds model + CPU ONNX Runtime. setup.bat
+   automatically installs Runtime when a verified bundled model exists.
+   End users do not train or install a separate model.
+
+   The developer must actively review private data and results before any
+   public GitHub upload. datasets/, training_runs/ and private screenshots
+   remain gitignored.
+
+
+PRIVATE VIDEO REVIEW INDEX (DEV ONLY)
+-------------------------------------
+The collector does NOT automatically label frames. Use this optional local
+index to find candidate timestamps before choosing a cropped ROI.
+
+1. Extract the developer branch and install ordinary app dependencies.
+2. Keep the MP4 on your own computer. Example commands from repo root:
+     python developer/video_review_index.py --video "20261123-0655-33.4962075.mp4"
+     python developer/video_dataset_collector.py --video "20261123-0655-33.4962075.mp4"
+3. In Collector, click "Load local review suggestions" and select the
+   datasets/hybrid/review_<video SHA256 prefix>.json generated in step 2.
+4. Browse Previous/Next suggestion, visually confirm the correct element,
+   draw an ROI and confirm the label/privacy before saving. Completed/Failed
+   are navigation context ONLY, NOT classifier labels at this stage.
+5. Never place train/val/test crops from the same video recording in more
+   than one split; do not treat copies as independent recording sessions.
+6. Run the real dataset audit before any training:
+     python developer/hybrid_dataset.py audit --root datasets/hybrid --release
+
+No recording, extracted crop or review index should be committed to GitHub:
+the datasets/ directory and video extensions are gitignored.
+This index is based on the existing OpenCV templates and may generate
+incorrect/missing timestamps. It is an aid to manual review, not AI.

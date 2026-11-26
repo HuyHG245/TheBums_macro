@@ -4,16 +4,18 @@
 
 The Bums Macro is an independent keyboard/mouse automation application for Roblox: Attack on Titan Revolution. It is not affiliated with Roblox or the game. Use it in accordance with applicable game rules.
 
-> **Status:** v1.3 source snapshot for Windows. Reconnect, the updater and several beta features still require Windows/Roblox end-to-end verification. **Background Mode is In Development and cannot be enabled.** The default Standard Mode remains available.
+> **Status:** v1.4 source snapshot for Windows. Reconnect, the updater and several beta features still require Windows/Roblox end-to-end verification. **Background Mode is In Development and cannot be enabled.** The default Standard Mode remains available.
 
-## Quick start — TheBumsMacro_v1.3 source ZIP
+## Quick start — TheBumsMacro_v1.4 source ZIP
 
-**This ZIP contains the full v1.3 source, not a prebuilt Windows EXE.** Extract to a separate folder, especially if you already have a working installation.
+**This ZIP contains the full v1.4 source, not a prebuilt Windows EXE.** Extract to a separate folder, especially if you already have a working installation.
 
 1. Install **Python 3.10+ on Windows** and check **Add Python to PATH**.
 2. Double-click **`setup.bat`** once (internet connection required for dependencies).
 3. Double-click **`run.bat`** to open the Beta application.
 4. Optionally double-click **`build.bat`** to build `TheBumsMacro.exe` on Windows.
+
+For the existing Grid v11.5 analytics path, run `run-grid-v11.4.bat` instead of `run.bat` (the legacy launcher name is retained for compatibility). See `WINDOWS_PLAYTEST_README.txt` for v1.4 Heatwave, chest and reconnect checks.
 
 If the app does not open, run ` .venv\Scripts\python.exe main.py ` in a terminal from this folder to see any error messages.
 
@@ -106,11 +108,20 @@ experimental Background Input Diagnostics interface and module have been
 removed from this source release. Ordinary **Settings → Detection → User
 Diagnostics** remains available.
 
-**No trained, gameplay-validated ONNX model is bundled.** The Hybrid AI option
-requires a validated model and optional CPU ONNX Runtime; otherwise Standard
-OpenCV recognition is used. See [models/README.md](models/README.md) for the
-expected model and manifest. Use `setup-hybrid-ai.bat` optionally; `setup.bat`,
-`run.bat` and `build.bat` retain Standard behavior.
+**No trained, gameplay-validated ONNX model is bundled in this source version.**
+Users can opt in via Settings > Detection > Recognition Engine. Until an
+independently verified model is installed, the UI explicitly displays
+Standard/OpenCV ACTIVE and Opt-in pending. The opt-in preference is saved;
+restart or toggle off/on with the macro stopped to retry model initialization.
+No unvalidated model is enabled. Standard/OpenCV continues to work. Model training uses **one shared model for all users**, not
+one model per machine. See `developer/HYBRID_TRAINING_GUIDE.txt` for developer dataset/training steps.
+
+**When a verified shared model is released**, it will be shipped with the app.
+`setup.bat` will automatically install its CPU runtime for source users;
+`build.bat` will automatically embed both the model and its CPU runtime into
+Windows EXE releases. End users will not install or train model files manually.
+No API, cloud inference or user training is involved. Standard/OpenCV and
+original recognition PNGs remain supported.
 
 ## Settings navigation and session tools (development build)
 
@@ -163,7 +174,7 @@ Tkinter smoke test and pure-data tests in a non-Windows development environment.
 Actual Roblox input, capture, updates, notifications and crash recovery still
 need Windows-level verification before being considered production ready.
 
-## Stability / Shared Scan (v1.3)
+## Stability / Shared Scan (v1.4)
 
 **Background input remains unavailable.** The Background Mode switch is labeled
 *In Development*, is non-interactive, and cannot be enabled using old
@@ -215,3 +226,11 @@ PS Code is saved locally and excluded from shared preset codes and diagnostics.
 Image Reconnect now types each alphanumeric character with explicit key-down/up
 and a short delay to reduce missed characters on Roblox. Entry still requires
 Roblox to have focus in Standard Mode.
+
+### Grid v11.4 — Windows playtest
+
+Extract the branch ZIP first. Double-click **run-grid-v11.4.bat** in the extracted folder, finish setup if prompted, then start your usual raid macro. Use 64-bit Python 3.11 or 3.12. First launch installs CPU PyTorch and checks that both quantity models can load.
+
+The local observer consumes existing watchdog screenshots and logs Gold/Gem candidates. After a reward screen, let the run continue into the next mission and stop the macro before closing its window. Open **logs/grid114/** and share the newest JSONL for review. Each file records observations, finalized events, and sampled/dropped frame counts. A run with no detected rewards still creates a log. Confirmed rewards are credited once per mission and currency to a playtest session total shown in Activity and recorded in the JSONL. Only events with ledger_allowed=true contribute. Totals start fresh on each Grid launch. Use **run.bat** for the regular mode.
+
+Mission and raid webhooks include REWARDS before the screenshot. This run shows confirmed Gold, Gem and perk quantities. Session totals start on Start. A question mark means the amount is unconfirmed. Launch with run-grid-v11.4.bat to enable recognition.

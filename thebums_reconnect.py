@@ -52,7 +52,15 @@ REGIONS = {
     'create': (.40,.71,.66,.83),
     'start': (.46,.70,.69,.83),
 }
+# New Raid markers are deliberately separate from the original Mission assets.
+RAID_REGIONS = {
+    'raids': (.32,.27,.50,.44),
+    'attack_selected': (.29,.26,.56,.37),
+    'female_raid': (.60,.54,.76,.63),
+}
+RAID_ASSETS = tuple(RAID_REGIONS)
 THRESHOLDS = {name:.82 for name in REGIONS}
+
 THRESHOLDS.update({'reconnect':.90, 'slot_a':.86, 'select':.85,
                    'start':.88, 'generate':.85, 'ps_input':.87})
 
@@ -68,6 +76,9 @@ _CLIENT_UI_B64 = {
     'home_game_title': 'iVBORw0KGgoAAAANSUhEUgAAAJoAAAAqCAAAAABuXh2+AAABbElEQVRYw+1X0ZKDIAxknf7/L+9ZQ4EEFLRwN3OTfUBLQ1hCAmsIDodjIcivhr+0sxBwPIu2mjCgwyg+xYyYQ20K8KGPMC9qu0fKsuWNMk0KQJotRy72iT2q+FonTbsTbPWC44qRfheN3iyZl8H+qxxqJyd2vailETgSJLbZHyrDdx/IkoDlpp2c2g3lWpW3NlIlSVnCSLVOqNBWQfLrY+SJk02N39FKF5j9Lnd0LCB4UK9b7YQqZfdGjk6kt8zt6OtMqpw8pYaSH2O7NzGUaLBAl5lx4nA4HP9cyQ7eobQHb0fgcvEh+qrl2l1J+yvUDoXDpCeJkEVqKR4L/cooXm9r2AfXe6lheKEvoLTufQ17+9sg3dhRu+YbnDa1QB3IK607J2qilZm/M0yEzhIOq8vAVCn/UslsLSFpj4teBs3MsOsySHoWTS3LDw2Gca07gRrkIKBKvVLLIm0z0lWAFcwcDodjgXBdKGEH8AOBXKgkUyC3lAAAAABJRU5ErkJggg==',
     'game_detail_title': 'iVBORw0KGgoAAAANSUhEUgAAAawAAAAvCAAAAACa8KGyAAACRElEQVR42u2Z63bjIAyEPT55/1eenr2cBoME4ua4u/P9aFOXKCOBJCDHIYQQQgghhBBCCCGEEOLRIH9A62EnnDHBQuCEOfqOrnSG8zGL8LK8IywVNynatwbwIDlDnP9RFeFPd+Blu/XBFAKbpfr5zeSWyeJTPOe6EODbNeJfyyy8Z4zfP3B5/Z5W5NOM6maFefhwsVltDswscsRU8c7MIDxXkg5lyKGtqk9Wb89iNMPI6++DzhutuboM4lhGFwLipox3Fkk9WmUs21xWs8Y2GPQf0B9lDOJgZOhPX8sUncRnzZVuWdMehsogkhaPJL/T179GIO0DSQWBWwSTmpF0D0T9qApom0o/HVlgkRkoVTbkrPGwL7MY3mkAeZFD+tzbIqCojBis56UA1xR/Y5VmVnYkgz1mnYe7zll0HqF5mbBwe4bQiEIFsm4zIW23h2UZ5PD8dA0g1i+Q6GQyPN0zKjecE16e/9XP+vhxjH2zxNvjeuMNRtfZ9eOH59ityLXj5zcm3CNvLefI4g1cL6CxB8J0YuGG6D4s484sAn9ZsIjy2UJkGezMQvoz8t4s1lS2TrfbPTxDq9gRYVwfsH3vwMmUcgT0GiHdUNdUsl59uHM1vuzSkhZ5Zhtc/Plv0RPyZo3s6hRJDGa+CrQExLuWKfVoq7Q/8lqP0zG4P7NQLXYwejYihRDDtcwTMFMI4fyFymm81eO2dLvzGJktFMdyIBA9dIfYjcXEvQBMGWipRGD1TnsohBBCCCGEEEIIIYQQQoh7+ALC6uwzbzcgDwAAAABJRU5ErkJggg==',
 }
+_CLIENT_UI_B64['leave_256'] = 'iVBORw0KGgoAAAANSUhEUgAAAEAAAAATCAAAAAAFGFRbAAABhUlEQVQ4EaXBP2gTYRjA4d+bDi2CyiE2WgK6CCaglkpBePk+aHuCglAdO3cSg3+GkqKuB4KISzo4tOLcHHapWIkgElxUvMMhQ5CUUKGCrYPWQbF653If3cI9jyj5iJKPKPmI4rAmoE+iOKwJ6JMoDmsC+iSKw5qA/ypT3nYr4si5E/u+PuteLtWBa5+eU5nytlsRDlEc1gSkRv1wY2Qm7Izvf/fLP/3g6Gz9C4evL2yO+uHGyEzYISOKw5qARKG20gbfWyZxYO5x9+bHJpOVeqG20gbfWyYjisOagESxSmp9kWOnSoeGGvHkmYfceN8qVkmtL5IRxWFNQKJYXeqSujj+pvNtrhF7tx7tXr3/vVhd6rKHKA5rAhID89EqiaHbTz8weLcRM9vbLT1hYD5aZQ9RHNYEpMam16JCuf3zztuX3qXjYcxZ8+d1DGPTa1Gh3P5BRhSHPU9ic4HyxPBOr7l18sLBzy+uvIoZrP299xsoTwzv9JpbZETJR5R8RMlHlHxEyecfbZR1dcUxfDkAAAAASUVORK5CYII='
+_CLIENT_UI_B64["body_256"] = 'iVBORw0KGgoAAAANSUhEUgAAAWEAAAA/CAAAAAAUZyY4AAAPMElEQVR4Ae3BfVCU94HA8e+zazSJJBFd/QGxgxlj66oI61Zj+7jLIGuKsYRftkDO3Glt7q7ejdt0OjdhadPtP89s73qZDq3EnM+dWmORpImQDQoKNag548uVl6UCK2eML2cMEdQGMBefheUeSLg0HTuxvdsu0+HzUVQmxJWiMiGuFJUJcaWoTIgrRWVCXCkq8eaa+eowv5fDqxn8/5G2bcSbFDq3T1EZ43YFuZWZT2kGf5SZT2kGFKY+P8Tv5fBqBrcw8ynN4A8nbduIE/cqhj9472QnUujcPkVljNsV5FZmb9QM/iizN2oGn8Hh1QxuYfZGzeAPJ23biBO3K2hJWvzwq61S6Nw+RWWM2xXkVuZu0Az+KHM3aAafIetrmsEtzN2gGfzhpG0bceJ2BYEnpv6bFDq3T1EZ43YFGWXPtfWfOB7jc3kpA6cbVy63wM6zmB70iP6Og0P2XFv/ieMxZOxC9rTu6l5k7EL2tO7qXliQm3ztaBge9Ij+DutDFth5Vgod7Lm2/hPHY8jYhexp3dW9jMhcmXT5HVUz1g9WQp69DBbkJl87GgZWL7fAzrP2XFv/ieMxTCnL593dW3cOGbuQPa27uhfT+sFKyLOXIWMXsqd1V/cibduwffONozJ2IXtad3Uv2HNt/SeOx1bk/HCIJx74xxiPD78sYxeyp3VX9zJiQW7ytaNh5NDllX26HLq8sk/HnmvrP3E8hhy6vLJPZ5TbFQRWzy+TQocFucnXjoZJWT7v7t66c3wuL2XgdONNFuQmXzsa5rcoKmPcriAjsgpqIqlF7XUWf0tjcmbjkMOrGYzIKKxvvXf+kayCmkhqUXsdMrPlkLJuYBcys+WQsm5gF1meqktpa6vOZBTWt947/4jDqxkghU5WQU0ktai9DpnZckhZN7AL05JH97VPfyRdM9YPVkKevYwsT9WltLVVZwCHVzPIKqiJpBa112Faek+T4Vn845sys+WQsm5gF6b1g5WQZy9DZrYcUtYN7ELatt39zbN7kZkth5R1A7vIKqiJpBa118361rYLllLj5YuKv6FFZrYcUtYN7MKU5am6lLa26oycF2mMRuW8SGM0mlVQE0ktaq9Dzos0RqOMcruCwAZ2SqGT5am6lLa26szSe5oMz+IfR/0tjcmZjUNZnqpLaWurzvAJRWWM2xXEZC1pPQAZReW/eab+OCaHVzMwWUs6agBrSesByCgq75EpW2FFdhCZshVWZAct/lAEPMnVJR01mBxezQApdGtJ6wHIKCrvkSlbYUV2ELCUdOwFh1cz1g9WQp69zOIPRcCT/Arg8GqGtaT1AGQUlffwkXuf/tnbMmUrrMgOYlo/WAl59jJkylZYkR1E2n624WZlDJmyFVZkB60lrQcgo6i85x9aG9PXXLrxesqmZ/tkylZYkR0ELP5QBDzJr8j0zcMg0zcPYy1pPQAZReU9Mn3zMB9zu4LKPUvd2y9KoVv8oQh4kl/BdO/TP/uvZ+qPAxZ/KAKe5Ff4hKIyxu0KYhK+ii5I8oeal65+ty1s4PBqBibhq4wAwlfRBUn+ULMUOjhlACl0cMqA8DHi/D5fZQSTw6sZIIUufBVdkOQPNUuhg1MGgJlPvdQBDq9mrB+shDx7mfAx4vx2wOHVDOGr6IIkf6gZU3rG7Bl37mmTQgenDGBaP1gJefYypNDBKQNI2/WsX7SDFDo4ZUD4KrogyR9qzhfbcie9++WtX3aWI4UOThkAhI8R57dLoQNS6CB8FV2Q5A81S6Ezxr0KBt49cgEpdOFjxPntpGfMnnHnnralq99tCxvCx4jz2/mEojLG7QpiEr6KLphaGmrm7oyHpmy77vBqBibh230aEL6KLphaGmqWQgenDCCFDk4ZEL4d5zAJ3+7TmBxezQApdOGr6IKppaFmKXRwygAw/Tu7T4PDqxnrByshz14mfDvO8TGHVzOEr6ILppaGmoHVS4+duf70njYpdHDKAKb1g5WQZy9DCh2cMoB0XG9buvlDpNDBKQPCV9EFU0tDzfP/4ocbXu8u+ZH36n6k0MEpA4Dw7TjHCCl0QAodhK+iC6aWhpql0BnjdgUZJYUufDvOMWL10mNnrj+9p427Mx6asm2yb8c5foeiMsbtCmKy+psaYFFxeQ8w6dutjYuLgh9ispa27Aes/qYGWFRc3iOFDk4ZQAodnDJgLQ3XYrKWtuzHtLgo+CFIoVv9TQ2wqLi8RwodnDIAWAJvHgSHVzOKk3bAY3PKrKXhWj62uCj4odXf1ACList74M7vvdrKlO/vaZNCB6cMYCpO2gGPzSlDCh2cMoBcsPX6xvdeRQodnDJg9Tc1wKLi8p7J33258J+if3/00V+8hRQ6OGUAsJaGaxkhhQ5IoYPV39QAi4rLe6TQGeN2BRklhW4tDddiuvN7r7Yy5ft72oBJ3249Uhqu5XcoKmPcriAjHPk1kbTCztr7H27oTvnG3raUTdUdyk1g2SN1p5KWNyzIr4mkFXbWIoUOThlACh2cMsCSgvqwxR4ZWPZI3amk5Q3Jm6o7lJtS6DjyayJphZ21SKGDUwYwPbxsz9n75QzNUD3bryz/4nAZSwrqwxZ7ZABI2VTdoSzIr4mkFXbWApZnfvV68lfnVLVJoYNTBjCpnu1Xln9xuAwpdHDKANK2jbSNP39LCh2cMoAjvyaSVthZCxvuiO5k1Zy0H0aRQgenDGBaUlAfttgjA1LogBQ64MiviaQVdtYihQ7FaVuigNsVZNSaueXDSwrqwxZ75INnfvV68lfnVPU+3NCd8o29bUsK6sMWe2SATygqY9yrMHVvYWGOrf/ksdgUNfO+vqY3IHeZ9bVTmBZnz3i/8/DNhTm2/pPHYkihg1MGkEIHpwyAPWfWjYsHr7I4e8b7nYdv5i6zvnZKCh0W5tj6Tx6LIYUOThnANGlV5uS3mtZpxmT5eePNPk8Z2HNm3bh48Cqm3GXW104tzLH1nzwWwzQ/7753Gh473CaFDk4ZwDRZft54s89ThhQ6OGUAadsGa+Y/t1ro4JQBWJhj6z95LAZfXt3w78z567M7QQodnDLACHvOrBsXD16VQgek0DEtzLH1nzwWQwodHk/dEgXcriCj0p8I78eeM+vGxYNX5+fd907DY4dPq5n39TW9AfacWTcuHrzKJxSVCXGlqEyIK0VlQlwpKhPiSlGZEFeKyoS4UlQmxJWiMiGuFJUJcaWo/NmY+ZRmMO4oKn82Zm/UDMYdReXPxtwNmsG4o6iMH3Lo8so+nQW5ydeOhuFBj+jvODhkz7X1nzgeQ8YuZE/rru5Fxi5kT+uu7oUFucnXjobhQY/o77A+ZIGdZxlnFJXxQ86LNEajWZ6qS2lrq85kFNa33jv/SFZBTSS1qL0OmdlySFk3sAuZ2XJIWTewiyxP1aW0tVVnMgrrW++df8Th1QzGHUVl/JDpm4ex+EMR8CRXl3TUANaS1gOQUVTeI1O2worsIDJlK6zIDlr8oQh4kqtLOmowObyawbijqIwfUuggfIw4v89XGQGEr6ILkvyhZil0cMoAUujglAHhY8T5fb7KCCaHVzMYdxSV8UMKHYRvxzlMwrf7NCB8FV0wtTTULIUOThlACh2cMiB8O85hEr7dpzE5vJrBuKOojB9S6GAtDddispa27Aes/qYGWFRc3iOFDk4ZQAodnDJgLQ3XYrKWtuzHtLgo+CHjjqIyfkihA0sK6sMWe2Rg2SN1p5KWNyzIr4mkFXbWIoUOThlACh2cMsCSgvqwxR4ZWPZI3amk5Q3Jm6o7lJvFaVuijCOKyvghhY7JnjPrxsWDV1mcPeP9zsM3F+bY+k8eiyGFDk4ZQAodnDIA9pxZNy4evMri7Bnvdx6+mbvM+tqpx1O3RBlHFJUJcaWoTIgrRWVCXCkqE+JKUZkQV4rKhLhSVCbElaIyIa4UlcQoOPU2/zcOr2ZwW2xrXiBhFJWESP3Lnwy6V2EyND6DstQ5c+js4W4+zeHVDD4tPXf2h6frb5L1NUw/GmB63tzh/zzQt/FoB4miqCTEY9eO4HYFuQ3K4/fve/vO7KH9fJrDqxl8yvRN9eFpxe+9wpeW/ZQRU33NJ62uk1cylm0nURSVRLjju+XXcbuC3Ial+c9d4RayvqYZfFrSACws1gZXPrCdEWum/5wRd5RuuUaCKCqJ8EDhs+B2BRklhy6v7NPl0OWVfTr2XFv/ieMx5NDllX06sOnqS3zMnmvrP3E8Bpkrky6/o2oGC3KTrx0NU5y2JcpHHvz6P/evueclRvj3/5pRT7Y1kyCKSiKsmFMBbleQUXJepDEalfMijdFoVkFNJLWovQ45L9IYjcKkHxx8g49kFdREUova61jy6L726Y+ka0aWp+pS2tqqM4+nbonykYIvPDtcONsy9d1fXkjyVy6Z23fsP2D1pL0kiKKSCF+5KwTuVZieew+ZvnkYZPrmYawlrQcgo6i8R6ZvHsaU5K9uZZS1pPUAZBSVXy3p2AsOrzboD0XAk/wK/2v23/7yKA9Ob5/08ILnLd/qrbvwhaLdXbjvf5EEUVQSIX+oDtyuIKOk0AEpdBC+ii5I8oeapdAZMekHrx9hlPBVdEGSP3TxqZc6wOHVkn2MOL+dMVP/7oN/HWLEJP+vWr5d0QXrPqjiIftOEkRRSYSv3BUCtyvIKCl0QAodhK+iC6aWhpql0Bn1rd4XGSV8FV0wtTR07ju7T4PDqyX7dpzjt0158r5/eZ+P+C7Vff/ldng0+QXc979IgigqibBiTgW4XUFGSaEDUuhg9Tc1wKLi8h4pdEZ9afVzV4C7/tvqb2qARcXlVwNvHgSHVxsqDdfyWyZ/PXXnRWDKTbizpPHo31yrhiev7GP1HTUkiKKSCA8UPgtuV5BRUuiAFDrgyK+JpBV21iKFzijLX6W9evYul/0nQ478mkhaYWctDy/bc/Z+OUMzlhTUhy32yEBx2pYoTF7/ucouIGPV3vNJ+dOfNx5Yv7djYf7zPTzZ1kyCKCqJcMd3y6/jXsWIH/9GCh2QQse0MMfWf/JYDCl0PmL9kmOGcf7Qu7Awx9Z/8liMSasyJ7/VtE4zsOfMunHx4NXHU7dEwf7E0OBkhchLD2XZom819MF8z4wrB85xR+mWaySIopIQ3qtH+NNZtHwbiaKoJETqEz8d5E/mm292kCiKSmLIX7/Nn4ptzQskjKIyIa4UlQlxpahMiKv/AZXa/BBEk9EOAAAAAElFTkSuQmCC'
+_CLIENT_UI_B64["title_256"] = 'iVBORw0KGgoAAAANSUhEUgAAAI8AAAAiCAAAAABDitV/AAAEvUlEQVRYCc3BbUxVZQDA8f9z5RKldhL0+k4fCrSc0/vBtfmUm+0kimtpKjo5XWcOPGSTjMydtqOmE1e+3MnVdGOW00yMPHChm/hSJ70uY86UofmSwBSV1QdnmNwDCnbRD/durm+2nd9PSFxFSFxFSFxFSFxFSFxFSFxFSFxFSFxFSP5D9rtN5fzPfBZGlGRCkuAPQc+dpmPfdwLrX2NBE09KcIJp8xifhRElmZAk+EM8dH3FVcgpaVrm8KR8mW3aPMZnYURJJiQJ/hCBa0NztJQbCzt4sr4bYto8xmdhREkmJAn+EIFmmLyW7Xt5so48bdo8Jr0GI0oyIUnwhwg0A+UvXShA0x0Vz6w3h3XWl7eBJ3d6Fo3bL5Mye1pmx297LoOmV+8rnJB2bkMraHr1vsIJaec2tALevGnD24+Xt4Mnd3oWjdsn5z0FOCrevGnD24+Xt8MzC9Xnruz6DCNKMiFJ8IcINANF+fcnP9B0R6UwQNztObGU0onENRalbh5P3L1Vx9H0W/1SgQsFoOm3+qUCFwogNTiOuKaCrpTSicQ1/vE2cY6aGhxHXFNBV9oX2TxkREkmJAn+EIFmYE4xU//RdEfF8u0vH/jWlUMsKKCyonNmXdvid3rK6gYZL9/N+1vTubj+5uLZ5F9F07m4/ubi2eRfpTBwe92ZwStHbalcUEBlRefMujafhWlDYeD2ujODV47aUlkYoLwqXX8VI0oyIUnwhwg0A3lLmdKh6Y7KV1m/bLkBiOqM+hLiPLXK0dUw4htP2bea3jU9xsh9lNSj6V3TY4zcR0m9qBmw9hBMKj31YXVGfQm9fBamjagZsPYQTCo9taxq0K8fgc/CiJJMSBL8IQLNwPvzul5H0x2VMZ8rXAnXdKfXEDxAXEaYjdWA5fuhVNMdFZQIpo2mOyooEUw7I8wjrUtqCB6gl8/CtMkI80jrosPs+Bp8FkaUZEKS4A8RaAZ2vdiwBE13VOj/Zs4LnF32bJjNFnEZYTZWAwcGH1yn6Y4KSgTTRtMdFZQIpp0R5pGWD8JstujlszBtMsI80lJUx/a94LMwoiQTkgR/iEAzTFnJpio03VHx3gN/MMU8Ful/cjlxnlrlyKcwrMKztULTHRWUCKaNpjsqKBFM21OrbKqilyfS/+RyeqXXsPoonlplUxW9xMF+tgkjKjCiJBOSBH+IwLWhU7U+LYu60HRH9e64srcte6t3zeHiOVTsj+Xet96b3xM8MtAYE5t7S9MdFZQIpo2mOyooEUybovxY2YnYaLmN4jlU7I/l3rc8dp/o2rRbRfmxshOx0XIbq97o2fDTkE9GYURJJiQJ/hAPXV1+EzTdUccHvcS1LurouzWLuLszHgTHEte95kc03VFBiWDaaLqjghLBtEkLjqVX8em+W7OIuzsjtlqFezme4Fh6FZ8etrM/0PkgzYiSTEgS/CHoudPyc00XoOmOyvPzX1H+bNj5F6TNU4d3Nuw+j3duzohYw57fQdMdFZQIpo2mOyooEUwbvLOmZnZfqjwGafPU4Z0Nu8/Tb+mk1Osr2ryzpmZ2X6o8BplF/pSzZR+PN6IkExJXERJXERJXERJXERJXERJXERJXERJXERJXERJXERJX+ReCW80IPIqoxQAAAABJRU5ErkJggg=='
 _CLIENT_UI_CACHE = {}
 
 
@@ -82,7 +93,7 @@ def _ui_template(name):
     return _CLIENT_UI_CACHE[name]
 
 
-def _find_ui_text(frame, name, roi, threshold=.82):
+def _find_ui_text(frame, name, roi, threshold=.82, scales=(1.0, .9, 1.1, .8, 1.2)):
     """Match an anchored, locally embedded UI label with bounded scaling."""
     if frame is None or not isinstance(frame, np.ndarray) or frame.ndim != 3:
         return None
@@ -97,7 +108,7 @@ def _find_ui_text(frame, name, roi, threshold=.82):
     image = cv2.threshold(image, 185, 255, cv2.THRESH_BINARY)[1]
     original = _ui_template(name)
     best=None
-    for scale in (1.0, .9, 1.1, .8, 1.2):
+    for scale in scales:
         tw=max(8,round(original.shape[1]*scale)); th=max(8,round(original.shape[0]*scale))
         if image.shape[0]<th or image.shape[1]<tw:
             continue
@@ -114,12 +125,102 @@ def _find_ui_text(frame, name, roi, threshold=.82):
     return best if best is not None and best.confidence>=threshold else None
 
 
+def find_scaled_reconnect(frame, template):
+    """Conservative fallback for resized Reconnect dialogs, irrespective of body text.
+
+    Requires the Disconnected title and the white Reconnect label at the
+    expected offset. Does not change the original exact-template path or
+    use the Leave-only route. No click is performed here.
+    """
+    if template is None or frame is None or frame.ndim != 3:
+        return None
+    scales = (1.0, .975, 1.025, .95, 1.05, .925, 1.075, .90, 1.10,
+              .875, 1.125, .85, 1.15, .80, 1.20)
+    title = _find_ui_text(frame, 'disconnect_title', (.35,.30,.65,.53), .78, scales)
+    if title is None:
+        return None
+    h,w = frame.shape[:2]
+    tw = title.width
+    xa = max(0, int(title.x + .18 * tw))
+    xb = min(w, int(title.x + 1.08 * tw))
+    ya = max(0, int(title.y + .95 * tw))
+    yb = min(h, int(title.y + 1.65 * tw))
+    crop = frame[ya:yb,xa:xb,:3]
+    if not crop.size:
+        return None
+    # Include the expected scale inferred from the title and nearby scales.
+    base = tw / _ui_template('disconnect_title').shape[1]
+    best = None
+    for scale in (base, base-.025, base+.025, base-.05, base+.05):
+        t = cv2.resize(template, None, fx=scale, fy=scale,
+                       interpolation=cv2.INTER_CUBIC if scale>1 else cv2.INTER_AREA)
+        bh,bw = t.shape[:2]
+        if bh > crop.shape[0] or bw > crop.shape[1]:
+            continue
+        _,score,_,(x,y) = cv2.minMaxLoc(cv2.matchTemplate(crop,t,cv2.TM_CCOEFF_NORMED))
+        cx,cy=xa+x+bw//2,ya+y+bh//2
+        if not (.42*tw <= cx-title.x <= .85*tw and
+                1.05*tw <= cy-title.y <= 1.55*tw):
+            continue
+        patch = frame[cy-bh//2:cy+bh//2,cx-bw//2:cx+bw//2,:3]
+        if not patch.size or np.mean(np.all(patch>185,axis=2)) < .60:
+            continue
+        if score >= .85 and (best is None or score>best.confidence):
+            best = Match('reconnect',cx,cy,float(score),bw,bh,'opencv_scaled_dialog')
+    return best
+
+
+def find_error_256_leave(frame):
+    """Recognize the specific two-button Error 256 modal, not generic errors."""
+    scales = tuple(x / 100 for x in range(65, 151, 2))
+    if frame is None or frame.ndim != 3:
+        return None
+    h,w=frame.shape[:2]
+    gray=cv2.cvtColor(frame[:,:,:3],cv2.COLOR_BGR2GRAY)
+    xa,ya,xb,yb=int(w*.40),int(h*.32),int(w*.60),int(h*.48)
+    crop=gray[ya:yb,xa:xb]
+    title=None
+    for scale in scales:
+        t=cv2.resize(_ui_template('title_256'),None,fx=scale,fy=scale,interpolation=cv2.INTER_LINEAR)
+        th,tw=t.shape
+        if crop.shape[0]<th or crop.shape[1]<tw: continue
+        _,score,_,(x,y)=cv2.minMaxLoc(cv2.matchTemplate(crop,t,cv2.TM_CCOEFF_NORMED))
+        if title is None or score>title.confidence:
+            title=Match('title',xa+x+tw//2,ya+y+th//2,float(score),tw,th)
+    if title is None or title.confidence<.78:
+        return None
+    base=title.width/143
+    def local(name, dx, dy):
+        tpl=_ui_template(name)
+        best=None
+        for scale in (base,base*.95,base*1.05,base*.90,base*1.10):
+            t=cv2.resize(tpl,None,fx=scale,fy=scale,interpolation=cv2.INTER_LINEAR)
+            th,tw=t.shape
+            cx=title.x+dx*scale; cy=title.y+dy*scale
+            xa=max(0,int(cx-tw/2-12*scale)); xb=min(w,int(cx+tw/2+12*scale))
+            ya=max(0,int(cy-th/2-12*scale)); yb=min(h,int(cy+th/2+12*scale))
+            crop=gray[ya:yb,xa:xb]
+            if crop.shape[0]<th or crop.shape[1]<tw: continue
+            _,score,_,(x,y)=cv2.minMaxLoc(cv2.matchTemplate(crop,t,cv2.TM_CCOEFF_NORMED))
+            if best is None or score>best.confidence:
+                best=Match(name,xa+x+tw//2,ya+y+th//2,float(score),tw,th)
+        return best
+    code=local('body_256',0,94)
+    leave=local('leave_256',-94,185)
+    if code is None or leave is None or code.confidence<.80 or leave.confidence<.86:
+        return None
+    return Match('leave',leave.x,leave.y,min(title.confidence,code.confidence,leave.confidence),leave.width,leave.height,'opencv_error_256')
+
+
 def find_leave_disconnect(frame):
     """Distinct Roblox Leave-only disconnect dialog; require *both* text labels.
 
-    This never mistakes the original 'Reconnect' button for a Leave dialog.
-    The result points to the white Leave button, not the central text.
+    Also recognizes the verified Error 256 two-button dialog.
+    Other errors retain the existing Leave-only recognition.
     """
+    special=find_error_256_leave(frame)
+    if special is not None:
+        return special
     title=_find_ui_text(frame,'disconnect_title',(.33,.30,.68,.53),.85)
     if title is None:
         return None
@@ -360,12 +461,70 @@ class ImageMatcher:
             if tpl is None:
                 raise FileNotFoundError(path)
             self.templates[name] = tpl
+        for name in RAID_ASSETS:
+            path = os.path.join(image_dir, 'rc_'+name+'.png')
+            if os.path.isfile(path):
+                tpl = cv2.imread(path, cv2.IMREAD_COLOR)
+                if tpl is not None:
+                    self.templates[name] = tpl
+
+    def _raid_find(self, frame, name, region=None, threshold=.86):
+        # Raid-specific bounded scale search; keep original Mission matching untouched.
+        tpl = self.templates.get(name)
+        if tpl is None or frame is None or frame.ndim != 3:
+            return None
+        h,w = frame.shape[:2]
+        x0,y0,x1,y1 = region or RAID_REGIONS.get(name, REGIONS.get(name))
+        xa,ya,xb,yb = int(x0*w),int(y0*h),int(x1*w),int(y1*h)
+        crop=frame[ya:yb,xa:xb,:3]
+        best=None
+        for scale in (1., .975, 1.025, .95, 1.05, .925, 1.075, .90, 1.10, .875, 1.125, .85, 1.15, .825, 1.175, .80, 1.20):
+            t = tpl if scale==1. else cv2.resize(tpl,None,fx=scale,fy=scale,
+                interpolation=cv2.INTER_AREA if scale<1 else cv2.INTER_CUBIC)
+            th,tw=t.shape[:2]
+            if crop.shape[0]<th or crop.shape[1]<tw:continue
+            _,score,_,(x,y)=cv2.minMaxLoc(cv2.matchTemplate(crop,t,cv2.TM_CCOEFF_NORMED))
+            if score>=threshold and (best is None or score>best.confidence):
+                best=Match(name,xa+x+tw//2,ya+y+th//2,float(score),tw,th)
+            if scale==1. and score>=.97:break
+        return best
+
+    @staticmethod
+    def _female_border(frame, label):
+        # The supplied Attack card has a solid gold outline only when selected.
+        # Check both horizontal edges of the Female card, relative to its label.
+        h,w=frame.shape[:2]
+        scale=label.width/183.
+        x0=max(0,round(label.x-115*scale)); x1=min(w,round(label.x+115*scale))
+        if x1-x0<100:return False
+        def edge(offset):
+            y=round(label.y+offset*scale)
+            pad=max(4,round(7*scale))
+            strip=frame[max(0,y-pad):min(h,y+pad+1),x0:x1,:3].astype(float)
+            if not strip.size:return False
+            b,g,r=strip[:,:,0],strip[:,:,1],strip[:,:,2]
+            gold=(r>140)&(g>90)&(r>b*1.5)&(g>b*1.3)
+            return bool(np.max(gold.mean(axis=1))>=.85)
+        return edge(-16) and edge(102)
 
     def find(self, frame: np.ndarray, name: str,
              region: Optional[tuple[float,float,float,float]]=None,
              threshold: Optional[float]=None) -> Optional[Match]:
         if frame is None or frame.ndim != 3:
             return None
+        if name in RAID_REGIONS:
+            return self._raid_find(frame,name,region,threshold if threshold is not None else .86)
+        if name=='female_selected':
+            label=self._raid_find(frame,'female_raid')
+            if label and not self._raid_find(frame,'attack_selected') and self._female_border(frame,label):
+                return dataclasses.replace(label,name=name)
+            return None
+        if name in ('raid_create_attack','raid_create_female'):
+            gate='attack_selected' if name.endswith('attack') else 'female_selected'
+            if self.find(frame,gate) is None:return None
+            return self._raid_find(frame,'create')
+        if name=='raid_start':
+            return self._raid_find(frame,'start',threshold=.88)
         h,w=frame.shape[:2]
         x0,y0,x1,y1=region or REGIONS.get(name,(0,0,1,1))
         xa,ya=max(0,int(x0*w)),max(0,int(y0*h))
@@ -383,6 +542,10 @@ class ImageMatcher:
         result = Match(name,xa+point[0]+tw//2,ya+point[1]+th//2,score,tw,th)
         if score >= limit:
             return result  # authoritative original OpenCV path
+        if name == 'reconnect' and region is None and threshold is None:
+            scaled = find_scaled_reconnect(frame, tpl)
+            if scaled is not None:
+                return scaled
         if self.advisor is None:
             return None
         # AI only assesses the original ROI-constrained candidate. The
@@ -425,11 +588,14 @@ class ImageReconnectFlow:
     mission_ready: checks the existing skill/HUD marker to confirm gameplay
     """
     def __init__(self, matcher, capture, click, check, disconnect, progress,
-                 enter_code, mission_ready, server_mode='public', ps_code=''):
+                 enter_code, mission_ready, server_mode='public', ps_code='', destination='mission'):
         self.matcher=matcher;self.capture=capture;self.click=click
         self.check=check;self.disconnect=disconnect;self.progress=progress
         self.enter_code=enter_code;self.mission_ready=mission_ready
         self.mode=server_mode;self.ps_code=ps_code
+        if destination not in ('mission','attack','female'):
+            raise ValueError('Unsupported reconnect destination')
+        self.destination=destination
         if self.mode not in ('public','ps_code','gamepass'):
             raise ValueError('Unsupported server mode')
         if self.mode=='ps_code' and (not ps_code or any(ord(c)<32 for c in ps_code) or len(ps_code)>128):
@@ -538,12 +704,20 @@ class ImageReconnectFlow:
             # screen has been verified; the reported bug concerns PS Code.
             route += [('Ensure VIP Servers','codes','generate'),
                       ('Generate Gamepass Server','generate','play_large')]
-        route += [('Open Missions Menu','play_large','missions'),
-                  ('Select Missions','missions','outskirts'),
-                  # CREATE can already be visible with SHIGANSHINA selected.
-                  # Verify the *central* OUTSKIRTS title changes first.
-                  ('Select Outskirts','outskirts','outskirts_selected'),
-                  ('Create Mission','create','start')]
+        raid=self.destination!='mission'
+        start_marker='raid_start' if raid else 'start'
+        if raid:
+            route += [('Open Raid Menu','play_large','raids'),
+                      ('Select Raids','raids','attack_selected')]
+            if self.destination=='female':
+                route += [('Select Female Titan','female_raid','female_selected')]
+            route += [('Create Raid','raid_create_'+self.destination,start_marker)]
+        else:
+            route += [('Open Missions Menu','play_large','missions'),
+                      ('Select Missions','missions','outskirts'),
+                      # CREATE can already be visible with SHIGANSHINA selected.
+                      ('Select Outskirts','outskirts','outskirts_selected'),
+                      ('Create Mission','create','start')]
         total=len(route)+1
         for n,(label,target,gate) in enumerate(route,1):
             if label=='Ensure VIP Servers':
@@ -551,17 +725,25 @@ class ImageReconnectFlow:
             else:
                 self._step(n,total,label,target,gate,timeout=75 if (target=='generate' or gate=='play_large') else 40)
         # START must be the modal's START, not the button behind the modal.
-        self.progress(total,total,'Start Mission','Detecting',1)
-        button=self._wait_for('start',timeout=35)
-        if not button:raise ReconnectError('Mission START is not visible in the room popup')
+        kind='Raid' if raid else 'Mission'
+        self.progress(total,total,'Start '+kind,'Detecting',1)
+        button=self._wait_for(start_marker,timeout=35)
+        if not button:raise ReconnectError(kind+' START is not visible in the room popup')
+        if raid:
+            fresh=self.capture()
+            if self.disconnect(fresh):raise NewDisconnect('Reconnect returned before START')
+            still=self.matcher.find(fresh,start_marker)
+            if not still or abs(still.x-button.x)>16 or abs(still.y-button.y)>16:
+                raise ReconnectError('Raid START moved before clicking')
+            button=still
         self.check();self.click(button)
-        self.progress(total,total,'Waiting for Mission HUD','Verifying',1)
+        self.progress(total,total,'Waiting for '+kind+' HUD','Verifying',1)
         expiry=time.monotonic()+100
         while time.monotonic()<expiry:
             self.check();frame=self.capture()
             if self.disconnect(frame):raise NewDisconnect('Disconnected while mission was loading')
             if self.mission_ready(frame):
-                self.progress(total,total,'Mission Confirmed','Confirmed',1)
+                self.progress(total,total,kind+' Confirmed','Confirmed',1)
                 return True
             self._sleep(.4)
-        raise ReconnectError('Mission HUD not confirmed after START')
+        raise ReconnectError(kind+' HUD not confirmed after START')

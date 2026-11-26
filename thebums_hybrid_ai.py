@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import json
+import hashlib
 import logging
 import math
 
@@ -59,6 +60,14 @@ class CpuOnnxBackend:
         path = root / filename
         if not path.is_file():
             raise FileNotFoundError(path)
+        expected_sha = meta.get('model_sha256')
+        if expected_sha is not None:
+            if (not isinstance(expected_sha, str) or len(expected_sha) != 64 or
+                    not all(ch in '0123456789abcdef' for ch in expected_sha.lower())):
+                raise ValueError('Model SHA-256 must be a hex digest')
+            actual_sha = hashlib.sha256(path.read_bytes()).hexdigest()
+            if actual_sha != expected_sha.lower():
+                raise ValueError('ONNX model checksum mismatch')
         names = meta.get('labels')
         if not isinstance(names, list) or not names or any(not isinstance(n, str) or not n for n in names):
             raise ValueError('labels must be a non-empty string list')

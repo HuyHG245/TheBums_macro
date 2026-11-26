@@ -1,7 +1,25 @@
-# Female raid Build
+# Female Raid Blood Awakening
 
-## SKill Layouts
-![image](images/layout_female.png)
+## Skill Layouts
+**Before Shift — only two required slots**
+
+Skill 2: **Acoustic Shells**
+
+![Acoustic Shells - Skill 2](images/attack_blood_skill2.png)
+
+Skill 5: **Titan Shifting**
+
+![Titan Shifting - Skill 5](images/attack_blood_skill5.png)
+
+**After Shift — same Colossal Titan build as Attack Titan Raid Fritz**
+
+![After Shift - Colossal Titan](images/layout_attack_after.png)
+
+## Raid opening
+1. Wait for Acoustic Shells in slot 2. Its icon starts the raid routine.
+2. Dash forward once by double-tapping the configured Dash key.
+3. Wait 2 seconds, then press Skill 5 until the Heatwave icon confirms Colossal Shift.
+4. Press Skill 4 once after Shift confirmation. When Heatwave first disappears and returns, leave it enabled. Press Skill 4 again only after the next stable disappearance and return. Skill 5, 3 and 1 each use their own timer; when ready together, they fire in that order.
 
 ## Family and SKill Tree:
 - Fritz
@@ -26,3 +44,10 @@
 - Sparks of Black
 - Shatterpoint
 - Elementalist/Tactician 
+
+## Chests and cutscenes
+The macro finds the left OPEN button automatically. Finish is enabled in the routine only
+after the left OPEN button clears and the chest selection screen is visible again.
+Enable Open Emperor’s Trove under Edit configs to try the right OPEN once with an Emperor Key.
+A missing or unresponsive optional chest is reported in Activity. While Skip is visible,
+the Heatwave tracker discards pending icon transitions and waits for the combat HUD.

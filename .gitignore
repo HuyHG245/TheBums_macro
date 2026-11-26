@@ -1,7 +1,5 @@
-# The Bums Macro - source-only repository
-# Keep runnable templates (image/) and guide illustrations (guides/images/) tracked.
-
-# Python environments, caches and tooling
+# The Bums Macro: source-only repository. Preserve original image/ recognition assets.
+# Python environments, caches and local tooling
 .venv/
 .buildenv/
 venv/
@@ -20,7 +18,7 @@ htmlcov/
 .ipynb_checkpoints/
 pip-wheel-metadata/
 
-# Generated builds / executables / local release archives
+# Builds and download archives
 build/
 dist/
 *.spec
@@ -33,13 +31,16 @@ dist/
 *.zip
 build_revision.txt
 
-# User configuration, statistics and local game data
+# Personal settings, game stats, presets and macro scripts
 config.json
+config*.json
 aotr_stats.json
+*aotr_stats*.json
 stats.json
 settings.json
 user_settings.json
 session*.json
+session_data/
 *.sqlite
 *.sqlite3
 *.db
@@ -52,7 +53,7 @@ user_data/
 userdata/
 profiles/
 
-# Screenshots, recordings, debug traces, crash reports
+# Screenshots, private training crops, recordings and reports
 crash.log
 *.log
 *.trace
@@ -67,8 +68,13 @@ debug/
 logs/
 tmp/
 temp/
+error_snapshots/
+diagnostics_report.json
+datasets/
+training_runs/
+model_candidates/
 
-# Credentials, access tokens and environment-specific files
+# Credentials and machine-specific secrets
 .env
 .env.*
 !.env.example
@@ -93,27 +99,6 @@ token*.json
 *.backup
 *.old
 *.tmp
-
-# Editor / OS metadata
-.vscode/
-.idea/
-*.swp
-*.swo
-.DS_Store
-Thumbs.db
-desktop.ini
-
-# README.md is the only Markdown file in the source distribution.
-# In-app guides ship as guides/*.txt so the application can still show them.
-*.md
-!/README.md
-
-# Local app backups and private exports
-config*.json
-*aotr_stats*.json
-session_data/
-private/
-secrets/
 *.env.local
 *.token
 *.session
@@ -128,3 +113,27 @@ secrets/
 *.mkv
 *.mov
 *.webm
+private/
+secrets/
+
+# Native editor metadata
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Only root README.md is tracked as markdown; keep in-app *.txt guides
+*.md
+!/README.md
+
+# Model data: release ONE verified shared ONNX model only after validation
+models/*.pt
+models/*.pth
+models/*.onnx
+!models/recognizer.onnx
+models/*.json
+!models/hybrid_manifest.json
+!models/hybrid_validation_report.json

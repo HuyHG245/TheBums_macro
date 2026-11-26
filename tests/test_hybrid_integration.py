@@ -283,22 +283,45 @@ def test_switch_from_beta_to_standard_does_not_require_ai(macro_restore, monkeyp
     m = macro_restore
     monkeypatch.setattr(m, 'running', lambda: False)
     monkeypatch.setattr(m, 'save_stats', lambda: None)
-    def missing_model():
-        m.settings['recognition_mode'] = 'standard'
-        return None
-    monkeypatch.setattr(m, 'get_hybrid_advisor', missing_model)
+    monkeypatch.setattr(m, 'hybrid_install_status', lambda: (False, 'No model'))
+    monkeypatch.setitem(m.settings, 'hybrid_opt_in', False)
     class FakeFlag:
         value = True
         def get(self): return self.value
         def set(self, v): self.value = v
-    obj = types.SimpleNamespace(v_hybrid=FakeFlag(), say=lambda *a, **k: None)
+    messages = []
+    obj = types.SimpleNamespace(v_hybrid=FakeFlag(), say=lambda *a, **k: messages.append(a[0]))
     m.SettingsWindow.on_hybrid_toggle(obj)
     assert m.settings['recognition_mode'] == 'standard'
-    # Real method's explicit missing-model guard must force user back to Standard.
-    assert obj.v_hybrid.get() is False
+    assert m.settings['hybrid_opt_in'] is True
+    assert obj.v_hybrid.get() is True
+    assert 'Opt-in pending' in messages[-1]
     obj.v_hybrid.set(False)
     m.SettingsWindow.on_hybrid_toggle(obj)
     assert m.settings['recognition_mode'] == 'standard'
+    assert m.settings['hybrid_opt_in'] is False
+
+
+def test_opt_in_requires_verified_model_and_respects_running(macro_restore, monkeypatch):
+    m = macro_restore
+    monkeypatch.setitem(m.settings, 'hybrid_opt_in', True)
+    monkeypatch.setattr(m, 'hybrid_install_status', lambda: (True, 'ready'))
+    monkeypatch.setattr(m, 'get_hybrid_advisor', lambda: None)
+    assert m.apply_hybrid_preference()[0] is False
+    assert m.settings['recognition_mode'] == 'standard'
+    assert m.settings['hybrid_opt_in'] is True
+    monkeypatch.setattr(m, 'get_hybrid_advisor', lambda: object())
+    assert m.apply_hybrid_preference()[0] is True
+    assert m.settings['recognition_mode'] == 'hybrid_beta'
+    monkeypatch.setattr(m, 'running', lambda: True)
+    class Flag:
+        value = False
+        def get(self): return self.value
+        def set(self, value): self.value = value
+    obj = types.SimpleNamespace(v_hybrid=Flag(), say=lambda *a, **k: None)
+    m.SettingsWindow.on_hybrid_toggle(obj)
+    assert obj.v_hybrid.get() is True
+    assert m.settings['recognition_mode'] == 'hybrid_beta'
 
 
 def test_loot_beta_rejects_nonconsecutive_false_hits(macro_restore, monkeypatch):
@@ -471,3 +494,23 @@ def test_leave_navigator_requires_successive_verified_screens():
     with pytest.raises(rc.ReconnectError,match='target moved'):
         moved._click_verified('leave','Leave disconnected game','home_game',3)
     assert not did_click
+
+@pytest.mark.parametrize('direct_detail',[False, True])
+def test_error_256_leave_navigation(direct_detail, monkeypatch):
+    from test_reconnect_error_256 import frame
+    screens=_roblox_client_frames()
+    screens[0]=frame()
+    if direct_detail:
+        screens.pop(1)
+    class FakeSlot:
+        def slot_a_select(self, f):
+            return rc.Match('slot_select',640,645,1.,110,25) if f is screens[-1] else None
+    index=0; clicked=[]
+    def capture():return screens[index]
+    def click(hit):
+        nonlocal index
+        clicked.append(hit.name); index+=1
+    monkeypatch.setattr(rc.time,'sleep',lambda _:None)
+    navigator=rc.RobloxLeaveNavigator(FakeSlot(),capture,click,lambda:None,lambda *a:None)
+    assert navigator.run(first_frame=screens[0])
+    assert clicked==(['leave','game_play'] if direct_detail else ['leave','home_game','game_play'])

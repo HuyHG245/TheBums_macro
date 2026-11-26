@@ -36,12 +36,11 @@ and presses E at the start of the Raid or during phase transitions.
 The macro starts when `acoustic_shells.png` is detected on the Skill 2 HUD slot.
 
 1. Immediately press **Skill 2 — Acoustic Shells**.
-2. **Forward Dash × 1:** double-tap **Space, Space** (or the Dash key configured in Keybinds).
+2. Wait **1.5 seconds** after casting Acoustic Shells.
 3. Repeatedly press **Skill 5 — Titan Shifting** until `heatwave.png` confirms
    that Colossal Titan has shifted successfully. **No automatic timeout**.
 4. If Phase 1 cutscene appears, optionally skip it with E.
-5. During Colossal combat, Skill 4 **Heatwave** uses the same two-cycle icon detection
-   as Fritz; **Skills 5, 3 and 1** run on independent timers until the CHESTS screen.
+5. During Colossal combat, Press Skill 4 once after Shift confirmation. When Heatwave first disappears and returns, leave it enabled. Press Skill 4 again only after the next stable disappearance and return. Skill 5, 3 and 1 each use their own timer; when ready together, they fire in that order.
 6. Raider's Chest is ON by default; Emperor's Trove is OFF by default.
    Use the Chest 1/Chest 2 **Pick spot** controls in Settings > Macros.
 7. After the real Retry button is detected, the existing results, loot and Retry system

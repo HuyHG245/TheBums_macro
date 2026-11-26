@@ -8,6 +8,7 @@ import ctypes
 import json
 import os
 import hashlib
+import importlib.util
 import queue
 import random
 import re
@@ -31,6 +32,7 @@ import cv2
 import mss
 import numpy as np
 import thebums_reconnect as image_rc
+from thebums_skill_scheduler import BloodSkillScheduler
 from thebums_hybrid_ai import CpuOnnxBackend, HybridAdvisor
 from thebums_features import ConfigPresetStore, SessionHistory, ErrorSnapshotStore, UpdateHistory, _atomic_json
 
@@ -184,7 +186,7 @@ if IS_WIN:
 
 # ----------------------------- SETTINGS ---------------------------------
 APP_NAME = "The Bums Macro"
-VERSION = "TheBumsMacro_v1.3-beta"  # development build; do not publish as stable until Windows tests
+VERSION = "TheBumsMacro_v1.4"  # Windows/Roblox playtest remains required
 
 # --- Update checker (footer > Updates) ---
 UPDATE_REPO = "HuyHG245/TheBums_macro"   # <-- your GitHub "owner/repo" (public). Releases are read from it
@@ -415,6 +417,8 @@ ATTACK_FAMILIES = (ATTACK_FRITZ_KEY, ATTACK_BLOOD_KEY)
 FAMILIES = ("Shiki", "Universal", "Blood Awakening", "Female Raid", OUTSKIRTS_FRITZ_KEY, *ATTACK_FAMILIES)
 DEFAULT_FAMILY = "Shiki"
 FAMILY_LABELS = {f: f for f in FAMILIES}   # what the dropdown shows
+COLOSSAL_RAIDS = (*ATTACK_FAMILIES, "Female Raid")
+FAMILY_LABELS["Female Raid"] = "Female Raid Blood Awakening"
 FAMILY_LABELS[ATTACK_FRITZ_KEY] = "Attack Titan Raid Fritz (Not Recommended)"
 FAMILY_LABELS[ATTACK_BLOOD_KEY] = "Attack Titan Raid Blood Awakening"
 FAMILY_LABELS[OUTSKIRTS_FRITZ_KEY] = "Outskirts Fritz"
@@ -630,7 +634,7 @@ CONFIG_FIELDS = {
            "needs it."),
         _f("chest2", "Chest 2", "spot", None, 0, 20000, "Chests",
            "Screen coordinate of chest 2."),
-        _f("open_chest2", "Open chest 2", "bool", True, 0, 1, "Chests",
+        _f("open_chest2", "Open Emperor’s Trove (uses an Emperor Key)", "bool", False, 0, 1, "Chests",
            "On: chest 2 is opened too. Off: only chest 1 is opened."),
         _f("chest_click_time", "Click spam time", "sec", RAID_CHEST_CLICK_TIME, 0, 30, "Chests",
            "A chest is clicked over and over this long."),
@@ -747,6 +751,12 @@ _ATTACK_SHARED_FIELDS = {
 CONFIG_FIELDS[ATTACK_BLOOD_KEY] = [
     spec for spec in CONFIG_FIELDS[ATTACK_FRITZ_KEY] if spec[0] in _ATTACK_SHARED_FIELDS
 ]
+# Retain the Female Raid settings key and its existing chest coordinates.
+_female_chest_fields = [f for f in CONFIG_FIELDS["Female Raid"] if f[0] in _ATTACK_SHARED_FIELDS]
+_female_keys = {f[0] for f in _female_chest_fields}
+CONFIG_FIELDS["Female Raid"] = _female_chest_fields + [
+    f for f in CONFIG_FIELDS[ATTACK_BLOOD_KEY] if f[0] not in _female_keys
+]
 CONFIG_INDEX = {sec: {f[0]: f for f in fields} for sec, fields in CONFIG_FIELDS.items()}
 # fields that live in Settings > Macros instead of the Edit configs window (still saved in the same place)
 CONFIG_HIDDEN = {"Female Raid": ("chest1", "chest2"),
@@ -759,9 +769,9 @@ CONFIG_INFO = {
     "Universal": "Used while the Universal abilities are selected.",
     OUTSKIRTS_FRITZ_KEY: "Fritz skills with Universal movement. Extra Skill 3 animation wait is editable here.",
     "Blood Awakening": "Used while the Blood Awakening abilities are selected.",
-    "Female Raid": "Used while Female Raid is selected. (The chest locations are set in Settings > Macros.)",
+    "Female Raid": "Forward Dash, wait 2 seconds, then Colossal Shift. Chest locations are set in Settings > Macros.",
     "Attack Titan Raid": "Attack Titan Raid Fritz (Not Recommended). Colossal chest spots are set in Settings > Macros.",
-    ATTACK_BLOOD_KEY: "Acoustic Shells (Skill 2), forward Space-Space Dash, Shift (Skill 5), and Colossal combat.",
+    ATTACK_BLOOD_KEY: "Acoustic Shells (Skill 2), wait 1.5 seconds, Shift (Skill 5), and Colossal combat.",
 }
 
 
@@ -1116,9 +1126,9 @@ STEP_NAMES = ["Ability 2", "Dashing", "Strafe", "Ability 3",
               "Buying time", "Ability 4", "Shift", "Shifted 4", "Ability 5"]
 
 ATTACK_STEP_NAMES = ["Right Dashes", "Fritz opening skills", "Fritz positioning", "Colossal Shift", "Opening chests", "Clicking retry"]
-ATTACK_BLOOD_STEP_NAMES = ["Acoustic Shells", "Forward Dash", "Colossal Shift", "Colossal combat", "Opening chests", "Clicking retry"]
+ATTACK_BLOOD_STEP_NAMES = ["Acoustic Shells", "Wait 1.5 s", "Colossal Shift", "Colossal combat", "Opening chests", "Clicking retry"]
 
-RAID_STEP_NAMES = ["Using buffs", "Shifting", "Killing Eren", "Killing Female titan",
+RAID_STEP_NAMES = ["Forward Dash", "Wait 2 s", "Colossal Shift", "Colossal combat",
                    "Opening chests", "Clicking retry"]
 
 
@@ -1247,7 +1257,8 @@ settings = {
                             # window and show the small stats bar instead (off = keep the window)
     "mini_pos": DEFAULT_MINI_POS,   # Settings > App: Left / Middle / Right edge of Roblox
     "animations": False,    # Settings > App > "GUI animations": slide / fade effects (off = the plain look)
-    "recognition_mode": "standard",  # Standard default; optional local Hybrid AI (Beta)
+    "recognition_mode": "standard",  # effective engine, not merely the preference
+    "hybrid_opt_in": False,  # explicit preference; may wait for a verified model
     "fix_loot": False,      # Settings > Detection > Fix image detection > "Fix loot tracking" (Beta): look for
                             # the loot icons at many sizes, for UIs where the drops are resized
     "auto_monitor": True,     # The Bums: prefer the Roblox window monitor when found
@@ -1380,6 +1391,8 @@ def load_settings(saved):
         settings["compact_ui"] = not saved["legacy_ui"]
     if saved.get("recognition_mode") in ("standard", "hybrid_beta"):
         settings["recognition_mode"] = saved["recognition_mode"]
+    settings["hybrid_opt_in"] = saved.get("hybrid_opt_in") is True or (
+        "hybrid_opt_in" not in saved and saved.get("recognition_mode") == "hybrid_beta")
     if isinstance(saved.get("fix_loot"), bool):
         settings["fix_loot"] = saved["fix_loot"]
     if isinstance(saved.get("animations"), bool):
@@ -1490,8 +1503,8 @@ def reconnect_missing():
     plus that tab's own 4."""
     missing = []
     if settings['reconnect'].get('method') == 'image':
-        if settings['family'] not in ('Universal', 'Blood Awakening', OUTSKIRTS_FRITZ_KEY):
-            missing.append('Image Reconnect supports Outskirts mission macros only')
+        if settings['family'] not in ('Universal', 'Blood Awakening', OUTSKIRTS_FRITZ_KEY, *COLOSSAL_RAIDS):
+            missing.append('Image Reconnect supports Outskirts, Attack Titan and Female Titan macros only')
         mode = settings['reconnect'].get('server_mode', 'public')
         if mode not in ('public', 'ps_code', 'gamepass'):
             missing.append('Server Mode')
@@ -1504,6 +1517,11 @@ def reconnect_missing():
                          'rc_start.png', 'rc_outskirts_selected.png'):
             if not os.path.isfile(asset_path(filename)):
                 missing.append(filename)
+        if settings['family'] in COLOSSAL_RAIDS:
+            for name in image_rc.RAID_ASSETS:
+                filename = 'rc_'+name+'.png'
+                if not os.path.isfile(asset_path(filename)):
+                    missing.append(filename)
         return missing
     if not override_path(RECONNECT_IMAGE_FILE):
         missing.append("Disconnect Image")
@@ -2110,7 +2128,7 @@ def default_builtin_commands(family):
                 "press ability1", "native attack_shift_and_colossal"]
     elif family == ATTACK_BLOOD_KEY:
         prefix += "# Opening is editable; Shift, Heatwave and chest handling stay native.\n"
-        body = ["native attack_raid_init", "press ability2", "dash forward",
+        body = ["native attack_raid_init", "press ability2", "wait 1.5",
                 "native attack_shift_and_colossal"]
     else:
         # Female Raid stays native: animation-driven transitions can't safely be
@@ -2165,6 +2183,10 @@ def load_builtin_commands(family):
     except OSError as e:
         log(f"Cannot read built-in command override for {family}: {e}; original preserved")
         return None
+    if family == ATTACK_BLOOD_KEY:
+        commands = [line.strip() for line in source.splitlines() if line.strip() and not line.lstrip().startswith("#")]
+        if commands == ["native attack_raid_init", "press ability2", "dash forward", "native attack_shift_and_colossal"]:
+            return default_builtin_commands(family)
     errors = validate_builtin_commands(family, source)
     if errors:
         log(f"Invalid built-in commands for {family}: {errors[0][1]}; original preserved")
@@ -2221,7 +2243,7 @@ def _run_builtin_native(name):
     elif name == "female_raid":
         raid_routine()
     elif name == "attack_raid_init":
-        _attack_skip.update(next_scan=0.0, last_press=0.0, streak=0, busy=False)
+        _attack_skip.update(next_scan=0.0, last_press=-100., last_seen=-100., streak=0, busy=False)
         _raid.update(step=-1, title=FAMILY_LABELS[family], detail="Editable opening")
         show(FAMILY_LABELS[family], "Editable Attack Titan Raid opening")
         log(f"{FAMILY_LABELS[family]}: executing saved opening commands")
@@ -2231,10 +2253,17 @@ def _run_builtin_native(name):
                   seconds=tv(family, "camera_down_time"),
                   pixels=tv(family, "camera_down_pixels"), settle=0.15)
     elif name == "attack_shift_and_colossal":
-        raid_phase(3, "Colossal Shift", "Skill 5 until Heatwave confirms Colossal")
-        attack_titan_shift_until_confirmed()
-        raid_phase(3, "Colossal Titan", "Heatwave and independent Skills 5, 3, 1")
-        attack_titan_colossal()
+        if family in (ATTACK_BLOOD_KEY, "Female Raid"):
+            raid_phase(3, "Colossal Shift", "Skill 5 until Colossal HUD confirms form")
+            detector = ColossalHUD(_raid_templates, tv(family, "heatwave_threshold"))
+            first_frame = blood_shift_until_confirmed(detector)
+            raid_phase(3, "Colossal Titan", "Heatwave + independent Skills 5, 3, 1")
+            blood_colossal_priority(detector, first_frame)
+        else:
+            raid_phase(3, "Colossal Shift", "Skill 5 until Heatwave confirms Colossal")
+            attack_titan_shift_until_confirmed()
+            raid_phase(3, "Colossal Titan", "Heatwave and independent Skills 5, 3, 1")
+            attack_titan_colossal()
 
 
 def run_builtin_commands(family, source):
@@ -2248,9 +2277,12 @@ def run_builtin_commands(family, source):
         try:
             run_macro_nodes(program)
         except AttackTitanChestFound:
-            if family not in ATTACK_FAMILIES:
+            if family == "Female Raid":
+                female_chests()
+            elif family in ATTACK_FAMILIES:
+                attack_titan_chests()
+            else:
                 raise
-            attack_titan_chests()
         show("Waiting for retry", "Built-in commands finished")
         while True:
             wait(0.1)
@@ -2661,11 +2693,15 @@ def macro_openchest():
             "Fix image detection")
         return
     log("openchest(): waiting for the finish button")
-    hit = None
-    while hit is None:
-        show("Opening chests", "Waiting for the finish button...")
-        hit = raid_wait_finish_button(30)
-    raid_finish(hit, phase=False)
+    previous = state.get('raid_chest_active', False)
+    state['raid_chest_active'] = True
+    try:
+        hit = chest_wait_panel(lambda frame: raid_find('finish', frame), CHEST_FINISH_TIMEOUT)
+        if hit is None:
+            chest_recovery_failed('custom_chest_panel_timeout')
+        raid_finish(hit, phase=False)
+    finally:
+        state['raid_chest_active'] = previous
 
 
 def macro_add_result(kind):
@@ -2688,10 +2724,11 @@ def run_macro_nodes(nodes):
     for node in nodes:
         # Edited Attack Titan openings retain the original finish/chest state guard.
         script_family = getattr(_builtin_editor_thread, "family", None)
-        if script_family in ATTACK_FAMILIES:
+        if script_family in COLOSSAL_RAIDS:
             tick()
-            if attack_titan_picture("attack_finish"):
-                raise AttackTitanChestFound
+            check_colossal_chest()
+        elif state.get("mission_t0") is not None:
+            tick()  # custom scripts also check their Mission Settings deadline between commands
         op = node[0]
         if op == "native":
             _run_builtin_native(node[1])
@@ -4112,7 +4149,12 @@ def notify_mission_async(result, found, mission_seconds=None):
         log(f"Discord: no screenshot ({type(e).__name__}: {e})")
         shot = None
 
+    review = _grid_review
+    mission = state.get("grid_mission", 0)
     def work():
+        from grid114.reward_summary import reward_field
+        summary = review.webhook_snapshot(mission) if review else None
+        embed["fields"].append(reward_field(summary))
         png = None if shot is None else cv2.imencode(".png", shot)[1].tobytes()
         ok, msg = post_webhook("", png=png, ping=False, embed=embed)
         if not ok:
@@ -4382,6 +4424,9 @@ _shared_scan_frame = None       # (read-only BGR, monotonic time, geometry, scal
 _shared_scan_counts = {'published': 0, 'reused': 0}
 
 
+_grid_review = None
+
+
 def _publish_shared_scan(frame, area, scale):
     global _shared_scan_frame
     if frame is None or area is None or frame.size == 0:
@@ -4393,6 +4438,9 @@ def _publish_shared_scan(frame, area, scale):
     with _shared_scan_lock:
         _shared_scan_frame = (frame, time.monotonic(), coords, scale)
         _shared_scan_counts['published'] += 1
+    review = _grid_review
+    if review is not None:
+        review.submit(frame, state.get("grid_mission", 0))
 
 
 def _latest_shared_scan():
@@ -4445,6 +4493,8 @@ def _watchdog_scan_interval():
         return max(interval, .85)
     if state.get('reconnecting'):
         return max(interval, .65)
+    if _grid_review is not None:
+        return .16
     if state.get('phase_status') == 'waiting':
         return max(interval, .40)
     return interval
@@ -4475,6 +4525,44 @@ def reset_hybrid_advisor():
         _hybrid_init_error = ''
 
 
+def _hybrid_models_dir():
+    """Prefer a bundled model; use a manually installed local model otherwise."""
+    local_models = os.path.join(app_dir(), 'models')
+    packaged_models = os.path.join(getattr(sys, '_MEIPASS', app_dir()), 'models')
+    if os.path.isfile(os.path.join(packaged_models, 'hybrid_manifest.json')):
+        return packaged_models
+    return local_models
+
+
+def hybrid_install_status():
+    """Fast GUI status check; never install packages or enable missing AI."""
+    root = _hybrid_models_dir()
+    manifest_path = os.path.join(root, 'hybrid_manifest.json')
+    if not os.path.isfile(manifest_path):
+        return False, 'Shared AI model has not been released yet. Standard/OpenCV remains available.'
+    try:
+        with open(manifest_path, encoding='utf-8') as fh:
+            meta = json.load(fh)
+        name = meta.get('model')
+        if meta.get('schema_version') != 1 or meta.get('validated') is not True or meta.get('calibrated') is not True:
+            raise ValueError('Model has not passed validation/calibration')
+        if not isinstance(name, str) or not name.endswith('.onnx') or os.path.basename(name) != name:
+            raise ValueError('Bad ONNX model filename')
+        path = os.path.join(root, name)
+        if not os.path.isfile(path):
+            raise FileNotFoundError('Model weights missing')
+        expected = meta.get('model_sha256')
+        if expected:
+            with open(path, 'rb') as fh:
+                if hashlib.sha256(fh.read()).hexdigest() != expected.lower():
+                    raise ValueError('Model SHA-256 mismatch')
+        if importlib.util.find_spec('onnxruntime') is None:
+            return False, 'CPU ONNX Runtime is missing. Run setup.bat for a bundled model.'
+    except (OSError, ValueError, TypeError) as exc:
+        return False, 'Invalid AI model: ' + str(exc)
+    return True, 'Shared offline AI model is ready.'
+
+
 def get_hybrid_advisor():
     """Return a CPU-only local advisor, or None. Never fail a macro run."""
     global _hybrid_advisor, _hybrid_init_done, _hybrid_init_error
@@ -4484,18 +4572,29 @@ def get_hybrid_advisor():
         if not _hybrid_init_done:
             _hybrid_init_done = True
             try:
-                # Prefer a user-supplied model beside the EXE/source, like
-                # asset_path(): no EXE rebuild required just to update weights.
-                local_models = os.path.join(app_dir(), 'models')
-                packaged_models = os.path.join(getattr(sys, '_MEIPASS', app_dir()), 'models')
-                models = (local_models if os.path.isfile(os.path.join(local_models,
-                                           'hybrid_manifest.json')) else packaged_models)
-                _hybrid_advisor = HybridAdvisor(CpuOnnxBackend(models))
+                _hybrid_advisor = HybridAdvisor(CpuOnnxBackend(_hybrid_models_dir()))
             except Exception as exc:
                 _hybrid_init_error = f'{type(exc).__name__}: {exc}'
                 settings['recognition_mode'] = 'standard'
                 log('Hybrid AI unavailable; Standard Mode retained (' + type(exc).__name__ + ')')
         return _hybrid_advisor
+
+
+def apply_hybrid_preference():
+    """Apply explicit opt-in, keeping Standard active until a verified model loads."""
+    settings["recognition_mode"] = "hybrid_beta" if settings.get("hybrid_opt_in") else "standard"
+    reset_hybrid_advisor()
+    if settings["recognition_mode"] == "hybrid_beta":
+        ready, message = hybrid_install_status()
+        if not ready:
+            settings["recognition_mode"] = "standard"
+            log("Hybrid AI opt-in pending; Standard/OpenCV active: " + message)
+            return False, message
+        if get_hybrid_advisor() is None:
+            settings["recognition_mode"] = "standard"
+            return False, "Verified model could not load. Standard/OpenCV active."
+        return True, "Hybrid AI (Beta) active: verified local model."
+    return False, "Standard/OpenCV active."
 
 
 def hybrid_confirm(frame, label, candidate, threshold, roi=None):
@@ -5035,7 +5134,7 @@ def start_macro(manual=False):
         if settings.get('background_mode', False):
             # Defense in depth for a changed runtime setting: never run a mission
             # using an unverified background input backend.
-            msg = ('Background Mode is In Development and disabled in v1.3. '
+            msg = ('Background Mode is In Development and disabled in v1.4. '
                    'Use Standard Mode to run macros.')
             log(msg)
             ev.put(('now', 'Background Mode: In Development', msg))
@@ -5639,6 +5738,8 @@ def _retry_watch_worker(stop):
                             tpl=_disconnect_template.get('normal')
                             hit=bool(tpl is not None and
                                      (lambda m: m is not None and m[2]>=.90)(best_match(frame,tpl)))
+                            if not hit:
+                                hit = image_rc.find_scaled_reconnect(frame, tpl) is not None
                         else:
                             dm=find_quality_template(frame,_disconnect_template,RECONNECT_THRESHOLD)
                             hit=bool(dm and dm[0][2]>=RECONNECT_THRESHOLD)
@@ -5719,13 +5820,14 @@ def cached_retry_hit():
     return None
 
 
-def scan_for_retry():
+def scan_for_retry(check_grab=True):
     """Look for the end of the mission once (and for a grab). Raises RetryFound if it is there.
     The end of the mission is the retry button."""
     global _last_scan
     _last_scan = time.time()
     screen = passive_scan_screen()
-    check_grabbed(screen)
+    if check_grab:
+        check_grabbed(screen)
     found = find_retry(screen)
     if found and _retry_inside_panel(found[0], screen):
         # Fast Mode may shorten scan intervals but NEVER bypass confirmation.
@@ -5849,15 +5951,21 @@ def rescue_clicks(debug=False, reason=None):
     (ctrl, mouse down for 2s, ctrl), then click (X centre / 80% Y, or the coordinate picked in
     Settings) every RESCUE_CLICK_DELAY seconds until the retry button can be seen. The retry button being found raises RetryFound, so the normal
     end-of-mission handling takes over."""
+    if reason and settings["family"] in COLOSSAL_RAIDS:
+        if not raid_runtime_recovery_check(force=True, allow_rescue=False):
+            return  # possible terminal transition; do not start Eject yet
     state["rescuing"] = True
     state["rescue_t0"] = None if debug else time.time()   # tick(): a rescue past RECONNECT_RESCUE_LIMIT rejoins
     if not debug:
         state["rescued"] = True
-    for held in (KEY_STRAFE_D, KEY_STRAFE):
+    release_all_keys()
+    for held in list(_custom_held):
         try:
-            pydirectinput.keyUp(held)          # step 9 may be holding D / A: let go before rescuing
+            pydirectinput.keyUp(held)
         except Exception:  # noqa: BLE001
             pass
+    _custom_held.clear()
+    _skip_spam["until"] = 0.0
     if not debug:
         notify_rescue_async(False, counters()[0]["missions"])  # Discord: stuck, trying to eliminate
     cx, cy = failsafe_click_point(*failsafe_default_point())
@@ -5879,7 +5987,12 @@ def rescue_clicks(debug=False, reason=None):
             tick(scan_retry=False)                      # stop / pause
             loop_start = time.time()
             scan_for_retry()                            # raises RetryFound when it is visible
-            if reason and "finish" in _raid_templates:  # raid failsafe: stop at the finish button too
+            if reason and settings["family"] in COLOSSAL_RAIDS:
+                # Route the correct Female/Attack chest handler via its existing exception.
+                if not raid_runtime_recovery_check(force=True, allow_rescue=False, retry_checked=True):
+                    time.sleep(.05)
+                    continue  # uncertain heading: do not click the rescue spot
+            elif reason and "finish" in _raid_templates:  # legacy/custom raid path
                 fin = raid_find("finish", grab_screen())
                 if fin:
                     log("Raid failsafe: finish button seen - failsafe stopped")
@@ -5896,7 +6009,8 @@ def rescue_clicks(debug=False, reason=None):
         if debug:
             log("DEBUG F3+K: running the rescue now")
         # always use ability 2 (ejects the player if shifted), then wait before looking down
-        show("Stuck mission", f"Spamming ability 2 for {STILL_SHIFTED_SPAM_TIME:g}s")
+        rescue_title = "Stuck raid" if reason else "Stuck mission"
+        show(rescue_title, f"Spamming ability 2 for {STILL_SHIFTED_SPAM_TIME:g}s")
         log(f"Rescue: spamming ability 2 for {STILL_SHIFTED_SPAM_TIME:g}s, the {STILL_SHIFTED_WAIT:g}s "
             f"wait starts {STILL_SHIFTED_WAIT_START:g}s after the spam started")
         spam_start = time.time()
@@ -5907,12 +6021,12 @@ def rescue_clicks(debug=False, reason=None):
             remaining = wait_end - time.time()
             if remaining <= 0:
                 break
-            show("Stuck mission", f"Waiting {remaining:.0f}s before "
+            show(rescue_title, f"Waiting {remaining:.0f}s before "
                                   f"{'looking down' if look else 'clicking'}")
             wait(min(0.5, remaining))
         if look:        # ctrl, mouse down, ctrl - off by default (on some setups the camera goes UP)
             fsl = settings["failsafe"]      # Failsafe > Configure: time / pixels / step delay
-            look_down(lambda: tick(scan_retry=False), seconds=fsl["look_time"],
+            look_down(lambda: tick(scan_retry=bool(reason)), seconds=fsl["look_time"],
                       pixels=fsl["look_pixels"], step=fsl["look_step"])
         click_phase()
     finally:
@@ -6158,7 +6272,7 @@ def _type_private_server_code(code, key_api, guard_focus, pause=time.sleep, caps
 
 
 def image_reconnect_rejoin(reason):
-    """Reconnect button -> Slot A -> chosen server -> Outskirts -> verified HUD.
+    """Reconnect button -> Slot A -> chosen server -> selected mission/raid -> verified HUD.
     The whole state route is restarted if another disconnect appears.
     """
     state['reconnecting'] = True
@@ -6193,7 +6307,14 @@ def image_reconnect_rejoin(reason):
                 raise BackgroundModeUnavailable(
                     'PS Code entry stopped: focus Roblox before continuing in Standard Mode.')
         _type_private_server_code(code, keyboard, guard_focus)
+    family = settings['family']
+    destination = 'female' if family == 'Female Raid' else ('attack' if family in ATTACK_FAMILIES else 'mission')
+    if destination != 'mission':
+        _attack_skip.update(next_scan=0., last_press=-100., last_seen=-100., streak=0, busy=False)
     def mission_ready(frame):
+        if destination != 'mission':
+            # This callback runs only after the verified Raid START click.
+            return raid_start_ready(frame, reconnect=True)
         return bool(_start_template and find_quality_template(frame,_start_template,START_THRESHOLD))
     try:
         for attempt in range(1, RECONNECT_MAX_ATTEMPTS+1):
@@ -6207,7 +6328,19 @@ def image_reconnect_rejoin(reason):
                 # verified Slot A -> selected-server route unchanged.
                 # Also resume safely from Home/detail if a previous retry
                 # already clicked Leave or the game tile.
-                if (image_rc.find_leave_disconnect(frame) or
+                leave_hit = image_rc.find_leave_disconnect(frame)
+                if (attempt == 1 and str(reason).startswith('chest recovery:')
+                        and not leave_hit and not matcher.find(frame, 'reconnect')
+                        and not matcher.slot_a_select(frame)
+                        and not image_rc.find_roblox_home_game(frame)
+                        and not image_rc.find_roblox_game_play(frame)):
+                    log('Chest Recovery: no Disconnect dialog; performing a real game relaunch')
+                    reconnect_launch(reason)
+                    frame = capture()
+                    leave_hit = image_rc.find_leave_disconnect(frame)
+                if leave_hit and leave_hit.source == 'opencv_error_256':
+                    log('Image Reconnect: Error 256 detected; using Leave -> game Play -> Slot A')
+                if (leave_hit or
                         image_rc.find_roblox_home_game(frame) or
                         image_rc.find_roblox_game_play(frame)):
                     image_rc.RobloxLeaveNavigator(
@@ -6248,9 +6381,9 @@ def image_reconnect_rejoin(reason):
                     matcher,capture,click,check,disconnect,_image_reconnect_progress,
                     enter_code,mission_ready,
                     server_mode=settings['reconnect'].get('server_mode','public'),
-                    ps_code=settings['reconnect'].get('ps_code',''))
+                    ps_code=settings['reconnect'].get('ps_code',''), destination=destination)
                 flow.run()
-                log('Image Reconnect confirmed: Mission HUD visible; resuming selected macro')
+                log(f'Image Reconnect confirmed: {destination} HUD visible; resuming selected macro')
                 state['disconnect_alert_sent'] = False
                 try:session_history().record('reconnect_completed',method='image')
                 except OSError:pass
@@ -6302,12 +6435,13 @@ def reconnect_rejoin(reason="the Disconnect Image was seen"):
                 state["disconnect_alert_sent"] = False
                 try:session_history().record('reconnect_completed',method='coordinates')
                 except OSError:pass
-                return
+                return True
             reason = "a Reconnect picture did not show"
             if attempt < RECONNECT_MAX_ATTEMPTS:
                 log(f"Rejoining again (attempt {attempt + 1}/{RECONNECT_MAX_ATTEMPTS})")
         log(f"Reconnect gave up after {RECONNECT_MAX_ATTEMPTS} attempts - waiting for the next mission")
         notify_async(f"Reconnect FAILED after {RECONNECT_MAX_ATTEMPTS} attempts - please check the game.")
+        return False
     finally:
         state["reconnecting"] = False
         state["rc_next"] = time.time() + RECONNECT_COOLDOWN
@@ -6383,20 +6517,31 @@ def tick(scan_retry=True):
                 raise Disconnected('Leave dialog detected by foreground scan')
             if find_quality_template(frame, _disconnect_template, RECONNECT_THRESHOLD):
                 raise Disconnected('the Disconnect Image was seen')
+            if (settings['reconnect'].get('method') == 'image' and
+                    image_rc.find_scaled_reconnect(frame, _disconnect_template.get('normal'))):
+                raise Disconnected('Scaled Reconnect dialog detected by foreground scan')
     if scan_retry:
         t0 = state["mission_t0"]
+        # Retry and disconnect watchdogs above always take precedence over recovery.
+        # Even a precise-timing loop reaches this check on its next normal tick.
+        if (t0 is not None and settings["family"] in COLOSSAL_RAIDS
+                and not state.get("retry_processing") and not state.get("reconnecting")):
+            raid_runtime_recovery_check()
+        if (settings["family"] in COLOSSAL_RAIDS and not state.get("retry_processing")
+                and not state.get("reconnecting") and not state.get("rescuing")
+                and not (t0 is not None and state.get("raid_chest_active"))
+                and not state.get("raid_terminal_wait")):
+            attack_titan_auto_skip()
         if state["debug_rescue"] and not state["rescuing"]:     # DEBUG: F3+K
             state["debug_rescue"] = False
-            rescue_clicks(debug=True)
+            if not (t0 is not None and state.get("raid_chest_active")):
+                rescue_clicks(debug=True, reason="manual debug" if settings["family"] in COLOSSAL_RAIDS else None)
         elif (not state["rescuing"] and t0 is not None
                 and settings["family"] != "Female Raid" and settings["family"] not in ATTACK_FAMILIES    # raid routines manage retry
                 and time.time() - t0 > mission_timeout()):
             rescue_clicks()
         if _raid["active"] and not _raid["in_raid_wait"] and not state["rescuing"]:
             raid_skip_poll()        # the skip button is watched during every other raid action too
-        if (settings["family"] in ATTACK_FAMILIES
-                and not state.get("retry_processing")):
-            attack_titan_auto_skip()
         interval = FAST_SCAN_INTERVAL if tv(settings["family"], "fast_mode") else SCAN_INTERVAL
         if time.time() - _last_scan >= interval and not state.get("retry_processing") \
                 and time.monotonic() >= state.get("retry_guard_until", 0.0):
@@ -6714,7 +6859,7 @@ def wait_for_mission_start(scan_retry=True, after_retry=False):
     set_status("waiting")
     set_step(-1)
     raid = raid_counting()
-    attack_mode = settings["family"] in ATTACK_FAMILIES
+    attack_mode = settings["family"] in COLOSSAL_RAIDS
     start_note = "Looking for acoustic_shells.png (Skill 2)" if attack_mode else ("Looking for the skip button / raid_start.png" if raid else "Looking for the ability 2 icon")
     show("Waiting for the raid" if raid else "Waiting for the mission", start_note)
     log("Waiting for the raid: " + start_note if raid else "Waiting for the mission to start")
@@ -6970,13 +7115,16 @@ def shift_sequence(fam=None):
 
 
 # ---------------------------- the routine -------------------------------
+from raid_vision import locate as locate_raid_control, locate_skip, ColossalHUD
+
+
 def raid_find(kind, screen):
     """Look for the skip / finish button. Returns the match (cx, cy, score, w, h) or None."""
     tpl = _raid_templates.get(kind)
     if not tpl:
         return None
     thr = {"skip": RAID_SKIP_THRESHOLD, "finish": RAID_FINISH_THRESHOLD,
-           "heatwave": (tv(settings["family"], "heatwave_threshold") if settings["family"] in ATTACK_FAMILIES else RAID_HEATWAVE_THRESHOLD),
+           "heatwave": (tv(settings["family"], "heatwave_threshold") if settings["family"] in COLOSSAL_RAIDS else RAID_HEATWAVE_THRESHOLD),
            "start": RAID_START_THRESHOLD, "attack_finish": ATTACK_FINISH_THRESHOLD}[kind]
     hit = find_quality_template(screen, tpl, thr)
     return hit[0] if hit else None
@@ -7012,18 +7160,23 @@ def attack_titan_start_icon_visible(frame):
     return False
 
 
+def raid_start_ready(frame, reconnect=False):
+    """Shared normal/reconnect raid gate; only the post-START callback may skip here."""
+    retry = find_retry(frame)
+    if retry:
+        cx, cy = retry[0][:2]
+        h, w = frame.shape[:2]
+        if .20*w < cx < .82*w and .48*h < cy < .96*h:
+            return False
+    if reconnect:
+        attack_titan_auto_skip(frame)
+    return raid_intro_clear(frame) and attack_titan_start_icon_visible(frame)
+
+
 def start_marker_visible():
     """Detect the selected macro's actual start icon, not another macro's icon."""
-    if settings["family"] in ATTACK_FAMILIES:
-        # Retry sometimes overlays the HUD. Never treat that as a new Raid.
-        frame = grab_screen()
-        retry = find_retry(frame)
-        if retry:
-            cx, cy = retry[0][:2]
-            h, w = frame.shape[:2]
-            if .20*w < cx < .82*w and .48*h < cy < .96*h:
-                return False
-        return attack_titan_start_icon_visible(frame)
+    if settings["family"] in COLOSSAL_RAIDS:
+        return raid_start_ready(grab_screen())
     if raid_counting():
         screen = grab_screen()
         return raid_find("skip", screen) is not None or raid_find("start", screen) is not None
@@ -7129,18 +7282,121 @@ def raid_trigger_failsafe(reason):
     rescue_clicks(reason=reason)
 
 
-def raid_failsafe_time_check():
-    """5 min since the raid began, or 3 min since the shifting + waiting sequence ended."""
+def raid_failsafe_reason(now=None):
+    """The existing fixed raid deadline, independent of the Mission Settings timer."""
     t0 = state["mission_t0"]
-    if t0 is None or state["rescuing"]:
-        return
-    now = time.time()
+    if t0 is None or state["rescuing"] or state.get("raid_chest_active"):
+        return None
+    now = time.time() if now is None else now
     if now - t0 > RAID_FAILSAFE_MAX_TIME:
-        raid_trigger_failsafe(f"raid longer than {RAID_FAILSAFE_MAX_TIME / 60:g} min")
-    seq = _raid["seq_done_t"]
+        return f"raid longer than {RAID_FAILSAFE_MAX_TIME / 60:g} min"
+    seq = _raid.get("seq_done_t")
     if seq is not None and now - seq > RAID_FAILSAFE_AFTER_SEQUENCE:
-        raid_trigger_failsafe(f"{RAID_FAILSAFE_AFTER_SEQUENCE / 60:g} min after the "
-                              "shifting + waiting sequence")
+        return f"{RAID_FAILSAFE_AFTER_SEQUENCE / 60:g} min after the shifting + waiting sequence"
+    return None
+
+
+def raid_failsafe_time_check():
+    """Legacy caller; current Colossal routines reach the same deadline through tick()."""
+    reason = raid_failsafe_reason()
+    if reason:
+        raid_trigger_failsafe(reason)
+
+
+def raid_terminal_heading(frame):
+    """Strong result-title evidence in the upper results ROI (not click authority).
+
+    Existing COMPLETED / FAILED templates match both Mission and Raid suffixes.
+    A dim mask is accepted only here, to stop inputs; Retry still uses the
+    original thresholds, panel check and fresh-frame verification.
+    """
+    h, w = frame.shape[:2]
+    if h < 100 or w < 100:
+        return None
+    roi = frame[int(.11*h):int(.36*h), int(.27*w):int(.73*w)]
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    masks = [cv2.inRange(hsv, (12, 70, v), (40, 255, 255)) for v in (150, 75)]
+    # Half-size screening keeps ordinary combat scans cheap. A match must still
+    # pass the original full-size .86 threshold; the coarse probe never confirms.
+    small_masks = [cv2.resize(mask, None, fx=.5, fy=.5, interpolation=cv2.INTER_AREA)
+                   for mask in masks]
+    best = (.86, None)
+    for kind, tpl in _result_templates.items():
+        for scale in (.75, .85, 1., 1.15, 1.30):
+            scaled = cv2.resize(tpl, None, fx=scale, fy=scale)
+            if scaled.shape[0] > roi.shape[0] or scaled.shape[1] > roi.shape[1]:
+                continue
+            small_tpl = cv2.resize(scaled, None, fx=.5, fy=.5, interpolation=cv2.INTER_AREA)
+            for mask, small_mask in zip(masks, small_masks):
+                coarse = float(cv2.matchTemplate(small_mask, small_tpl, cv2.TM_CCOEFF_NORMED).max())
+                if coarse < .72:
+                    continue
+                score = float(cv2.matchTemplate(mask, scaled, cv2.TM_CCOEFF_NORMED).max())
+                if score >= best[0]:
+                    best = (score, kind)
+    return best[1]
+
+
+def wait_raid_terminal_retry(kind):
+    """Terminal confirmed: suspend combat/rescue, wait for a verified Retry only."""
+    state["raid_terminal_wait"] = True
+    state["rescue_t0"] = None  # a result screen is not an ongoing failed Eject
+    _skip_spam["until"] = 0.0
+    release_all_keys()
+    for key in list(_custom_held):
+        try:
+            pydirectinput.keyUp(key)
+        except Exception:
+            pass
+    _custom_held.clear()
+    log(f"Raid terminal {kind} confirmed - combat stopped; waiting for verified Retry")
+    show("Raid ended", "Waiting for verified Retry (no combat inputs)")
+    try:
+        while True:
+            tick(scan_retry=False)  # pause, stop, disconnect and cached Retry remain live
+            scan_for_retry()        # the original two-frame verifier raises RetryFound
+            time.sleep(.25)
+    finally:
+        state["raid_terminal_wait"] = False
+
+
+def raid_runtime_recovery_check(force=False, allow_rescue=True, retry_checked=False):
+    """Shared foreground recovery for native/edited Female and Attack raids.
+
+    Rate-limited normal scans; force a fresh check before any rescue input.
+    Do not Eject during chest handling or an already confirmed terminal screen.
+    """
+    if (state.get("mission_t0") is None or state.get("reconnecting")
+            or state.get("retry_processing") or state.get("raid_terminal_wait")):
+        return
+    reason = raid_failsafe_reason() if allow_rescue else None
+    now = time.monotonic()
+    if not force and not reason and now < state.get("raid_recovery_next", 0.):
+        return
+    state["raid_recovery_next"] = now + .5
+    frame = grab_screen() if (force or reason) else passive_scan_screen()
+    kind = raid_terminal_heading(frame)
+    if kind:
+        time.sleep(RETRY_CONFIRM_DELAY)
+        if raid_terminal_heading(grab_screen()) == kind:
+            wait_raid_terminal_retry(kind)  # raises RetryFound / Disconnected / SystemExit
+            return
+        # A possible result is not evidence of combat. In particular, do not
+        # initiate Eject on a single ambiguous result frame at the deadline.
+        if reason or force:
+            if not retry_checked:
+                scan_for_retry()
+            return False
+    if state.get("raid_chest_active"):
+        return False
+    if reason or force or state["rescuing"]:
+        if not retry_checked:
+            scan_for_retry()  # Retry wins even if the result header was obscured
+        # The correct chest exception unwinds the combat/rescue stack.
+        check_colossal_chest(grab_screen())
+    if reason:
+        raid_trigger_failsafe(reason)
+    return True  # forced preflight may continue only after a clear check
 
 
 def raid_phase(step, title, detail_text=""):
@@ -7175,37 +7431,55 @@ def raid_wait_finish_button(timeout):
 
 
 def raid_finish(match, phase=True):
-    """The finish button is on screen: chest 1 (clicked over and over), wait until the finish button
-    shows up again (= the chest is open), chest 2 (if on) the same, then the finish button is
-    clicked over and over. The retry button that shows up afterwards is
-    clicked by the normal retry handling."""
-    cx, cy, _score, tw, th = match
-    t = lambda key: tv("Female Raid", key)    # noqa: E731
-    log("Finish button seen")
-    if phase:                       # (openchest() in a custom macro has no raid steps)
-        raid_phase(4, "Opening chests", "Finish button seen")
-    for n, key in ((1, "chest1"), (2, "chest2")):
-        if n == 2 and not t("open_chest2"):
-            continue
-        spot = t(key)
-        if spot is None:
-            log(f"WARNING: Female Raid - Chest {n} coordinate is not set, not opening it")
-            continue
-        log(f"Opening chest {n} at {spot[0]}, {spot[1]}")
-        show("Opening chests", f"Clicking chest {n}")
-        raid_click_spam(spot[0], spot[1], t("chest_click_time"), t("chest_click_interval"),
-                        f"chest {n}")
-        hit = raid_wait_finish_button(t("finish_wait"))
-        if hit:
-            log(f"Chest {n} open (finish button seen)")
-            cx, cy, _score, tw, th = hit
+    """Legacy/custom coordinate chest route; use fresh panel evidence before inputs."""
+    previous = state.get('raid_chest_active', False)
+    state['raid_chest_active'] = True
+    try:
+        t = lambda key: tv('Female Raid', key)
+        locate = lambda frame: raid_find('finish', frame)
+        log('Finish button seen')
+        if phase:
+            raid_phase(4, 'Opening chests', 'Finish button seen')
+        for n, key in ((1, 'chest1'), (2, 'chest2')):
+            if n == 2 and not t('open_chest2'):
+                continue
+            spot = t(key)
+            if spot is None:
+                log(f'WARNING: Female Raid - Chest {n} coordinate is not set, not opening it')
+                continue
+            if not chest_wait_panel(locate, t('finish_wait')):
+                log(f'Chest Recovery: panel unavailable for chest {n}')
+                continue
+            chest_coordinate_burst(spot, locate, t('chest_click_time'), t('chest_click_interval'), f'chest {n}', paid=n==2)
+            if not chest_wait_panel(locate, t('finish_wait')):
+                log(f'WARNING: finish button not seen after chest {n}')
+        if phase:
+            chest_finish_and_retry(locate)
         else:
-            log(f"WARNING: finish button not seen {t('finish_wait'):g}s after chest {n}")
-    show("Opening chests", "Clicking the finish button")
-    log(f"Clicking finish for {t('finish_click_time'):g}s")
-    raid_click_spam(*frame_to_screen(cx, cy),
-                    t("finish_click_time"), t("finish_click_interval"), "finish",
-                    jitter=max(1, int(min(tw, th) * _scale) // 6))
+            if t('finish_click_time') <= 0:
+                return  # preserve the custom command's configured no-click behavior
+            deadline = time.monotonic() + CHEST_FINISH_TIMEOUT
+            while time.monotonic() < deadline:
+                chest_poll()
+                match = locate(grab_screen())
+                if chest_verified_click(locate, match, deadline):
+                    log('Custom chest: clicked verified FINISH')
+                    # Preserve the custom command's bounded configured click burst,
+                    # but stop immediately if FINISH is no longer visible.
+                    end = time.monotonic() + float(t('finish_click_time'))
+                    while time.monotonic() < end:
+                        time.sleep(max(.02, float(t('finish_click_interval'))))
+                        chest_poll()
+                        if time.monotonic() >= end:
+                            break
+                        match = locate(grab_screen())
+                        if not chest_verified_click(locate, match, end):
+                            break
+                    return
+                time.sleep(.15)
+            chest_recovery_failed('custom_finish_timeout')
+    finally:
+        state['raid_chest_active'] = previous
 
 
 def raid_watch(force=False):
@@ -7337,35 +7611,8 @@ def raid_sequence():
 
 
 def raid_routine():
-    """Female Raid. The raid starts when the skip button or raid_start.png is seen (see
-    wait_for_mission_start). The buffs (ability 1, 3, 5 ...) start when raid_start.png is seen (if
-    that picture is missing: at the first skip). Skip button = E spam (and ability 3 on the Nth one),
-    finish button = chests + finish, retry button = the end (tick() raises RetryFound, handled as
-    usual)."""
-    _raid.update(skips=0, skip_visible=False, last_look=0.0, heatwave=False, next_a1=None,
-                 start_seen=False, step=-1, seq_done_t=None, title="Raid started",
-                 detail="Waiting for the first skip")
-    log("Female Raid: raid started")
-    show(_raid["title"], _raid["detail"])
-    _raid["active"] = True
-    _skip_spam["until"] = 0.0
-    try:
-        try:
-            raid_watch(force=True)          # E if the skip button is what started the raid
-            while not _raid["start_seen"]:  # the buffs wait for the first skip
-                raid_wait(0.05)
-            log("First skip seen - using buffs")
-            raid_sequence()                 # never returns by itself
-        except RaidFinished:
-            pass
-        _raid["active"] = False             # finished: no more skip polling
-        _skip_spam["until"] = 0.0
-        show("Opening chests", "Finish clicked - waiting for the retry button")
-        while True:
-            wait(0.2)
-    finally:
-        _raid["active"] = False             # retry / stop: the raid is over
-        _skip_spam["until"] = 0.0
+    """Native Female override and normal dispatch share the Blood Awakening route."""
+    attack_titan_blood_routine()
 
 
 def warn_raid_config():
@@ -7373,6 +7620,8 @@ def warn_raid_config():
     if settings["family"] != "Female Raid" and settings["family"] not in ATTACK_FAMILIES:
         return
     fam = settings["family"]
+    if fam == "Female Raid":
+        return
     if tv(fam, "chest1") is None:
         log(f"WARNING: {fam} - Chest 1 coordinate is not set! "
             "Set it in Settings > Macros > Chest locations.")
@@ -7385,41 +7634,57 @@ def warn_raid_config():
 _attack_skip = {"next_scan": 0.0, "last_press": 0.0, "streak": 0, "busy": False}
 
 
-def attack_titan_auto_skip():
-    """Optional E-on-skip; main worker only. Rate-limited and double-frame confirmed."""
-    if (_attack_skip["busy"] or not tv(settings["family"], "auto_skip_cutscene")
-            or "skip" not in _raid_templates):
+def attack_titan_auto_skip(frame=None):
+    """Press on the first strong text match; debounce weaker legacy matches."""
+    if _attack_skip["busy"] or not tv(settings["family"], "auto_skip_cutscene"):
         return False
     now = time.monotonic()
     if now < _attack_skip["next_scan"]:
         return False
-    _attack_skip["next_scan"] = now + 0.20
-    visible = attack_titan_skip_visible()
-    if not visible:
+    _attack_skip["next_scan"] = now + .075
+    frame = grab_screen() if frame is None else frame
+    strong = raid_skip_text(frame)
+    if not strong and not legacy_raid_skip(frame):
         _attack_skip["streak"] = 0
         return False
     _attack_skip["streak"] += 1
-    if (_attack_skip["streak"] >= 2 and
-            now - _attack_skip["last_press"] >= float(tv(settings["family"], "skip_press_interval"))):
+    _attack_skip["last_seen"] = time.monotonic()
+    if ((strong or _attack_skip["streak"] >= 2)
+            and now - _attack_skip["last_press"] >= float(tv(settings["family"], "skip_press_interval"))):
         _attack_skip["busy"] = True
         try:
-            log(f"{FAMILY_LABELS[settings['family']]}: skip.png confirmed -> pressing E")
             tap(KEY_RAID_SKIP)
             _attack_skip["last_press"] = time.monotonic()
+            log("Raid cutscene: pressed Skip")
         finally:
             _attack_skip["busy"] = False
     return True
 
 
+def raid_skip_text(frame):
+    return locate_skip(frame, _raid_templates.get("skip_text", {}),
+                               (.65, .68, 1., 1.), .89,
+                               scales=(1., .85, 1.15, .70, 1.30, .55, 1.50))
+
+
+def legacy_raid_skip(frame):
+    return locate_skip(frame, _raid_templates.get("skip", {}),
+                               (.65, .68, 1., 1.), .84,
+                               scales=(1., .85, 1.15, .70, 1.30, .55, 1.50)) is not None
+
+
 def attack_titan_skip_visible(frame=None):
-    """Cutscene detection in the bottom-right SKIP area, not the full combat HUD."""
-    if "skip" not in _raid_templates:
-        return False
     frame = grab_screen() if frame is None else frame
-    h, w = frame.shape[:2]
-    # The supplied Raid recording places SKIP near x=91%, y=89%.
-    bottom_right = frame[int(h * 0.68):, int(w * 0.65):]
-    return raid_find("skip", bottom_right) is not None
+    if raid_skip_text(frame) or legacy_raid_skip(frame):
+        _attack_skip["last_seen"] = time.monotonic()
+        return True
+    return False
+
+
+def raid_intro_clear(frame):
+    """Require the Skip prompt to clear before allowing a raid opening."""
+    return (not attack_titan_skip_visible(frame)
+            and time.monotonic() - _attack_skip.get("last_seen", -100.) >= .35)
 
 
 class AttackTitanChestFound(Exception):
@@ -7430,12 +7695,251 @@ def attack_titan_picture(kind, frame=None):
     return raid_find(kind, grab_screen() if frame is None else frame)
 
 
+def female_finish_button(frame):
+    return locate_raid_control(frame, _raid_templates.get("finish", {}),
+                               (.30, .77, .70, 1.), RAID_FINISH_THRESHOLD)
+
+
+def female_open_button(frame, side):
+    bounds = (.10, .53, .48, .81) if side == "left" else (.52, .53, .90, .81)
+    return locate_raid_control(frame, _raid_templates.get("female_open", {}), bounds, .84)
+
+
+# Chest recovery is separate from combat recovery. These are wall-clock limits,
+# not changes to the existing Mission or Raid combat failsafe timers.
+CHEST_OPEN_TIMEOUT = 30.0
+CHEST_MAX_ATTEMPTS = 5
+CHEST_RETRY_INTERVAL = 2.5
+CHEST_SETTLE = .15
+CHEST_FINISH_TIMEOUT = 30.0
+
+
+def chest_poll():
+    """Keep stop/pause/Disconnect/Retry live without combat or terminal-wait loops."""
+    tick(scan_retry=False)
+    if time.time() - _last_scan >= (FAST_SCAN_INTERVAL if tv(settings['family'], 'fast_mode') else SCAN_INTERVAL):
+        scan_for_retry(check_grab=False)
+
+
+def chest_recovery_failed(reason):
+    """One bounded recovery exit. Never Eject or click an unverified control."""
+    tick(scan_retry=False)
+    scan_for_retry(check_grab=False)  # final chance for a verified Retry
+    log(f"Chest Recovery: {reason}")
+    capture_error_snapshot('chest_recovery_' + reason)
+    if settings['reconnect'].get('enabled') and _disconnect_template is not None:
+        log('Chest Recovery: using configured Auto Reconnect')
+        raise Disconnected('chest recovery: ' + reason)
+    show('Chest Recovery', 'Stopped safely: ' + reason)
+    log('Chest Recovery: Auto Reconnect unavailable; stopping safely')
+    raise SystemExit
+
+
+def chest_focus_game():
+    """Activate the actual Roblox window in Standard mode; never click to steal focus."""
+    if not IS_WIN or _background_run_enabled:
+        return True
+    try:
+        backend = _BackgroundRobloxWindow()
+        hwnd = backend.bind()
+        if backend.u.IsIconic(hwnd):
+            return False
+        if backend.u.GetForegroundWindow() != hwnd:
+            backend.u.SetForegroundWindow.argtypes = [ctypes.c_void_p]
+            backend.u.SetForegroundWindow(hwnd)
+            time.sleep(.15)
+        return backend.u.GetForegroundWindow() == hwnd
+    except Exception:
+        return False
+
+
+def chest_pointer_safe(x, y):
+    """Check actual desktop cursor, window focus and hit target immediately before input."""
+    if not IS_WIN or _background_unfocused():
+        return True
+    try:
+        from ctypes import wintypes as wt
+        backend = _BackgroundRobloxWindow()
+        hwnd = backend.bind()
+        u = backend.u
+        if u.GetForegroundWindow() != hwnd:
+            return False
+        pt = wt.POINT()
+        if not u.GetCursorPos(ctypes.byref(pt)) or max(abs(pt.x-x), abs(pt.y-y)) > 3:
+            return False
+        u.WindowFromPoint.argtypes = [wt.POINT]
+        u.WindowFromPoint.restype = ctypes.c_void_p
+        u.GetAncestor.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+        u.GetAncestor.restype = ctypes.c_void_p
+        hit = u.WindowFromPoint(pt)
+        return bool(hit and u.GetAncestor(hit, 2) == hwnd)
+    except Exception:
+        return False
+
+
+def chest_verified_click(locate, match, deadline):
+    """Move, settle, and reacquire the same control on a fresh frame before click."""
+    if not match or time.monotonic() >= deadline:
+        return False
+    if not chest_focus_game():
+        log("Chest input blocked: Roblox is not foreground; focus Roblox / enable Compact mode")
+        return False
+    x, y = frame_to_screen(*match[:2])
+    pydirectinput.moveTo(x, y)
+    pydirectinput.moveRel(1, 0)  # same mouse nudge as the established Retry/Finish click
+    time.sleep(CHEST_SETTLE)
+    chest_poll()
+    if time.monotonic() >= deadline:
+        return False
+    fresh = locate(grab_screen())
+    if not fresh or time.monotonic() >= deadline:
+        return False
+    nx, ny = frame_to_screen(*fresh[:2])
+    if abs(nx-x) > 5 or abs(ny-y) > 5:
+        return False  # window/control moved; reacquire next iteration
+    # A fresh capture / watchdog may have moved the cursor or changed focus.
+    pydirectinput.moveTo(nx, ny)
+    pydirectinput.moveRel(1, 0)
+    time.sleep(.05)
+    if time.monotonic() >= deadline or state.get("quit") or state.get("paused"):
+        return False
+    if not chest_pointer_safe(nx+1, ny):
+        log("Chest input blocked: cursor/focus/target changed before click")
+        return False
+    pydirectinput.click()
+    return True
+
+
+def chest_finish_and_retry(locate, timeout=CHEST_FINISH_TIMEOUT):
+    """Bound both FINISH acquisition and the post-click wait for verified Retry."""
+    deadline = time.monotonic() + timeout
+    last_attempt = -float('inf')
+    attempts = 0
+    finish_clicked = False
+    show('Opening chests', 'Waiting for verified FINISH / RETRY')
+    while time.monotonic() < deadline:
+        chest_poll()
+        if time.monotonic() >= deadline:
+            break
+        frame = grab_screen()
+        match = locate(frame)
+        now = time.monotonic()
+        if match and attempts < CHEST_MAX_ATTEMPTS and now-last_attempt >= CHEST_RETRY_INTERVAL:
+            last_attempt = now
+            attempts += 1
+            if chest_verified_click(locate, match, deadline):
+                log(f'Chest Recovery: clicked verified FINISH ({attempts}/{CHEST_MAX_ATTEMPTS})')
+                if not finish_clicked:
+                    finish_clicked = True
+                    deadline = time.monotonic() + timeout  # one separate Retry window
+        time.sleep(.15)
+    chest_recovery_failed('finish_or_retry_timeout')
+
+
+def female_chests():
+    """Bounded image-based OPEN flow; optional paid chest is never clicked twice."""
+    state['raid_chest_active'] = True
+    try:
+        release_all_keys()
+        chest_focus_game()
+        sides = ['left', 'right'] if tv('Female Raid', 'open_chest2') else ['left']
+        for side in sides:
+            raid_phase(4, 'Opening chests', 'Free chest' if side == 'left' else "Emperor's Trove")
+            deadline = time.monotonic() + CHEST_OPEN_TIMEOUT
+            max_attempts = CHEST_MAX_ATTEMPTS if side == 'left' else 1
+            attempts = 0
+            clicked = False
+            last_attempt = -float('inf')
+            absent_since = None
+            cleared = False
+
+            def locate(frame):
+                return female_open_button(frame, side) if female_finish_button(frame) else None
+
+            while time.monotonic() < deadline:
+                chest_poll()
+                if time.monotonic() >= deadline:
+                    break
+                frame = grab_screen()
+                now = time.monotonic()
+                panel = female_finish_button(frame)
+                button = None
+                if panel:
+                    button = female_open_button(frame, side)
+                    if button:
+                        absent_since = None
+                        if attempts < max_attempts and now-last_attempt >= CHEST_RETRY_INTERVAL:
+                            last_attempt = now
+                            # A rejected pre-click verification is not a paid click.
+                            if chest_verified_click(locate, button, deadline):
+                                attempts += 1
+                                clicked = True
+                                log(f'Female Raid: clicked {side} OPEN ({attempts}/{max_attempts})')
+                    elif clicked or side == 'right':
+                        if absent_since is None:
+                            absent_since = now
+                        elif now-absent_since >= (.45 if clicked else 2.0):
+                            cleared = True
+                            log(f'Female Raid: {side} OPEN cleared on chest panel' if clicked else
+                                "Emperor's Trove: OPEN unavailable")
+                            break
+                else:
+                    absent_since = None  # animation/occlusion is not proof of opening
+                if attempts >= max_attempts and now-last_attempt >= (CHEST_RETRY_INTERVAL if side == 'left' else max(6., float(tv('Female Raid','finish_wait')))):
+                    # A missing panel may still be an animation; allow it to return until deadline.
+                    if panel and button:
+                        break
+                time.sleep(.12)
+            if not cleared:
+                log(f'Chest Recovery: {side} OPEN unconfirmed; skipping further clicks on this chest')
+                capture_error_snapshot('chest_open_unconfirmed_' + side)
+        chest_finish_and_retry(female_finish_button)
+    finally:
+        state['raid_chest_active'] = False
+
+
+def resume_visible_raid_chest():
+    """Recover an existing chest screen on Start without spending another key."""
+    if settings['family'] not in COLOSSAL_RAIDS:
+        return
+    locate = female_finish_button if settings['family'] == 'Female Raid' else (
+        lambda frame: attack_titan_picture('attack_finish', frame))
+    def confirmed(frame):
+        return bool(locate(frame) and locate_raid_control(
+            frame, _raid_templates.get('chest_header', {}), (.30, .025, .70, .20), .88))
+    if not confirmed(grab_screen()):
+        return
+    tick(scan_retry=False)
+    time.sleep(.20)
+    if not confirmed(grab_screen()):
+        return
+    log('Chest Recovery: existing CHESTS on Start; finishing only (no repeated paid OPEN)')
+    state['raid_chest_active'] = True
+    try:
+        release_all_keys()
+        chest_focus_game()
+        chest_finish_and_retry(locate)
+    finally:
+        state['raid_chest_active'] = False
+
+
+def check_colossal_chest(frame=None):
+    kind = "finish" if settings["family"] == "Female Raid" else "attack_finish"
+    if kind == "finish":
+        frame = grab_screen() if frame is None else frame
+        match = female_finish_button(frame)
+    else:
+        match = attack_titan_picture(kind, frame)
+    if match:
+        raise AttackTitanChestFound(match)
+
+
 def attack_titan_wait(seconds, check_finish=True):
     end = time.monotonic() + max(0.0, float(seconds))
     while True:
         tick()
-        if check_finish and attack_titan_picture("attack_finish"):
-            raise AttackTitanChestFound
+        if check_finish:
+            check_colossal_chest()
         remaining = end - time.monotonic()
         if remaining <= 0:
             return
@@ -7468,122 +7972,154 @@ def attack_titan_heatwave_transition(current, candidate, confirmed, stable_for):
     return current
 
 
-def attack_titan_chests():
-    """Open opted-in chests once and click FINISH. Existing RetryFound handling does the loop."""
-    fam = settings["family"]
-    t = lambda k: tv(fam, k)
-    show("Opening chests", "CHESTS screen detected")
-    log("Attack Titan Raid: finish.png detected - stopping combat and opening chests")
-    raid_phase(4, "Opening chests", "CHESTS screen detected")
-    for key, label, enabled in (
-        ("chest1", "Raider's Chest", True),
-        ("chest2", "Emperor's Trove", bool(t("open_chest2"))),
-    ):
-        if not enabled:
-            log(f"Attack Titan Raid: skipping {label} (disabled)")
-            continue
-        spot = t(key)
-        if spot is None:
-            log(f"WARNING: {label} position not set. Use Pick spot in Settings > Macros.")
-            continue
-        log(f"Attack Titan Raid: opening {label} at {spot[0]}, {spot[1]}")
-        raid_click_spam(spot[0], spot[1], t("chest_click_time"),
-                        t("chest_click_interval"), label, jitter=0)
-        # The animation temporarily hides CHESTS. Avoid clicking twice during this transition.
-        attack_titan_wait(0.75, check_finish=False)
-        deadline = time.monotonic() + t("finish_wait")
-        while time.monotonic() < deadline:
-            tick()
-            if attack_titan_picture("attack_finish"):
-                break
-            time.sleep(0.15)
-        else:
-            log(f"WARNING: finish.png did not return after opening {label}")
-    # Locate the actual FINISH text from finish.png rather than using a fixed screen coordinate.
-    show("Opening chests", "Clicking FINISH")
-    deadline = time.monotonic() + t("finish_wait")
-    match = None
+def chest_coordinate_burst(spot, locate, seconds, interval, label, paid=False):
+    """Retain configured coordinate-based Attack/legacy chest selection.
+
+    Never continue the burst once the panel disappears or moves. A paid
+    chest receives at most one click; the coordinate itself is user supplied.
+    """
+    if seconds <= 0:
+        return
+    deadline = time.monotonic() + max(CHEST_SETTLE + .1, float(seconds))
+    chest_poll()
+    match = locate(grab_screen())
+    if not match:
+        return
+    anchor = frame_to_screen(*match[:2])
+    if not chest_focus_game():
+        log("Chest coordinate input blocked: Roblox is not foreground")
+        return
+    pydirectinput.moveTo(int(spot[0]), int(spot[1]))
+    pydirectinput.moveRel(1, 0)
+    time.sleep(CHEST_SETTLE)
     while time.monotonic() < deadline:
-        tick()
-        match = attack_titan_picture("attack_finish")
-        if match:
+        chest_poll()
+        if time.monotonic() >= deadline:
+            return
+        fresh = locate(grab_screen())
+        if not fresh or time.monotonic() >= deadline:
+            return
+        point = frame_to_screen(*fresh[:2])
+        if max(abs(point[0]-anchor[0]), abs(point[1]-anchor[1])) > 5:
+            return
+        if not chest_pointer_safe(int(spot[0])+1, int(spot[1])):
+            log("Chest coordinate input blocked: cursor/focus/target changed")
+            return
+        pydirectinput.click()
+        if paid:
+            return
+        time.sleep(max(.02, float(interval)))
+
+
+def chest_wait_panel(locate, timeout):
+    deadline = time.monotonic() + max(0., float(timeout))
+    while time.monotonic() < deadline:
+        chest_poll()
+        if time.monotonic() >= deadline:
             break
-        time.sleep(0.15)
-    if match:
-        cx, cy, _score, tw, th = match
-        raid_click_spam(*frame_to_screen(cx, cy),
-                        t("finish_click_time"), t("finish_click_interval"), "FINISH", jitter=0)
-    else:
-        log("WARNING: FINISH was not detected. Waiting for retry without clicking random positions.")
-    show("Raid completed", "Waiting for RETRY")
+        match = locate(grab_screen())
+        if match:
+            return match
+        time.sleep(.15)
+    return None
+
+
+def attack_titan_chests():
+    """Keep Attack Raid coordinate settings, bound the final FINISH/Retry stage."""
+    state['raid_chest_active'] = True
+    try:
+        release_all_keys()
+        chest_focus_game()
+        fam = settings['family']
+        t = lambda k: tv(fam, k)
+        locate = lambda frame: attack_titan_picture('attack_finish', frame)
+        raid_phase(4, 'Opening chests', 'CHESTS screen detected')
+        for key, label, enabled in (
+            ('chest1', "Raider's Chest", True),
+            ('chest2', "Emperor's Trove", bool(t('open_chest2'))),
+        ):
+            if not enabled:
+                log(f'Attack Titan Raid: skipping {label} (disabled)')
+                continue
+            spot = t(key)
+            if spot is None:
+                log(f'WARNING: {label} position not set. Use Pick spot in Settings > Macros.')
+                continue
+            if not chest_wait_panel(locate, t('finish_wait')):
+                log(f'Chest Recovery: panel unavailable for {label}; skipping chest')
+                capture_error_snapshot('chest_panel_unavailable_' + key)
+                continue
+            log(f'Attack Titan Raid: opening {label} at {spot[0]}, {spot[1]}')
+            chest_coordinate_burst(spot, locate, t('chest_click_time'), t('chest_click_interval'), label, paid=key=='chest2')
+            # Preserve existing animation delay and configured finish_wait.
+            end = time.monotonic() + .75
+            while time.monotonic() < end:
+                chest_poll()
+                time.sleep(.05)
+            if not chest_wait_panel(locate, t('finish_wait')):
+                log(f'WARNING: finish.png did not return after opening {label}')
+                capture_error_snapshot('chest_panel_not_returned_' + key)
+        chest_finish_and_retry(locate)
+    finally:
+        state['raid_chest_active'] = False
+
+
+def blood_colossal_priority(detector=None, first_frame=None, visual_seismic=True):
+    """Shared Colossal combat; Fritz retains timer-based Skill 5."""
+    t = lambda k: tv(settings["family"], k)
+    detector = detector or ColossalHUD(_raid_templates, t("heatwave_threshold"))
+    scheduler = BloodSkillScheduler(
+        {slot: t("skill" + slot + "_interval") for slot in ("5", "3", "1")},
+        time.monotonic(), stable_for=t("heatwave_confirm"), min_frames=2)
+    keys = {"4": KEY_ABILITY_3RD, "5": KEY_ABILITY_LAST,
+            "3": KEY_ABILITY_2ND, "1": KEY_GRAB}
+    log("Colossal Titan: priority 4 > 5 > 3 > 1; slot-local HUD confirmation")
     while True:
-        attack_titan_wait(0.2, check_finish=False)   # tick() scans Retry for the normal loop
+        if first_frame is not None:
+            frame, first_frame = first_frame, None
+        else:
+            tick()
+            frame = grab_screen()
+        cutscene = attack_titan_skip_visible(frame)
+        now = time.monotonic()
+        if cutscene or now - _attack_skip.get("last_seen", -100.) < .35:
+            scheduler.observe(now, hud=False)
+            if scheduler.last_event:
+                log(scheduler.last_event)
+            time.sleep(.04)
+            continue
+        hud, heat, seismic = detector.observe(frame)
+        # Check the chest panel on HUD loss and again before every key;
+        # a chest overlay must never receive a combat input.
+        if not hud:
+            check_colossal_chest(frame)
+        # None is unknown rather than proof of cooldown. For Skill 5 use
+        # positive readiness, with the existing timer fallback only if no
+        # visual template is present.
+        if not visual_seismic:
+            seismic = None
+        elif detector.templates['seismic_local'] is not None:
+            seismic = seismic is True
+        slot = scheduler.observe(time.monotonic(), hud=hud, heatwave=heat, seismic=seismic)
+        if scheduler.last_event:
+            log(scheduler.last_event)
+        if slot:
+            check_colossal_chest(frame)
+            if slot == "4":
+                log("Heatwave: sending Skill 4; waiting for confirmed cooldown")
+            elif slot == "5" and seismic is not None:
+                log("Seismic Shock: sending Skill 5 on ready icon")
+            tap(keys[slot])
+            scheduler.sent(slot, time.monotonic())
+        time.sleep(.045)
 
 
 def attack_titan_colossal():
-    """Independent 1/3/5 timers + edge-driven Heatwave. No Skill 4 press on first reappearance."""
-    t = lambda k: tv(settings["family"], k)
-    show("Colossal Titan", "Waiting for Heatwave")
-    while True:
-        tick()
-        frame = grab_screen()
-        if attack_titan_picture("attack_finish", frame):
-            raise AttackTitanChestFound
-        if attack_titan_skip_visible(frame):
-            # Waiting for phase transition; auto-skip (if enabled) is handled in tick().
-            time.sleep(0.12)
-            continue
-        if attack_titan_heatwave_visible(frame):
-            break
-        time.sleep(0.1)
-    log(f"Colossal Titan: Heatwave icon detected; pressing Skill 4 ({KEY_ABILITY_3RD})")
-    tap(KEY_ABILITY_3RD)    # Skill 4 is a toggle; NEVER press this in the independent skill loop.
-    stage = "first_hidden"
-    stable_for = float(t("heatwave_confirm"))
-    state_icon = True
-    confirm = {"candidate": True, "since": time.monotonic()}
-    timers = {
-        "1": [KEY_GRAB, float(t("skill1_interval")), time.monotonic()],
-        "3": [KEY_ABILITY_2ND, float(t("skill3_interval")), time.monotonic()],
-        "5": [KEY_ABILITY_LAST, float(t("skill5_interval")), time.monotonic()],
-    }
-    last_heatwave_press = time.monotonic()
-    while True:
-        tick()
-        frame = grab_screen()
-        if attack_titan_picture("attack_finish", frame):
-            raise AttackTitanChestFound
-        if attack_titan_skip_visible(frame):
-            # Freeze all abilities and Heatwave transitions while a cutscene covers the HUD.
-            time.sleep(0.12)
-            continue
-        seen = attack_titan_heatwave_visible(frame)
-        next_icon = attack_titan_heatwave_transition(state_icon, seen, confirm, stable_for)
-        if next_icon != state_icon:
-            state_icon = next_icon
-            if stage == "first_hidden" and not seen:
-                stage = "first_visible"
-                log("Heatwave: first cooldown started")
-            elif stage == "first_visible" and seen:
-                stage = "second_hidden"
-                log("Heatwave: first cooldown ended. Skill 4 stays ON; do not press.")
-            elif stage == "second_hidden" and not seen:
-                stage = "true_ready"
-                log("Heatwave: real cooldown started")
-            elif stage == "true_ready" and seen:
-                if time.monotonic() - last_heatwave_press > 1.0:
-                    log("Heatwave: real cooldown ended. Activating Skill 4 again")
-                    tap(KEY_ABILITY_3RD)
-                    last_heatwave_press = time.monotonic()
-                    stage = "first_hidden"
-        # Independent polling: each ability has its own schedule; its keybind is user-configured.
-        now = time.monotonic()
-        for slot, values in timers.items():
-            key, interval, ready_at = values
-            if now >= ready_at:
-                tap(key)
-                values[2] = time.monotonic() + interval
-        time.sleep(0.06)
+    """Use the verified double-cooldown scheduler for Fritz and Blood."""
+    if settings["family"] in (ATTACK_BLOOD_KEY, "Female Raid"):
+        return blood_colossal_priority()
+    show("Colossal Titan", "Waiting for verified Heatwave HUD")
+    return blood_colossal_priority(visual_seismic=False)
 
 
 def attack_titan_heatwave_visible(frame):
@@ -7592,13 +8128,13 @@ def attack_titan_heatwave_visible(frame):
     Shift failures on 1920x1009 Roblox windows can be false negatives from HUD scaling.
     Only the lower skill row is examined for a fallback, never full-screen blurry matches.
     """
-    if attack_titan_picture("heatwave", frame):
-        return True
     images = _raid_templates.get("heatwave") or {}
     if not images:
         return False
     h, w = frame.shape[:2]
     roi = frame[int(h * .67):, int(w * .31):int(w * .82)]
+    if raid_find("heatwave", roi):
+        return True
     threshold = float(tv(settings["family"], "heatwave_threshold"))
     for tpl in images.values():
         best, _s = best_match_any_size(roi, tpl,
@@ -7608,10 +8144,46 @@ def attack_titan_heatwave_visible(frame):
     return False
 
 
+def blood_shift_until_confirmed(detector):
+    """Confirm form from two distinct frames, independent of Heatwave readiness."""
+    t = lambda k: tv(settings["family"], k)
+    sightings, presses, next_press = 0, 0, 0.
+    status_at = time.monotonic() + 20.
+    log("Blood Awakening: confirming Colossal from form HUD (slots 2/3)")
+    while True:
+        tick()
+        frame = grab_screen()
+        if attack_titan_skip_visible(frame):
+            sightings = 0
+            time.sleep(.045)
+            continue
+        hud, heat, _ = detector.observe(frame)
+        if hud:
+            sightings += 1
+            if sightings >= 2:
+                log(f"Colossal Shift CONFIRMED after {presses} Skill 5 presses; entering combat immediately")
+                return frame
+            # No chest scan, sleep-heavy wait or another Shift key between
+            # positive form sightings. Keep tick's stop/retry monitoring.
+            time.sleep(.035)
+            continue
+        sightings = 0
+        check_colossal_chest(frame)
+        now = time.monotonic()
+        if now >= next_press:
+            tap(KEY_ABILITY_LAST)
+            presses += 1
+            next_press = time.monotonic() + float(t("shift_spam_interval"))
+        if now >= status_at:
+            log("Shift still unconfirmed; waiting for Colossal HUD; Retry monitored")
+            status_at = now + 20.
+        time.sleep(.045)
+
+
 def attack_titan_shift_until_confirmed():
     """Continue Shift until Colossal is confirmed or a REAL end screen appears.
 
-    No arbitrary timeout and no transition to Recovery while still in a Raid.
+    No separate Shift timeout; tick() enforces the shared Raid failsafe deadline.
     The existing tick() / Retry watchdog always runs; F7 and pause remain usable.
     """
     t = lambda k: tv(settings["family"], k)
@@ -7624,8 +8196,7 @@ def attack_titan_shift_until_confirmed():
     while True:
         tick()  # includes Retry, pause, stop and optional skip.png
         frame = grab_screen()
-        if attack_titan_picture("attack_finish", frame):
-            raise AttackTitanChestFound
+        check_colossal_chest(frame)
         if attack_titan_skip_visible(frame):
             sightings = 0
             time.sleep(0.12)
@@ -7645,7 +8216,7 @@ def attack_titan_shift_until_confirmed():
             presses += 1
             next_press = time.monotonic() + float(t("shift_spam_interval"))
         if now >= status_at:
-            log("Shift still unconfirmed; continuing Skill 5 (no timeout). Retry remains monitored")
+            log("Shift still unconfirmed; continuing Skill 5 until confirmation or Raid failsafe. Retry remains monitored")
             status_at = now + 20.0
         attack_titan_wait(0.10)
 
@@ -7653,7 +8224,7 @@ def attack_titan_shift_until_confirmed():
 def attack_titan_raid_routine():
     """Fritz opening route. Other built-in and custom macro routines are unchanged."""
     t = lambda k: tv(settings["family"], k)
-    _attack_skip.update(next_scan=0.0, last_press=0.0, streak=0, busy=False)
+    _attack_skip.update(next_scan=0.0, last_press=-100., last_seen=-100., streak=0, busy=False)
     _raid.update(step=-1, title=ATTACK_DISPLAY_NAME, detail="Fritz opening combo")
     show(ATTACK_DISPLAY_NAME, "Fritz opening combo")
     log("Attack Titan Raid Fritz: acoustic_shells.png detected; entering Fritz opening")
@@ -7703,34 +8274,43 @@ def attack_titan_raid_routine():
 
 
 def attack_titan_blood_routine():
-    """Attack Titan Raid: Acoustic Shells -> Space-Space forward Dash -> Shift.
-
-    No Fritz family combo, no camera movement; after Shift use the exact same
-    Colossal Heatwave / independent Skill 5, 3, 1 / chests / Retry logic.
-    """
-    _attack_skip.update(next_scan=0.0, last_press=0.0, streak=0, busy=False)
-    label = FAMILY_LABELS[ATTACK_BLOOD_KEY]
+    """Blood Awakening raid openings share the verified Shift and Heatwave loop."""
+    fam = settings["family"]
+    t = lambda k: tv(fam, k)
+    female = fam == "Female Raid"
+    label = FAMILY_LABELS[fam]
+    # Preserve recent Skip sightings across reconnect / normal start handoff.
     _raid.update(step=-1, title=label, detail="Acoustic Shells opening")
-    show(label, "Acoustic Shells, Forward Dash, Colossal Shift")
-    log(f"{label}: acoustic_shells.png detected; entering Blood Awakening opening")
+    log(f"{label}: starting Blood Awakening opening")
     try:
-        raid_phase(0, "Acoustic Shells", "Press Skill 2 immediately")
-        tap(KEY_ABILITY_1ST)  # Skill 2, user-configurable in Settings > Keybinds
-        raid_phase(1, "Forward Dash", "Double-tap Space")
-        log(f"{label}: Forward Dash ({KEY_DASH.upper()} + {KEY_DASH.upper()})")
-        double_tap(KEY_DASH)  # Forward Dash = Space twice, not W or D
-        raid_phase(2, "Colossal Shift", "Skill 5 until Heatwave confirms Colossal")
-        attack_titan_shift_until_confirmed()
+        if female:
+            raid_phase(0, "Forward Dash", "Double-tap the dash key once")
+            double_tap(KEY_DASH)
+            delay = 2.0
+        else:
+            raid_phase(0, "Acoustic Shells", "Press Skill 2")
+            tap(KEY_ABILITY_1ST)
+            delay = 1.5
+        raid_phase(1, "Waiting to Shift", f"Wait {delay:g} seconds")
+        attack_titan_wait(delay)
+        raid_phase(2, "Colossal Shift", "Skill 5 until Colossal HUD confirms form")
+        detector = ColossalHUD(_raid_templates, t("heatwave_threshold"))
+        first_frame = blood_shift_until_confirmed(detector)
         raid_phase(3, "Colossal Titan", "Heatwave + independent Skills 5, 3, 1")
-        attack_titan_colossal()
-    except AttackTitanChestFound:
+        blood_colossal_priority(detector, first_frame)
+    except AttackTitanChestFound as chest:
+        if female:
+            return female_chests()
         attack_titan_chests()
 
 
 def run_mission():
+    state["grid_mission"] = state.get("grid_mission", 0) + 1
     state["manual_start"] = False   # a mission is running now: forget any leftover F8 press
     state["mission_t0"] = time.time()   # for the stuck-mission rescue (failsafe time)
     state["rescued"] = False
+    state.update(raid_chest_active=False, raid_terminal_wait=False, raid_recovery_next=0.0)
+    _raid["seq_done_t"] = None
     state.pop("macro_loot", None)   # what trackloot() / addwin() / addlose() of a custom macro
     state.pop("macro_result", None)  # counted in this run (so the retry handling skips it)
     counters()[0]["missions"] += 1  # a mission - or a raid (Female Raid / custom type: raid)
@@ -7754,7 +8334,7 @@ def run_mission():
             return
 
     if fam == "Female Raid":
-        raid_routine()          # never returns: ends with RetryFound / stop
+        return raid_routine()
     if fam in ATTACK_FAMILIES:
         log(f"Dispatch: {FAMILY_LABELS[fam]} selected - starting Raid routine")
         if fam == ATTACK_FRITZ_KEY:
@@ -7968,8 +8548,8 @@ def macro_main():
         load_alt_retry()
         _start_template = load_quality_templates(START_TEMPLATE_FILE)
         _attack_start_template = None
-        if settings["family"] in ATTACK_FAMILIES:
-            _attack_skip.update(next_scan=0.0, last_press=0.0, streak=0, busy=False)
+        if settings["family"] in COLOSSAL_RAIDS:
+            _attack_skip.update(next_scan=0.0, last_press=-100., last_seen=-100., streak=0, busy=False)
             _attack_start_template = load_quality_templates(ATTACK_START_FILE)
             log(f"{FAMILY_LABELS[settings['family']]}: acoustic_shells.png loaded for raid-start detection")
         try:
@@ -7980,7 +8560,12 @@ def macro_main():
         _raid_templates.clear()
         for kind, filename in (("skip", RAID_SKIP_FILE), ("finish", RAID_FINISH_FILE),
                                ("heatwave", RAID_HEATWAVE_FILE), ("start", RAID_START_FILE),
-                               ("attack_finish", ATTACK_FINISH_FILE)):
+                               ("attack_finish", ATTACK_FINISH_FILE),
+                               ("female_open", "female_open.png"), ("chest_header", "chest_header.png"), ("skip_text", "raid_skip_text.png"),
+                               ("slot3", "colossal_slot3.png"), ("seismic", "seismic_shock.png"),
+                               ("form2", "colossal_form2.png"), ("form3", "colossal_form3.png"),
+                               ("heat_ready", "colossal_heat_ready.png"),
+                               ("seismic_local", "colossal_seismic_ready.png")):
             try:
                 _raid_templates[kind] = load_quality_templates(filename)
             except FileNotFoundError:
@@ -8056,6 +8641,10 @@ def macro_main():
                 log(f"Capture reference: {capture_mode_description()}; scaling frames "
                     f"to 1080p size (x{1 / _scale:.2f}) to match template images")
 
+            global _grid_review
+            if os.environ.get('THEBUMS_GRID114') == '1':
+                from grid114.live import LiveReview
+                _grid_review = LiveReview(log, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs', 'grid114'))
             start_retry_watchdog()
             start_reconnect_watchdog()
             need_start = True
@@ -8066,6 +8655,8 @@ def macro_main():
                         if need_start:
                             # After Retry, monitor continuously; if Retry is still visible,
                             # recover the click instead of waiting forever on a result screen.
+                            if not after_retry:
+                                resume_visible_raid_chest()
                             wait_for_mission_start(scan_retry=True, after_retry=after_retry)
                             need_start = False
                             after_retry = False
@@ -8167,11 +8758,17 @@ def macro_main():
                         need_start = True
                         state["retry_processing"] = False
                 except Disconnected as dc:
-                    reconnect_rejoin(dc.reason)
+                    recovered = reconnect_rejoin(dc.reason)
+                    if str(dc.reason).startswith("chest recovery:") and recovered is False:
+                        log("Chest Recovery: rejoin failed; stopping instead of waiting on a stale screen")
+                        raise SystemExit
                     need_start = True
                     after_retry = False
         finally:
             stop_retry_watchdog()
+            review, _grid_review = _grid_review, None
+            if review is not None:
+                review.close()
             stop_reconnect_watchdog()
             # Clean up the mss instance (whether we're stopping or _reinit_mss() replaced it):
             # close whatever is current now.
@@ -8570,16 +9167,17 @@ class OpacitySlider(tk.Canvas):
         except tk.TclError:
             pass
 
-def switch_row(parent, text, var, command, bg, fg, sub_font=None, pady=4):
+def switch_row(parent, text, var, command, bg, fg, sub_font=None, pady=4, disabled=False):
     """Label on the left, switch on the right. Clicking the label flips it too."""
     row = tk.Frame(parent, bg=bg)
     row.pack(fill="x", pady=pady)
-    sw = ToggleSwitch(row, var, command, parent_bg=bg)
+    sw = ToggleSwitch(row, var, command, parent_bg=bg, disabled=disabled)
     sw.pack(side="right")
     lbl = tk.Label(row, text=text, font=sub_font or (App.FONT, 10), fg=fg, bg=bg, anchor="w",
-                   cursor="hand2")
+                   cursor="arrow" if disabled else "hand2")
     lbl.pack(side="left", fill="x", expand=True)
-    lbl.bind("<Button-1>", sw.flip)
+    if not disabled:
+        lbl.bind("<Button-1>", sw.flip)
     return row
 
 
@@ -9744,7 +10342,7 @@ class App:
         upd.bind("<Enter>", lambda _e: upd.configure(fg=self.TEXT))
         upd.bind("<Leave>", lambda _e: upd.configure(fg=self.SUB))
         # Show the installed release immediately beside Updates (not the newest GitHub release).
-        tk.Label(left, text="v1.3 beta", font=(App.FONT, 8), fg=self.SUB,
+        tk.Label(left, text="v1.4", font=(App.FONT, 8), fg=self.SUB,
                  bg=self.BG).pack(side="left", padx=(7, 0))
 
         self.reset_btn = tk.Label(foot, text="Reset stats", font=(App.FONT, 9),
@@ -10602,8 +11200,9 @@ class SettingsWindow(tk.Frame):
         tk.Frame(inner, height=8, bg=App.CARD).pack()
         return inner
 
-    def check(self, parent, text, var, command):
-        return switch_row(parent, text, var, command, App.CARD, App.TEXT)
+    def check(self, parent, text, var, command, disabled=False):
+        return switch_row(parent, text, var, command, App.CARD, App.TEXT,
+                          disabled=disabled)
 
     def entry(self, parent, var, show=None):
         e = tk.Entry(parent, textvariable=var, show=show, font=(App.FONT, 10),
@@ -11625,6 +12224,7 @@ class SettingsWindow(tk.Frame):
         itself lives in the Recovery tab."""
         for w in self.fs_slot.winfo_children():
             w.destroy()
+        self.chest_warn = None
         fam = settings["family"]
         if fam == "Female Raid" or fam in ATTACK_FAMILIES or (is_custom(fam) and (
                 custom_macro_type(fam) == "raid" or custom_uses_chest(fam))):
@@ -11643,27 +12243,35 @@ class SettingsWindow(tk.Frame):
 
     def build_hybrid_card(self, parent):
         f = self.card(parent, 'RECOGNITION ENGINE',
-                      'Standard Mode is the default. Hybrid AI (Beta) only verifies '
-                      'borderline OpenCV results for Retry, Loot and Image Reconnect. '
-                      'Offline CPU model required; missing/failed model returns to Standard.')
-        self.v_hybrid = tk.BooleanVar(value=settings.get('recognition_mode') == 'hybrid_beta')
-        self.check(f, 'Hybrid AI (Beta) - opt in', self.v_hybrid, self.on_hybrid_toggle)
-        self.hint(f, 'Needs an independently validated models/hybrid_manifest.json and '
-                     'CPU ONNX weights. No APIs and no changes to original PNG templates.')
+                      'Standard/OpenCV is the default. Opt in to Hybrid AI (Beta) to '
+                      'use a verified offline CPU model when available. No model means '
+                      'Standard remains active; no unvalidated AI controls gameplay.')
+        self.v_hybrid = tk.BooleanVar(value=bool(settings.get('hybrid_opt_in')))
+        self.check(f, 'Hybrid AI (Beta) - opt in', self.v_hybrid,
+                   self.on_hybrid_toggle)
+        active = settings.get('recognition_mode') == 'hybrid_beta' and get_hybrid_advisor() is not None
+        ai_ready, ai_message = hybrid_install_status()
+        self.hybrid_status_hint = self.hint(f,
+            'Hybrid AI (Beta) ACTIVE.' if active else
+            ('Standard/OpenCV ACTIVE. Opt-in pending: ' if self.v_hybrid.get() else
+             'Standard/OpenCV ACTIVE. ') + ai_message,
+            color=App.SUB if active or ai_ready else '#fbbf24')
 
     def on_hybrid_toggle(self):
         if running():
-            self.v_hybrid.set(settings.get('recognition_mode') == 'hybrid_beta')
+            self.v_hybrid.set(bool(settings.get('hybrid_opt_in')))
             self.say('Stop the macro before switching recognition engines.', error=True)
             return
-        settings['recognition_mode'] = 'hybrid_beta' if self.v_hybrid.get() else 'standard'
-        reset_hybrid_advisor()
-        if self.v_hybrid.get() and get_hybrid_advisor() is None:
-            self.v_hybrid.set(False)
-            self.say('Hybrid AI unavailable: local validated ONNX model / runtime missing.', error=True)
-        else:
-            self.say('Hybrid AI (Beta) enabled' if self.v_hybrid.get()
-                     else 'Standard Mode enabled', good=True)
+        settings['hybrid_opt_in'] = bool(self.v_hybrid.get())
+        active, message = apply_hybrid_preference()
+        pending = self.v_hybrid.get() and not active
+        status = ('Hybrid AI (Beta) ACTIVE.' if active else
+                  ('Standard/OpenCV ACTIVE. Opt-in pending: ' + message if pending else
+                   'Standard/OpenCV ACTIVE.'))
+        hint = getattr(self, 'hybrid_status_hint', None)
+        if hint is not None:
+            hint.configure(text=status, fg='#fbbf24' if pending else App.SUB)
+        self.say(status, error=True) if pending else self.say(status, good=True)
         save_stats()
 
     def build_reconnect_card(self, parent):
@@ -11684,7 +12292,7 @@ class SettingsWindow(tk.Frame):
         if lbl is None:
             return
         on = settings["reconnect"]["enabled"]
-        incomplete = on and bool(reconnect_missing())     # e.g. invalid image mode for Raids
+        incomplete = on and bool(reconnect_missing())     # e.g. unsupported custom family or missing assets
         try:
             if incomplete:
                 lbl.configure(text="Reconnect: Off - fill in the " + reconnect_macro_tab()
@@ -11710,8 +12318,8 @@ class SettingsWindow(tk.Frame):
     def build_failsafe_card(self, parent):
         f = self.card(parent, "FAILSAFE",
                       "If a mission lasts longer than the time below, the macro spams ability 2, "
-                      "waits 15s and clicks until the retry button shows up. Female Raid has its "
-                      "own 3 min raid failsafe (the wait time below isn't used there).")
+                      "waits 15s and clicks until the retry button shows up. Built-in Female and "
+                      "Attack Raids use the fixed 3 min raid failsafe (the wait time below isn't used there).")
 
         def spin(parent, var, hi, unit):
             sp = tk.Spinbox(parent, from_=0, to=hi, width=4, textvariable=var,
@@ -11772,6 +12380,10 @@ class SettingsWindow(tk.Frame):
     def build_chest_card(self, parent):
         """Female Raid: where the chests are on the screen (the same two coordinates as
         the Female Raid timings)."""
+        if settings["family"] == "Female Raid":
+            card = self.card(parent, "RAID CHESTS", "The left free chest opens automatically before Finish.")
+            self.hint(card, "Enable Emperor’s Trove in Edit configs to open the right chest with an Emperor Key.")
+            return
         c = self.card(parent, "CHEST LOCATIONS",
                       "Where the raid clicks to open the chests. Click Pick spot, then click on the "
                       "chest on your screen.")
@@ -12121,7 +12733,7 @@ class SettingsWindow(tk.Frame):
                  bg=App.CARD, font=(App.FONT, 8, 'bold')).pack(side='left', padx=(9, 0))
         self.hint(c, 'Unavailable for now. Roblox did not respond to background input '
                      'during Windows testing. Standard Mode remains enabled. '
-                     'This switch cannot be turned on in v1.3.')
+                     'This switch cannot be turned on in v1.4.')
 
     def build_detection(self, page):
         """All image-recognition settings in one place, independent of Roblox window controls."""
@@ -13393,7 +14005,7 @@ class ReconnectConfigWindow(tk.Toplevel):
                  text='Codes may contain uppercase/lowercase letters and numbers. Case matters.',
                  font=(App.FONT, 8), fg=App.SUB, bg=App.CARD,
                  wraplength=385, justify='left').pack(anchor='w',pady=(2, 0))
-        tk.Label(self.rc_image_options,text="Only Outskirts mission macros are supported. "
+        tk.Label(self.rc_image_options,text="Supports Outskirts, Attack Titan (Fritz/Blood) and Female Titan raids. "
                  "The Reconnect button stays monitored while the macro runs.",
                  font=(App.FONT,8),fg=App.SUB,bg=App.CARD,
                  wraplength=385,justify='left').pack(anchor='w',pady=(6,4))
@@ -14585,6 +15197,7 @@ ASSET_LIST = (
     ("Female Raid: raid start", RAID_START_FILE),
     ("Female Raid: finish button", RAID_FINISH_FILE),
     ("Female Raid / Attack Titan: heatwave", RAID_HEATWAVE_FILE),
+    ("Blood Awakening: Seismic Shock (Skill 5)", "seismic_shock.png"),
     ("Attack Titan Raid Fritz: CHESTS", ATTACK_FINISH_FILE),
     ("Result: Completed", RESULT_FILES["completed"]),
     ("Result: Failed", RESULT_FILES["failed"]),
@@ -15230,10 +15843,9 @@ def apply_theme(name):
 
 def main():
     load_stats()          # stats + settings (saved keybinds, webhook, family)
-    # A previously enabled Beta may now have missing model files. Revalidate
-    # before drawing the UI, persist a safe Standard fallback if necessary.
-    if settings.get('recognition_mode') == 'hybrid_beta' and get_hybrid_advisor() is None:
-        save_stats()
+    # The saved opt-in is independent from the effective recognition engine.
+    # Recheck on startup; no unverified or missing model controls gameplay.
+    apply_hybrid_preference()
     load_timings()        # config.json: the timings changed in Edit configs
     ensure_override_dir() # Documents\\thebums Macro\\asset_override: users drop their own pictures here
     register_thebums_file_type()   # Windows: the lambda icon on .tbmacro files (no admin needed)
