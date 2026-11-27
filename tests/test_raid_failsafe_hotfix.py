@@ -8,6 +8,7 @@ from unittest.mock import Mock, call
 import cv2
 import numpy as np
 import pytest
+import thebums_extra_failsafe as extra_fs
 
 ROOT=Path(__file__).resolve().parents[1]
 TREE=ast.parse((ROOT/'main.py').read_text(encoding='utf-8'))
@@ -33,7 +34,7 @@ def clock(now=10.):
 def env(family='Female Raid', elapsed=181):
     t=clock(1000.)
     st=dict(quit=False,paused=False,mission_t0=t.now-elapsed,rescuing=False,debug_rescue=False)
-    e=dict(time=t,state=st,settings={'family':family,'reconnect':{}},_raid={'seq_done_t':None,'active':False},
+    e=dict(time=t,state=st,extra_fs=extra_fs,raid_counting=lambda:family in RAIDS,settings={'family':family,'reconnect':{}},_raid={'seq_done_t':None,'active':False},
         RAID_FAILSAFE_MAX_TIME=180.,RAID_FAILSAFE_AFTER_SEQUENCE=180.,
         RETRY_CONFIRM_DELAY=.08,COLOSSAL_RAIDS=RAIDS,ATTACK_FAMILIES=RAIDS[1:],
         grab_screen=Mock(return_value='fresh'),passive_scan_screen=Mock(return_value='cached'),
@@ -43,7 +44,7 @@ def env(family='Female Raid', elapsed=181):
         RetryFound=Retry,Disconnected=Disconnect,attack_titan_auto_skip=Mock(),
         mission_timeout=lambda:120.,rescue_clicks=Mock(side_effect=Stop),raid_skip_poll=Mock(),
         tv=lambda f,k:False,FAST_SCAN_INTERVAL=.1,SCAN_INTERVAL=.5,_last_scan=t.now)
-    return load(['raid_failsafe_reason','raid_failsafe_time_check','raid_runtime_recovery_check','tick'],e)
+    return load(['raid_failsafe_reason','raid_failsafe_time_check','raid_runtime_recovery_check','extra_failsafe_check','tick'],e)
 
 @pytest.mark.parametrize('fam',RAIDS)
 def test_all_native_raids_use_180_not_mission_timer(fam):
@@ -216,3 +217,20 @@ def test_rescue_preflight_failure_does_not_eject():
     e['rescue_clicks'](reason='raid longer than 3 min')
     assert not e['state']['rescuing']
     e['release_all_keys'].assert_not_called()
+
+
+@pytest.mark.parametrize('family,timeout',[('Universal',120.),('Female Raid',180.),('Attack Titan Raid Fritz',180.)])
+def test_level2_preempts_active_level1_with_scan_disabled(family, timeout):
+    """Exercise real tick + deadline check, not only a standalone timer helper."""
+    e=env(family, elapsed=2*timeout-.01)
+    class Extra(Disconnect): pass
+    e['ExtraFailsafe']=Extra
+    e['state'].update(fs2_started=e['state']['mission_t0'], fs2_timeout=timeout, rescuing=True)
+    e['tick'](scan_retry=False)
+    e['grab_screen'].assert_not_called()
+    e['time'].now += .02
+    with pytest.raises(Extra):
+        e['tick'](scan_retry=False)
+    e['scan_for_retry'].assert_called_once_with(check_grab=False)
+    e['rescue_clicks'].assert_not_called()
+    e['raid_trigger_failsafe'].assert_not_called()

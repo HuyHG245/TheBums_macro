@@ -4,9 +4,11 @@
 
 The Bums Macro is an independent keyboard/mouse automation application for Roblox: Attack on Titan Revolution. It is not affiliated with Roblox or the game. Use it in accordance with applicable game rules.
 
-> **Status:** v1.4.1 development candidate for Windows. Reconnect, the updater and several beta features still require Windows/Roblox end-to-end verification. **Background Mode is In Development and cannot be enabled.** The default Standard Mode remains available.
+> **Status:** v1.4.2 Extra Failsafe development candidate for Windows. Reconnect, the updater and several beta features still require Windows/Roblox end-to-end verification. **Background Mode is In Development and cannot be enabled.** The default Standard Mode remains available.
 
-## Quick start — TheBumsMacro_v1.4.1 source
+## Quick start — TheBumsMacro_v1.4.2 source
+
+**Extra Failsafe hotfix:** Level 1 keeps the original rescue. Level 2 triggers at twice the active mission/raid deadline if the round has not ended, interrupts rescue, verifies the Roblox menu / Leave / Confirm Leave sequence, and hands off to the existing Auto Rejoin route if enabled and configured. If Leave or Rejoin cannot be verified, the macro stops safely. This candidate has offline tests only; live Windows/Roblox verification remains outstanding.
 
 **This source contains no prebuilt Windows EXE.** Extract to a separate folder, especially if you already have a working installation.
 

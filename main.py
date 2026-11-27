@@ -32,6 +32,7 @@ import cv2
 import mss
 import numpy as np
 import thebums_reconnect as image_rc
+import thebums_extra_failsafe as extra_fs
 from thebums_skill_scheduler import BloodSkillScheduler
 from thebums_hybrid_ai import CpuOnnxBackend, HybridAdvisor
 from thebums_update_download import download_verified, DownloadCancelled, DownloadNetworkError
@@ -187,7 +188,7 @@ if IS_WIN:
 
 # ----------------------------- SETTINGS ---------------------------------
 APP_NAME = "The Bums Macro"
-VERSION = "TheBumsMacro_v1.4.1"  # Windows/Roblox playtest remains required
+VERSION = "TheBumsMacro_v1.4.2"  # Windows/Roblox playtest remains required
 
 # --- Update checker (footer > Updates) ---
 UPDATE_REPO = "HuyHG245/TheBums_macro"   # <-- your GitHub "owner/repo" (public). Releases are read from it
@@ -1206,7 +1207,7 @@ DEFAULT_RECONNECT = {"enabled": False, "spots": {}, "click_delay": RECONNECT_CLI
                      "play_delay": RECONNECT_PLAY_DELAY, "method": "coordinates",
                      "server_mode": "public", "ps_code": ""}   # Recovery > Reconnect > Configure: off until it is set up
 RECONNECT_FIRST_DELAY = 2.0                  # the first click happens this long after the Select picture is seen
-RECONNECT_RESCUE_LIMIT = 120.0               # a failsafe rescue still running after this long forces a rejoin
+# Level 2 uses 2 x the active mission/raid deadline; no fixed rescue timer.
 # The two pictures under the coordinates (saved in asset_override, like the Disconnect Image). They are the
 # same for both tabs: the first click (Pick a slot) waits until "Select" is on screen, and
 # Click play (lobby) waits until "Play" is on screen.
@@ -4613,12 +4614,116 @@ class RetryFound(Exception):
 
 
 class Disconnected(Exception):
-    """Rejoin the game (see reconnect_rejoin). `reason`: the Disconnect Image was seen, the failsafe
-    rescue ran longer than RECONNECT_RESCUE_LIMIT, or the bot command !reconnect was used."""
+    """Rejoin the game after a disconnect or an explicit reconnect request."""
 
     def __init__(self, reason="the Disconnect Image was seen"):
         super().__init__(reason)
         self.reason = reason
+
+
+class ExtraFailsafe(Disconnected):
+    """Time-only second recovery stage (not a genuine disconnect)."""
+
+
+def extra_failsafe_check():
+    blocked = any(state.get(key) for key in (
+        "reconnecting", "retry_processing", "raid_chest_active", "raid_terminal_wait"))
+    if not extra_fs.level2_due(state.get("fs2_started"), state.get("fs2_timeout"),
+                              time.monotonic(), active=state.get("mission_t0") is not None,
+                              blocked=blocked):
+        return
+    # Give the existing confirmed Retry/terminal/chest path precedence.
+    # Do not run the grabbed-player combat handler as part of this preflight.
+    scan_for_retry(check_grab=False)
+    frame = grab_screen()
+    kind = raid_terminal_heading(frame)
+    if kind:
+        time.sleep(RETRY_CONFIRM_DELAY)
+        if raid_terminal_heading(grab_screen()) == kind:
+            wait_raid_terminal_retry(kind)
+            return
+        return  # ambiguous terminal transition: no forced Leave on this tick
+    if settings["family"] in COLOSSAL_RAIDS:
+        check_colossal_chest(frame)
+    raise ExtraFailsafe("failsafe level 2: twice the mission/raid deadline")
+
+
+def extra_failsafe_recover():
+    """Voluntary Leave, followed by the selected existing Rejoin route.
+
+    The entire operation is bounded and fails closed. A failed recovery is not
+    a new mission and must never re-enter the normal mission-counting loop.
+    """
+    state["reconnecting"] = True  # suppress Retry/reconnect observers and FS2 recursion
+    state["mission_t0"] = None
+    state["fs2_started"] = None
+    state["rescue_t0"] = None
+    state["rescuing"] = False
+    state["retry_processing"] = False
+    _skip_spam["until"] = 0.0
+    release_all_keys()
+    for key in list(_custom_held):
+        try:
+            pydirectinput.keyUp(key)
+        except Exception:
+            pass
+    _custom_held.clear()
+    log("Failsafe Level 2: deadline reached; opening Roblox menu and leaving")
+    notify_async("Failsafe Level 2: mission/raid exceeded twice the failsafe time. Leaving Roblox.")
+    show("Failsafe Level 2", "Verifying Roblox Leave sequence")
+
+    def check():
+        tick(scan_retry=False)  # pause/stop, without competing watchdog actions
+
+    def click(hit):
+        if state["quit"]:
+            raise SystemExit
+        if state["paused"]:
+            raise extra_fs.LeaveError("Paused before click; no stale input sent")
+        px, py = frame_to_screen(hit.x, hit.y)
+        click_middle(px, py)
+
+    def handoff(frame):
+        if (image_rc.find_leave_disconnect(frame) or
+                image_rc.find_roblox_home_game(frame) or
+                image_rc.find_roblox_game_play(frame)):
+            return True
+        if _disconnect_template is not None:
+            return bool(image_rc.find_scaled_reconnect(frame, _disconnect_template.get("normal")) or
+                        find_quality_template(frame, _disconnect_template, RECONNECT_THRESHOLD))
+        return False
+
+    def progress(message):
+        log("Failsafe Level 2: " + message)
+        show("Failsafe Level 2", message)
+
+    try:
+        matcher = extra_fs.LeaveMatcher(asset_path)
+        extra_fs.LeaveNavigator(matcher, grab_screen, click, check, handoff, progress).run()
+    except extra_fs.LeaveError as exc:
+        log("Failsafe Level 2 failed: " + str(exc))
+        capture_error_snapshot("failsafe_level2_leave_failed")
+        notify_async("Failsafe Level 2 failed to verify Leave. Macro stopped; please check Roblox.")
+        return False
+    finally:
+        state["reconnecting"] = False
+        release_all_keys()
+
+    if not settings["reconnect"]["enabled"] or _disconnect_template is None:
+        log("Failsafe Level 2: Leave verified, but Auto Reconnect is off or not configured")
+        notify_async("Failsafe Level 2: Leave verified. Auto Reconnect is off/unavailable; macro stopped.")
+        return False
+    # The image route already navigates Roblox Home/detail -> Play -> Slot A.
+    # The coordinate route keeps its original configured launch behavior.
+    log("Failsafe Level 2: handing off to existing Auto Rejoin")
+    recovered = reconnect_rejoin("failsafe level 2: verified voluntary Leave")
+    if not recovered:
+        notify_async("Failsafe Level 2: Auto Rejoin failed. Macro stopped safely.")
+        return False
+    log("Failsafe Level 2: Auto Rejoin completed; waiting for verified mission start")
+    notify_async("Failsafe Level 2: Auto Rejoin completed. Waiting for mission/raid start.")
+    return True
+
 
 
 _recent_logs = deque(maxlen=60)
@@ -5956,7 +6061,7 @@ def rescue_clicks(debug=False, reason=None):
         if not raid_runtime_recovery_check(force=True, allow_rescue=False):
             return  # possible terminal transition; do not start Eject yet
     state["rescuing"] = True
-    state["rescue_t0"] = None if debug else time.time()   # tick(): a rescue past RECONNECT_RESCUE_LIMIT rejoins
+    state["rescue_t0"] = None if debug else time.time()   # diagnostic only; FS2 uses mission start
     if not debug:
         state["rescued"] = True
     release_all_keys()
@@ -6504,13 +6609,9 @@ def tick(scan_retry=True):
             match, quality, screen, _timestamp = watchdog
             raise RetryFound(match, quality, screen if tv(settings["family"], "fast_mode") else None)
     if _disconnect_template is not None and not state.get("reconnecting"):
-        # Reconnect is on: three ways to rejoin - the bot command, a failsafe rescue that has not
-        # ended after RECONNECT_RESCUE_LIMIT (2 min), or the Disconnect Image
+        # Reconnect is on: manual request or a verified disconnect.
         if state.pop("rc_request", False):
             raise Disconnected("the bot command !reconnect was used")
-        t0 = state.get("rescue_t0")
-        if state["rescuing"] and t0 and time.time() - t0 > RECONNECT_RESCUE_LIMIT:
-            raise Disconnected(f"the failsafe has been rescuing for {RECONNECT_RESCUE_LIMIT / 60:g} minutes")
         if time.time() >= state.get("rc_next", 0.0):
             state["rc_next"] = time.time() + RECONNECT_CHECK_INTERVAL
             frame=passive_scan_screen()
@@ -6521,6 +6622,8 @@ def tick(scan_retry=True):
             if (settings['reconnect'].get('method') == 'image' and
                     image_rc.find_scaled_reconnect(frame, _disconnect_template.get('normal'))):
                 raise Disconnected('Scaled Reconnect dialog detected by foreground scan')
+    # Also runs in rescue_clicks and waits that deliberately disable ordinary scans.
+    extra_failsafe_check()
     if scan_retry:
         t0 = state["mission_t0"]
         # Retry and disconnect watchdogs above always take precedence over recovery.
@@ -6539,7 +6642,7 @@ def tick(scan_retry=True):
                 rescue_clicks(debug=True, reason="manual debug" if settings["family"] in COLOSSAL_RAIDS else None)
         elif (not state["rescuing"] and t0 is not None
                 and settings["family"] != "Female Raid" and settings["family"] not in ATTACK_FAMILIES    # raid routines manage retry
-                and time.time() - t0 > mission_timeout()):
+                and time.time() - t0 > (state.get("fs2_timeout") or mission_timeout())):
             rescue_clicks()
         if _raid["active"] and not _raid["in_raid_wait"] and not state["rescuing"]:
             raid_skip_poll()        # the skip button is watched during every other raid action too
@@ -7350,8 +7453,9 @@ def wait_raid_terminal_retry(kind):
         except Exception:
             pass
     _custom_held.clear()
-    log(f"Raid terminal {kind} confirmed - combat stopped; waiting for verified Retry")
-    show("Raid ended", "Waiting for verified Retry (no combat inputs)")
+    label = "Raid" if raid_counting() else "Mission"
+    log(f"{label} terminal {kind} confirmed - combat stopped; waiting for verified Retry")
+    show(f"{label} ended", "Waiting for verified Retry (no combat inputs)")
     try:
         while True:
             tick(scan_retry=False)  # pause, stop, disconnect and cached Retry remain live
@@ -8309,6 +8413,8 @@ def run_mission():
     state["grid_mission"] = state.get("grid_mission", 0) + 1
     state["manual_start"] = False   # a mission is running now: forget any leftover F8 press
     state["mission_t0"] = time.time()   # for the stuck-mission rescue (failsafe time)
+    state["fs2_started"] = time.monotonic()
+    state["fs2_timeout"] = (RAID_FAILSAFE_MAX_TIME if settings["family"] in COLOSSAL_RAIDS else mission_timeout())
     state["rescued"] = False
     state.update(raid_chest_active=False, raid_terminal_wait=False, raid_recovery_next=0.0)
     _raid["seq_done_t"] = None
@@ -8589,8 +8695,7 @@ def macro_main():
                         _reconnect_images[kind] = load_quality_templates(filename)
                     _disconnect_template = load_quality_templates(RECONNECT_IMAGE_FILE)
                 log(f"Reconnect is ON ({settings['reconnect'].get('method')}): rejoining game "
-                    f"{ROBLOX_GAME_ID} on a disconnect, a failsafe longer than "
-                    f"{RECONNECT_RESCUE_LIMIT / 60:g} min, or !reconnect")
+                    f"{ROBLOX_GAME_ID} on a disconnect, verified Level 2 Leave, or !reconnect")
             except FileNotFoundError:
                 _reconnect_images.clear()
                 log("Reconnect: one of its pictures could not be loaded - it stays of")
@@ -8759,7 +8864,12 @@ def macro_main():
                         need_start = True
                         state["retry_processing"] = False
                 except Disconnected as dc:
-                    recovered = reconnect_rejoin(dc.reason)
+                    if isinstance(dc, ExtraFailsafe):
+                        recovered = extra_failsafe_recover()
+                        if not recovered:
+                            raise SystemExit
+                    else:
+                        recovered = reconnect_rejoin(dc.reason)
                     if str(dc.reason).startswith("chest recovery:") and recovered is False:
                         log("Chest Recovery: rejoin failed; stopping instead of waiting on a stale screen")
                         raise SystemExit
@@ -10381,7 +10491,7 @@ class App:
         upd.bind("<Enter>", lambda _e: upd.configure(fg=self.TEXT))
         upd.bind("<Leave>", lambda _e: upd.configure(fg=self.SUB))
         # Show the installed release immediately beside Updates (not the newest GitHub release).
-        tk.Label(left, text="v1.4.1", font=(App.FONT, 8), fg=self.SUB,
+        tk.Label(left, text="v1.4.2", font=(App.FONT, 8), fg=self.SUB,
                  bg=self.BG).pack(side="left", padx=(7, 0))
 
         self.reset_btn = tk.Label(foot, text="Reset stats", font=(App.FONT, 9),
@@ -12371,7 +12481,7 @@ class SettingsWindow(tk.Frame):
     def build_reconnect_card(self, parent):
         f = self.card(parent, "RECONNECT",
                       "Rejoins the game and clicks back into a mission / raid when you disconnect, "
-                      "when the failsafe has been rescuing for 2 minutes, or on the bot command "
+                      "after Failsafe Level 2 (twice the configured deadline), or on the bot command "
                       "!reconnect. Off by default - Configure it first.")
         row = tk.Frame(f, bg=App.CARD)
         row.pack(fill="x", pady=(10, 0))
@@ -14051,9 +14161,8 @@ class ReconnectConfigWindow(tk.Toplevel):
                             bg=App.CARD, wraplength=400)
         self.req.pack(fill="x", pady=(4, 0))
 
-        tk.Label(f, text=f"When the Disconnect Image shows, the failsafe has been rescuing for "
-                         f"{RECONNECT_RESCUE_LIMIT / 60:g} minutes or !reconnect is sent, Roblox is "
-                         f"closed and game {ROBLOX_GAME_ID} is launched again.",
+        tk.Label(f, text=f"On a disconnect, verified Level 2 Leave, or !reconnect, "
+                         f"game {ROBLOX_GAME_ID} is rejoined using the configured recovery route.",
                  font=(App.FONT, 8), fg=App.SUB,
                  bg=App.CARD, anchor="w", justify="left", wraplength=400).pack(fill="x", pady=(4, 0))
 

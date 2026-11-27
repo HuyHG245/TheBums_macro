@@ -243,6 +243,28 @@ def find_leave_disconnect(frame):
 def find_roblox_home_game(frame):
     """Locate the AOT:R card text within Roblox Home / Continue."""
     label=_find_ui_text(frame,'home_game_title',(.02,.20,.97,.97),.84)
+    if not label and isinstance(frame, np.ndarray) and frame.ndim == 3:
+        # Adaptive capture rescales thin antialiased text. Preserve the original
+        # title, ROI and threshold; use a soft white foreground representation.
+        from thebums_extra_failsafe import white_mask
+        h, w = frame.shape[:2]
+        if h >= 480 and w >= 800 and frame.shape[2] == 3:
+            xa, ya, xb, yb = int(.02*w), int(.20*h), int(.97*w), int(.97*h)
+            roi = white_mask(frame[ya:yb, xa:xb])
+            original = _ui_template('home_game_title')
+            best = None
+            for scale in (1.05, 1.06, 1.07, 1.08, 1.09, 1.10):
+                tpl = cv2.resize(original, None, fx=scale, fy=scale,
+                                 interpolation=cv2.INTER_LINEAR)
+                th, tw = tpl.shape
+                if th > roi.shape[0] or tw > roi.shape[1]:
+                    continue
+                _, score, _, (x, y) = cv2.minMaxLoc(
+                    cv2.matchTemplate(roi, tpl, cv2.TM_CCOEFF_NORMED))
+                if score >= .84 and (best is None or score > best.confidence):
+                    best = Match('home_game_title', xa+x+tw//2, ya+y+th//2,
+                                 float(score), tw, th, 'opencv_soft_home')
+            label = best
     if not label:
         return None
     # Move upwards from the text into the matching game's thumbnail.
