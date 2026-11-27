@@ -36,6 +36,8 @@ import thebums_extra_failsafe as extra_fs
 from thebums_skill_scheduler import BloodSkillScheduler
 from thebums_hybrid_ai import CpuOnnxBackend, HybridAdvisor
 from thebums_update_download import download_verified, DownloadCancelled, DownloadNetworkError
+from thebums_update_handoff import (start_windows_helper, wait_until_ready,
+                                    authorize_install, cancel_uncommitted)
 from thebums_features import ConfigPresetStore, SessionHistory, ErrorSnapshotStore, UpdateHistory, _atomic_json
 
 IS_WIN = sys.platform == "win32"
@@ -188,7 +190,7 @@ if IS_WIN:
 
 # ----------------------------- SETTINGS ---------------------------------
 APP_NAME = "The Bums Macro"
-VERSION = "TheBumsMacro_v1.4.2"  # Windows/Roblox playtest remains required
+VERSION = "TheBumsMacro_v1.4.3"  # Windows/Roblox playtest remains required
 
 # --- Update checker (footer > Updates) ---
 UPDATE_REPO = "HuyHG245/TheBums_macro"   # <-- your GitHub "owner/repo" (public). Releases are read from it
@@ -4362,6 +4364,8 @@ def start_reporter():
 # ------------------- shared state + events to the window ----------------
 ev = queue.Queue()  # macro thread -> window
 state = {"paused": False, "quit": False, "manual_start": False,
+         "session_active": False,   # sticky: a Start was attempted in this app process
+         "user_stopped": False,     # explicit Stop since the most recent Start
          "phase_status": "waiting",
          "mission_t0": None,        # when the current mission began (None = no mission running)
          "rescuing": False,         # True while the stuck-mission rescue is clicking
@@ -5207,12 +5211,14 @@ def toggle_pause():
 
 
 def request_stop():
-    # A Stop is an explicit user choice; never infer it from Pause/Retry/Idle.
-    state['user_stopped']=True
-    if running():
-        state["quit"] = True
-        state["paused"] = False
-        ev.put(("stopping",))   # hide the mini bar now, not when the worker has finished
+    # Serialize with Start so a Stop cannot land before its worker is published.
+    # Never infer an explicit Stop from Pause, Retry or an unexpected exit.
+    with _update_install_guard:
+        state['user_stopped']=True
+        if running():
+            state["quit"] = True
+            state["paused"] = False
+            ev.put(("stopping",))   # hide the mini bar now, not when the worker has finished
 
 
 def debug_trigger_rescue():
@@ -5229,13 +5235,13 @@ def debug_trigger_rescue():
 
 def start_macro(manual=False):
     global worker
-    # Atomic against the updater's last Stop check, including hotkey callbacks
+    # Atomic against the updater's final safe-idle check, including hotkey callbacks
     # invoked from a non-Tk thread. Never start mid-installation.
     with _update_install_guard:
         if running():
             return
-        if _update.get('install_launched'):
-            log('Macro start refused: application update is already installing')
+        if _update.get('install_launched') or _update.get('handoff_uncertain'):
+            log('Macro start refused: application update is already installing or needs recovery')
             return
         if settings.get('background_mode', False):
             # Defense in depth for a changed runtime setting: never run a mission
@@ -5260,12 +5266,14 @@ def start_macro(manual=False):
         _reset_shared_scan()
         with _shared_scan_lock:
             _shared_scan_counts.update(published=0, reused=0)
-    try:session_history().begin(settings['family'])
-    except OSError:pass
-    worker = threading.Thread(target=macro_main, daemon=True)
-    worker.start()
-    start_reporter()
-    ev.put(("started",))
+        # Keep the guard until the worker is published and started. Otherwise
+        # Stop could authorize an install in the gap after state initialization.
+        try:session_history().begin(settings['family'])
+        except OSError:pass
+        worker = threading.Thread(target=macro_main, daemon=True)
+        worker.start()
+        start_reporter()
+        ev.put(("started",))
 
 
 def request_start():
@@ -9602,7 +9610,7 @@ def style_title_bar(root, bg_hex):
 # ------------------------------- updater --------------------------------
 _update = {'busy':False,'staged':None,'release':None,'install_launched':False,
            'prompted':False,'lockfile':None,'downloading':False,'cancel':None}
-_update_install_guard = threading.Lock()  # prevents Start racing with final Stop-gated installation
+_update_install_guard = threading.Lock()  # serializes Start/Stop with final safe-idle installation
 
 
 def parse_version(text):
@@ -9703,14 +9711,16 @@ def start_update_check(manual=False):
 
 
 def can_install_update():
-    """Never install unless user has explicitly stopped any started session.
-    Pause, reconnect, idle-in-mission and unexpected thread death are NOT Stop.
+    """Allow pristine idle or an explicitly stopped, fully exited macro.
+
+    session_active is a sticky per-process latch: once Start has been attempted,
+    a dead worker is not enough to authorize an installation. Pause, reconnect,
+    rescue and an in-flight mission are never safe idle.
     """
-    if running() or state.get('reconnecting') or state.get('paused'):
+    if (running() or state.get('reconnecting') or state.get('paused')
+            or state.get('rescuing') or state.get('mission_t0') is not None):
         return False
-    # Strict policy: even an app that just launched must wait until a genuine
-    # user Stop action. A merely idle app is not sufficient authorization.
-    return bool(state.get('user_stopped'))
+    return bool(state.get('user_stopped') or not state.get('session_active'))
 
 
 def acquire_update_lock():
@@ -9743,7 +9753,7 @@ def release_update_lock():
 
 
 def _install_update_worker(info):
-    """ONLY download + verify. Actual installation is a later user-Stop-gated event."""
+    """ONLY download + verify. Actual installation is a later safe-idle-gated event."""
     exe=sys.executable
     new_path=exe+'.new'
     try:
@@ -9765,7 +9775,7 @@ def _install_update_worker(info):
         update_history().record(info['tag'],'downloaded',info['digest'])
         _update['staged']=new_path
         _update['release']=info
-        log('Update downloaded and verified. Press Stop (F7 by default), then Updates if installation has not started.')
+        log('Update downloaded and verified. Install when idle; if a session is active or ended unexpectedly, press Stop (F7 by default) first.')
     except Exception as exc:
         cancelled=isinstance(exc,DownloadCancelled)
         log(f"Update download {'cancelled' if cancelled else 'failed'}: {type(exc).__name__}: {exc}")
@@ -9823,42 +9833,71 @@ def install_update(info):
 
 
 def launch_staged_update():
-    """Start the bundled local transaction helper; called ONLY after Stop verification."""
+    """Only close after the trusted local helper acknowledges a safe-idle-gated handoff."""
     if not can_install_update():return False
     info=_update.get('release')
     staged=_update.get('staged')
     if not info or not staged or not os.path.isfile(staged):return False
-    if _update.get('install_launched'):return False
+    if _update.get('install_launched') or _update.get('handoff_uncertain'):return False
     if not supports_exe_update():return False
     bundled_helper=os.path.join(getattr(sys,'_MEIPASS',app_dir()),'updater.ps1')
     if not os.path.isfile(bundled_helper):
         log('The bundled updater helper was not found')
         return False
     with _update_install_guard:
-        if not can_install_update() or _update.get('install_launched'):
+        if (not can_install_update() or _update.get('install_launched')
+                or _update.get('handoff_uncertain')):
             return False
         _update['install_launched']=True
-    health=os.path.join(data_dir(),'update_health_'+uuid.uuid4().hex+'.ok')
-    status_file=os.path.join(data_dir(),'update_status.json')
+    process=None
+    helper=None
+    ready=None
+    commit=None
+    logfile=None
     try:
-        # The PyInstaller one-file extraction directory vanishes on exit.
-        # Copy the trusted, bundled script to a stable local temporary path.
-        helper=os.path.join(tempfile.gettempdir(),
-                            'thebums_updater_'+uuid.uuid4().hex+'.ps1')
+        txn=uuid.uuid4().hex
+        health=os.path.join(data_dir(),'update_health_'+txn+'.ok')
+        ready=health+'.ready'
+        commit=health+'.commit'
+        logfile=os.path.join(data_dir(),'update_handoff_'+txn+'.log')
+        status_file=os.path.join(data_dir(),'update_status.json')
+        # Stable copy survives PyInstaller's extraction-directory cleanup.
+        helper=os.path.join(tempfile.gettempdir(),'thebums_updater_'+txn+'.ps1')
         shutil.copy2(bundled_helper,helper)
-        subprocess.Popen(['powershell.exe','-NoProfile','-ExecutionPolicy','Bypass',
-                          '-File',helper,'-CurrentExe',sys.executable,
-                          '-StagedExe',staged,'-HealthFile',health,
-                          '-StatusFile',status_file,'-ReleaseTag',info['tag'],
-                          '-Digest',info['digest']],
-                         creationflags=0x00000008|0x08000000,close_fds=True)
+        log('Update: starting local installer; waiting for readiness acknowledgement')
+        process=start_windows_helper(['-File',helper,'-CurrentExe',sys.executable,
+            '-StagedExe',staged,'-HealthFile',health,'-StatusFile',status_file,
+            '-ReleaseTag',info['tag'],'-Digest',info['digest'],
+            '-ParentPid',str(os.getpid()),'-ReadyFile',ready,'-CommitFile',commit],
+            logfile,cwd=app_dir())
+        wait_until_ready(process,ready)
+        with _update_install_guard:
+            if not can_install_update():
+                raise RuntimeError('Macro is no longer safely idle or explicitly stopped')
+            authorize_install(process,commit)
+        log('Update: installer acknowledged; closing for replacement and restart')
         ev.put(('update_ready',))
         return True
     except Exception as exc:
+        stopped=cancel_uncommitted(process,commit) if commit else process is None
         _update['install_launched']=False
-        log(f'Could not launch updater: {type(exc).__name__}: {exc}')
-        # Keep the reservation while the verified staged asset is still owned by us.
         _update['prompted']=False
+        if not stopped:
+            # Cannot safely start another helper or remove its reservation.
+            _update['handoff_uncertain']=True
+        else:
+            for path in (ready,commit,helper):
+                if path:
+                    try:os.remove(path)
+                    except OSError:pass
+        error=f'Could not launch updater: {type(exc).__name__}: {exc}'
+        if logfile:
+            try:
+                with open(logfile,'a',encoding='utf-8') as f:
+                    f.write('\n'+error+'\n')
+            except OSError:pass
+        log(f'{error}. Log: {logfile}')
+        ev.put(('update_handoff_failed',str(exc),logfile or '',not stopped))
         return False
 
 
@@ -9876,7 +9915,7 @@ def update_startup_check(root):
             if status.get('status') in ('installed','rolled_back','failed'):
                 update_history().record(status.get('tag','unknown'),status['status'],
                                         status.get('digest',''),status.get('details',''))
-                log('Last update: '+status['status'])
+                log('Last update: '+status['status']+' - '+str(status.get('details','')))
                 os.remove(status_file)
                 return
         except (OSError,ValueError,KeyError):
@@ -10491,7 +10530,7 @@ class App:
         upd.bind("<Enter>", lambda _e: upd.configure(fg=self.TEXT))
         upd.bind("<Leave>", lambda _e: upd.configure(fg=self.SUB))
         # Show the installed release immediately beside Updates (not the newest GitHub release).
-        tk.Label(left, text="v1.4.2", font=(App.FONT, 8), fg=self.SUB,
+        tk.Label(left, text="v1.4.3", font=(App.FONT, 8), fg=self.SUB,
                  bg=self.BG).pack(side="left", padx=(7, 0))
 
         self.reset_btn = tk.Label(foot, text="Reset stats", font=(App.FONT, 9),
@@ -10519,7 +10558,7 @@ class App:
         if key == "idle":
             self.btn_start.update_tile(enabled=True, active=False)
             self.btn_pause.update_tile(label="Pause", enabled=False, active=False)
-            self.btn_stop.update_tile(enabled=bool(_update.get("staged")), active=False)
+            self.btn_stop.update_tile(enabled=bool(_update.get("staged")) and not can_install_update(), active=False)
         elif key == "paused":
             self.btn_start.update_tile(enabled=False, active=False)
             self.btn_pause.update_tile(label="Resume", enabled=True, active=True)
@@ -10607,8 +10646,16 @@ class App:
         elif kind == 'update_staged':
             if not getattr(self,'_closing_for_download',False):
                 self.update_link.configure(text='↓ Ready')
-                self.btn_stop.update_tile(enabled=True, active=False)
+                self.btn_stop.update_tile(enabled=not can_install_update(), active=False)
                 self.maybe_install_update()
+        elif kind == 'update_handoff_failed':
+            _,reason,logfile,uncertain=e
+            self.update_link.configure(text='↓ Ready')
+            messagebox.showerror('Update installer',
+                'The updater could not start safely. The current EXE was kept.\n'
+                + reason + ('\nClose the app and check for a running updater before retrying.'
+                            if uncertain else '\nThe verified download is retained; click Ready to retry.')
+                + ('\nLog: '+logfile if logfile else ''),parent=self.root)
         elif kind == "update_ready":
             self.on_close()          # the bundled PowerShell helper replaces the EXE
         elif kind == 'reconnect_progress':
@@ -10772,7 +10819,7 @@ class App:
             return
         if _update.get('staged'):
             if not can_install_update():
-                messagebox.showinfo('Updates','Download verified. Press Stop (F7 by default), then Updates again.',parent=self.root)
+                messagebox.showinfo('Updates','Download verified. Stop the active or interrupted macro (F7 by default), then click Ready again.',parent=self.root)
                 return
             _update['prompted']=False
             self.maybe_install_update()
@@ -10821,7 +10868,7 @@ class App:
         if manual:
             if not messagebox.askyesno('Update Available',
                     f"Installed: {VERSION}\nAvailable: {package['tag']}\n\n"
-                    'Download and verify this update now? Installation will wait for Stop.',
+                    'Download and verify this update now? Installation is allowed when safely idle; active sessions must be stopped.',
                     parent=self.root):return
         elif not (settings['update_prefs']['automatic'] and settings['update_prefs']['download']):
             log(f"Update available: {package['tag']} (open Updates to download)")
@@ -10835,7 +10882,7 @@ class App:
         if settings['update_prefs'].get('install_mode')=='ask':
             _update['prompted']=True
             if not messagebox.askyesno('Install Update',
-                    'The update is ready. The macro is stopped. Install and restart now?',parent=self.root):
+                    'The update is ready. No macro session is running. Install and restart now?',parent=self.root):
                 return
         launch_staged_update()
 
@@ -10950,7 +10997,7 @@ class App:
                 self._closing_for_download=True
                 self.root.after(100,self._wait_download_close)
             return
-        if not _update.get('install_launched'):
+        if not _update.get('install_launched') and not _update.get('handoff_uncertain'):
             staged=_update.get('staged')
             if staged and _update.get('lockfile'):
                 try:os.remove(staged)
@@ -12971,7 +13018,7 @@ class SettingsWindow(tk.Frame):
 
     def build_themes(self, page):
         up=self.card(page,'UPDATE MANAGER',
-                     'Updates never install until you stop the macro. Downloads are allowed during runs.')
+                     'Install when safely idle. Active or interrupted sessions require Stop. Downloads are allowed during runs.')
         self.up_auto=tk.BooleanVar(value=settings['update_prefs']['automatic'])
         self.up_download=tk.BooleanVar(value=settings['update_prefs']['download'])
         self.up_install=tk.StringVar(value=settings['update_prefs']['install_mode'])
@@ -12981,7 +13028,7 @@ class SettingsWindow(tk.Frame):
                            activebackground=App.CARD,activeforeground=App.TEXT).pack(anchor='w',pady=3)
         tk.Label(up,text='Install preference',font=(App.FONT,9,'bold'),bg=App.CARD,
                  fg=App.SUB).pack(anchor='w',pady=(8,2))
-        for label,value in [('Install automatically after Stop','automatic'),('Ask before installing','ask')]:
+        for label,value in [('Install automatically when safely idle','automatic'),('Ask before installing','ask')]:
             tk.Radiobutton(up,text=label,variable=self.up_install,value=value,
                            command=self.save_update_prefs,bg=App.CARD,fg=App.TEXT,
                            selectcolor=App.LOGBG,activebackground=App.CARD,

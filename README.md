@@ -4,9 +4,9 @@
 
 The Bums Macro is an independent keyboard/mouse automation application for Roblox: Attack on Titan Revolution. It is not affiliated with Roblox or the game. Use it in accordance with applicable game rules.
 
-> **Status:** v1.4.2 Extra Failsafe development candidate for Windows. Reconnect, the updater and several beta features still require Windows/Roblox end-to-end verification. **Background Mode is In Development and cannot be enabled.** The default Standard Mode remains available.
+> **Status:** v1.4.3 Auto Update Safe Idle development candidate for Windows. Reconnect, the updater and several beta features still require Windows/Roblox end-to-end verification. **Background Mode is In Development and cannot be enabled.** The default Standard Mode remains available.
 
-## Quick start — TheBumsMacro_v1.4.2 source
+## Quick start — TheBumsMacro_v1.4.3 source
 
 **Extra Failsafe hotfix:** Level 1 keeps the original rescue. Level 2 triggers at twice the active mission/raid deadline if the round has not ended, interrupts rescue, verifies the Roblox menu / Leave / Confirm Leave sequence, and hands off to the existing Auto Rejoin route if enabled and configured. If Leave or Rejoin cannot be verified, the macro stops safely. This candidate has offline tests only; live Windows/Roblox verification remains outstanding.
 
@@ -63,9 +63,9 @@ The build uses PyInstaller and embeds the `image/` templates, `guides/` and the 
 
 Click **Updates** in the main window to compare your installed version with the latest GitHub Release.
 
-For a future release that ships the verified Update Manager, the app can download and verify a new EXE and install it without manual ZIP extraction. **It cannot install an update while a macro session is active, paused, reconnecting, or otherwise not explicitly stopped.** Downloads can be prepared in advance.
+For a future release that ships the verified Update Manager, the app can download and verify a new EXE and install it without manual ZIP extraction. **It can install immediately before the first Start in a fresh app session, or after an explicit Stop and full worker exit. It cannot install during an active, paused, reconnecting, rescuing or unexpectedly ended session.** Downloads can be prepared in advance.
 
-In **Settings → App → Update Manager**, choose whether to enable **Automatic Updates**, **Auto Download** and **Install automatically after Stop** or **Ask before installing**. Automatic Updates start **OFF** by default.
+In **Settings → App → Update Manager**, choose whether to enable **Automatic Updates**, **Auto Download** and **Install automatically when safely idle** or **Ask before installing**. Automatic Updates start **OFF** by default.
 
 Update transactions retain the previous EXE for rollback if the newly installed EXE fails its startup check. Failed builds are recorded to avoid repeated automatic reinstalls. **Update History** shows the last 20 records. Real-world verification is required before depending on these capabilities.
 
@@ -239,4 +239,4 @@ Mission and raid webhooks include REWARDS before the screenshot. This run shows 
 
 ## Auto Update reliability (v1.4.1)
 
-The official one-file Windows EXE supports bounded download retries, in-session HTTP Range resume, progress, cancellation, verified staging and Stop-gated installation. The installer rechecks the SHA-256 digest and uses a transaction-specific startup marker. Source and onedir builds use manual downloads. A stale update reservation requires confirmation that all macro and installer processes have exited before manual cleanup. Windows end-to-end playtest is required.
+The official one-file Windows EXE supports bounded download retries, in-session HTTP Range resume, progress, cancellation, verified staging and safe-idle-gated installation. The installer rechecks the SHA-256 digest and uses a transaction-specific startup marker. Source and onedir builds use manual downloads. A stale update reservation requires confirmation that all macro and installer processes have exited before manual cleanup. Windows end-to-end playtest is required.

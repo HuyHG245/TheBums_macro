@@ -238,7 +238,8 @@ Auto Update reliability (development candidate; no new release tag yet):
   for the worker to release its reservation; an in-flight network read can take
   until its timeout. A manual failed retry sequence offers the official release page.
 - Test network loss before and during download, cancellation, successful download,
-  explicit Stop before installation, restart health check and rollback on Windows.
+  safe-idle installation before the first Start, explicit Stop after Start,
+  restart health check and rollback on Windows.
 - Never ship a fake SHA-256 or change the official release asset name.
 
 v1.4.1 release candidate – updater transaction checks:
@@ -246,7 +247,9 @@ v1.4.1 release candidate – updater transaction checks:
 - Check the download footer percentage, cancel, reconnect and retry, including a slow transfer.
 - If an abandoned .updating reservation exists, close all macro and installer processes
   before clearing .updating, .new and .new.part. Never delete a live install reservation.
-- After verified download, explicitly Stop before installation. Test the ready state while idle.
+- After verified download in a fresh app, install without pressing Stop.
+- After Start, verify that running, paused, reconnecting and unexpected worker exit
+  require explicit Stop and full worker exit before installation.
 - Test a refused PowerShell launch, tampered staged EXE, healthy restart and rollback in a
   disposable installation. The new helper verifies SHA-256 again before replacing the EXE,
   uses a transaction-specific startup marker, and will not restore an old backup if this

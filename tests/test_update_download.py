@@ -156,10 +156,79 @@ def test_worker_cleanup(tmp_path,exc):
     ns['release_update_lock'].assert_called_once()
     assert (('update_download_failed',) in events)==isinstance(exc,DownloadNetworkError)
 
-@pytest.mark.parametrize('running,paused,reconnecting,stopped,expected',[(True,False,False,True,False),(False,True,False,True,False),(False,False,True,True,False),(False,False,False,False,False),(False,False,False,True,True)])
-def test_stop_gate(running,paused,reconnecting,stopped,expected):
-    ns=dict(running=lambda:running,state=dict(paused=paused,reconnecting=reconnecting,user_stopped=stopped))
+@pytest.mark.parametrize('started,stopped,worker_alive,flags,expected',[
+    (False,False,False,{},True),  # pristine idle: no Stop needed
+    (False,True,False,{},True),
+    (True,True,False,{},True),  # fully stopped
+    (True,False,False,{},False),  # unexpected exit
+    (True,False,True,{},False),  # active / waiting for mission
+    (True,True,True,{},False),  # stopping, worker not yet exited
+    (True,True,False,{'paused':True},False),
+    (True,True,False,{'reconnecting':True},False),
+    (True,True,False,{'rescuing':True},False),
+    (True,True,False,{'mission_t0':123.},False),
+    (False,False,False,{'reconnecting':True},False),
+    (False,False,False,{'paused':True},False),
+])
+def test_stop_gate(started,stopped,worker_alive,flags,expected):
+    ns=dict(running=lambda:worker_alive,state=dict(session_active=started,user_stopped=stopped,**flags))
     assert extract('can_install_update',ns)() is expected
+
+
+def test_pristine_idle_manual_ready_without_stop():
+    ns=dict(_update={'staged':'macro.exe.new','prompted':True},running=lambda:False,
+            state={'session_active':False,'user_stopped':False},start_update_check=Mock())
+    extract('can_install_update',ns)
+    app=SimpleNamespace(root=None,maybe_install_update=Mock())
+    extract('on_update_click',ns,True)(app)
+    app.maybe_install_update.assert_called_once()
+    assert not ns['_update']['prompted'] and not ns['state']['user_stopped']
+
+
+@pytest.mark.parametrize('mode',['automatic','ask'])
+@pytest.mark.parametrize('started,stopped,alive,expected',[
+    (False,False,False,True),(True,False,False,False),
+    (True,True,True,False),(True,True,False,True)])
+def test_idle_gate_install_preference(mode,started,stopped,alive,expected):
+    prompt=Mock(return_value=True);launch=Mock(return_value=True)
+    ns=dict(_update={'staged':'macro.exe.new','prompted':False},running=lambda:alive,
+            state={'session_active':started,'user_stopped':stopped},
+            settings={'update_prefs':{'install_mode':mode}},messagebox=SimpleNamespace(askyesno=prompt),
+            launch_staged_update=launch)
+    extract('can_install_update',ns)
+    extract('maybe_install_update',ns,True)(SimpleNamespace(root=None))
+    assert launch.call_count==int(expected)
+    assert prompt.call_count==int(expected and mode=='ask')
+
+
+def test_start_stop_and_unexpected_exit_lifecycle():
+    import time
+    guard=threading.Lock();events=[];workers=[]
+    class FakeWorker:
+        def __init__(self,**kwargs):self.alive=False;workers.append(self)
+        def is_alive(self):return self.alive
+        def start(self):
+            assert guard.locked(), 'worker must start under the same guard as install'
+            self.alive=True
+    ns=dict(worker=None,state={'session_active':False,'user_stopped':False},
+            _update={},_update_install_guard=guard,_health_lock=threading.Lock(),
+            _shared_scan_lock=threading.Lock(),_shared_scan_counts={},
+            settings={'family':'Universal'},time=time,threading=SimpleNamespace(Thread=FakeWorker),
+            ev=SimpleNamespace(put=events.append),log=Mock(),_reset_shared_scan=Mock(),
+            session_history=lambda:SimpleNamespace(begin=Mock()),macro_main=Mock(),start_reporter=Mock())
+    for name in ('running','can_install_update','start_macro','request_stop'):extract(name,ns)
+    assert ns['can_install_update']()
+    ns['start_macro']();assert ns['state']['session_active'] and not ns['can_install_update']()
+    # Simulate a worker exit without user Stop: sticky Start latch must survive.
+    workers[-1].alive=False
+    assert not ns['can_install_update']()
+    ns['request_stop']();assert ns['can_install_update']()
+    ns['start_macro']();assert not ns['state']['user_stopped'] and not ns['can_install_update']()
+    ns['request_stop']();assert ns['state']['quit'] and not ns['can_install_update']()
+    workers[-1].alive=False;assert ns['can_install_update']()
+    ns['_update']['install_launched']=True
+    ns['start_macro']();assert len(workers)==2  # updater owns the guard, no new Start
+
 
 def test_cancel_click():
     c=threading.Event();ns=dict(_update={'downloading':True,'cancel':c},messagebox=SimpleNamespace(askyesno=lambda *a,**k:True),start_update_check=Mock())
@@ -221,6 +290,7 @@ def test_commit_api_error_does_not_hide_release():
 
 def test_launch_failure_keeps_owned_stage_and_lock(tmp_path):
     import shutil, uuid, tempfile
+    from thebums_update_handoff import cancel_uncommitted
     (tmp_path/'updater.ps1').write_text('test')
     exe=tmp_path/'macro.exe';staged=tmp_path/'macro.exe.new';staged.write_bytes(DATA)
     lock=tmp_path/'macro.exe.updating';lock.write_text('123')
@@ -228,7 +298,8 @@ def test_launch_failure_keeps_owned_stage_and_lock(tmp_path):
     ns=dict(can_install_update=lambda:True,supports_exe_update=lambda:True,_update=state,os=os,
         sys=SimpleNamespace(executable=str(exe),_MEIPASS=str(tmp_path)),app_dir=lambda:str(tmp_path),data_dir=lambda:str(tmp_path),
         _update_install_guard=threading.Lock(),uuid=uuid,tempfile=SimpleNamespace(gettempdir=lambda:str(tmp_path)),shutil=shutil,
-        subprocess=SimpleNamespace(Popen=Mock(side_effect=OSError('launch failed'))),log=Mock(),release_update_lock=Mock())
+        start_windows_helper=Mock(side_effect=OSError('launch failed')),cancel_uncommitted=cancel_uncommitted,
+        ev=SimpleNamespace(put=Mock()),log=Mock(),release_update_lock=Mock())
     assert extract('launch_staged_update',ns)() is False
     assert lock.exists() and staged.exists() and not state['install_launched'] and not state['prompted']
     ns['release_update_lock'].assert_not_called()
